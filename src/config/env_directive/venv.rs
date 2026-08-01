@@ -2,7 +2,7 @@ use crate::Result;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::config_file::trust_check;
-use crate::config::env_directive::EnvResults;
+use crate::config::env_directive::{EnvDirectiveContext, EnvResults};
 use crate::config::{Config, Settings};
 use crate::env_diff::EnvMap;
 use crate::file::{display_path, which_no_shims};
@@ -20,6 +20,20 @@ use std::{
 pub struct Venv {
     pub venv_path: PathBuf,
     pub env: HashMap<String, String>,
+}
+
+#[derive(Default)]
+pub(crate) struct PythonVenvOptions {
+    /// `_.python.venv.python` — the user asked for this version by name, so a miss is an error
+    /// they should see rather than something to paper over.
+    pub(crate) python: Option<String>,
+    /// The python the caller's toolset has active, filled in by [`EnvResults::venv`]. A
+    /// *preference*, not a request: if the config-derived toolset cannot offer it we fall back to
+    /// the previous behaviour instead of failing, because the user never named this version.
+    pub(crate) active_python: Option<String>,
+    pub(crate) uv_create_args: Option<Vec<String>>,
+    pub(crate) python_create_args: Option<Vec<String>>,
+    pub(crate) require_uv: bool,
 }
 
 pub(crate) fn load_venv(
@@ -92,23 +106,39 @@ fn build_stdlib_venv_command<'a>(
         .args(extra)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_python_venv(
     config: &Arc<Config>,
     ts: &Toolset,
     venv: &Path,
     env_vars: EnvMap,
-    python: Option<&str>,
-    uv_create_args: Option<Vec<String>>,
-    python_create_args: Option<Vec<String>>,
-    require_uv: bool,
+    options: PythonVenvOptions,
 ) -> Result<bool> {
+    let PythonVenvOptions {
+        python,
+        active_python,
+        uv_create_args,
+        python_create_args,
+        require_uv,
+    } = options;
+    let python = python.as_deref();
     let ba = BackendArg::from("python");
     let tv = ts.versions.get(&ba).and_then(|tv| {
         // if a python version is specified, check if that version is installed
         // otherwise use the first since that's what `python3` will refer to
         if let Some(v) = python {
             tv.versions.iter().find(|t| t.version.starts_with(v))
+        } else if let Some(v) = &active_python {
+            // the caller's active python, which this toolset may not list at all — it was rebuilt
+            // from the config files. Falling back keeps a `--tool` version that is absent from
+            // `[tools]` working exactly as it did before (#5281).
+            //
+            // Matched exactly, unlike the branch above: that one compares against whatever partial
+            // version the user wrote in `_.python.venv.python`, while this is already resolved on
+            // both sides. A prefix match here would let `3.12.0` select a configured `3.12.0a1`.
+            tv.versions
+                .iter()
+                .find(|t| t.version == *v)
+                .or_else(|| tv.versions.first())
         } else {
             tv.versions.first()
         }
@@ -168,30 +198,35 @@ pub(crate) async fn create_python_venv(
     Ok(true)
 }
 
+/// The version of the python the caller's toolset has active, if any.
+///
+/// `create_python_venv` resolves its own python/uv-only toolset to avoid a circular wait (see
+/// below), and that toolset is built from the config files — so it lists every `[tools] python`
+/// entry in config order and knows nothing about `--tool`. Feeding this back in as the `python`
+/// option makes it select the same interpreter the rest of the run is using, and costs nothing
+/// when there is no override: the caller's toolset then holds the same first entry.
+fn active_python_version(toolset: Option<&Toolset>) -> Option<String> {
+    let tvl = toolset?.versions.get(&BackendArg::from("python"))?;
+    Some(tvl.versions.first()?.version.clone())
+}
+
 impl EnvResults {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn venv(
-        config: &Arc<Config>,
-        ctx: &mut tera::Context,
-        tera: &mut Option<crate::tera::TeraEngine>,
+    pub(super) async fn venv(
+        ctx: &mut EnvDirectiveContext<'_>,
         env: &mut IndexMap<String, (String, Option<PathBuf>)>,
-        r: &mut EnvResults,
-        normalize_path: fn(&Path, PathBuf) -> PathBuf,
-        source: &Path,
-        exec_env: &EnvMap,
-        config_root: &Path,
-        env_vars: EnvMap,
         path: String,
         create: bool,
-        python: Option<String>,
-        uv_create_args: Option<Vec<String>>,
-        python_create_args: Option<Vec<String>>,
+        mut options: PythonVenvOptions,
     ) -> Result<()> {
         trace!("python venv: {} create={create}", display_path(&path));
-        trust_check(source)?;
-        let venv = r.parse_template(ctx, tera, source, exec_env, &path)?;
-        let venv = normalize_path(config_root, venv.into());
+        trust_check(ctx.source)?;
+        let venv = ctx.parse_template(&path)?;
+        let venv = ctx.normalize_path(venv.into());
         let venv_lock = LockFile::new(&venv).lock()?;
+        // Record whichever python the caller actually has active. The toolset rebuilt below comes
+        // from the config files, so on its own it cannot see a CLI override — `mise run --tool
+        // python@3.12` would silently build the venv from the first `[tools] python` entry (#5281).
+        options.active_python = active_python_version(ctx.toolset);
         if !venv.exists() && create {
             // TODO: the toolset stuff doesn't feel like it's in the right place here
             // TODO: in fact this should probably be moved to execute at the same time as src/uv.rs runs in ts.env() instead of config.env()
@@ -202,7 +237,7 @@ impl EnvResults {
             // directive as part of config.env().
             // By filtering to only Python/UV BEFORE resolution, we avoid resolving unrelated tools
             // that have their own dependencies and environment requirements.
-            let trs = config.get_tool_request_set().await?;
+            let trs = ctx.config.get_tool_request_set().await?;
             let mut filter = HashSet::new();
             filter.insert("python".to_string());
             filter.insert("uv".to_string());
@@ -211,18 +246,8 @@ impl EnvResults {
             // Convert the filtered tool request set to a toolset and resolve only these tools
             let mut ts: Toolset = filtered_trs.into();
             // Ignore resolution errors for venv creation - if tools aren't available, we'll warn below
-            let _ = ts.resolve(config).await;
-            create_python_venv(
-                config,
-                &ts,
-                &venv,
-                env_vars,
-                python.as_deref(),
-                uv_create_args,
-                python_create_args,
-                false,
-            )
-            .await?;
+            let _ = ts.resolve(ctx.config).await;
+            create_python_venv(ctx.config, &ts, &venv, ctx.exec_env.clone(), options).await?;
         }
         drop(venv_lock);
         if venv.exists() {
@@ -230,9 +255,9 @@ impl EnvResults {
                 venv_path,
                 env: venv_env,
             } = load_venv(&venv, HashMap::new());
-            r.env_paths.insert(0, venv_path);
+            ctx.results.env_paths.insert(0, venv_path);
             for (k, v) in venv_env {
-                env.insert(k, (v, Some(source.to_path_buf())));
+                env.insert(k, (v, Some(ctx.source.to_path_buf())));
             }
         } else if !create {
             // The create "no venv found" warning is handled elsewhere
@@ -278,6 +303,7 @@ mod tests {
                             tools: true,
                             redact: Some(false),
                             required: crate::config::env_directive::RequiredValue::False,
+                            expand: false,
                         },
                     },
                     Default::default(),
@@ -293,6 +319,7 @@ mod tests {
                             tools: true,
                             redact: Some(false),
                             required: crate::config::env_directive::RequiredValue::False,
+                            expand: false,
                         },
                     },
                     Default::default(),

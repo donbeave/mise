@@ -1,5 +1,8 @@
 # Plan 007: Make mise interop upgrades recoverable across payload and both ledgers
 
+> **ARCHIVED — NON-EXECUTABLE.** Dual-writer transactions were rejected. No
+> instruction below authorizes implementation.
+
 **REJECTED AS CURRENTLY DESIGNED (2026-07-23)**: Do not execute this private
 dual-writer transaction plan. Homebrew install/upgrade/uninstall does not honor
 a lock mise can acquire, so local journaling cannot make two managers atomic.

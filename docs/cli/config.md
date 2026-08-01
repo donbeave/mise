@@ -3,6 +3,7 @@
 
 - **Usage**: `mise config [FLAGS] <SUBCOMMAND>`
 - **Aliases**: `cfg`
+- **Effect**: read-only
 - **Source code**: [`src/cli/config/mod.rs`](https://github.com/jdx/mise/blob/main/src/cli/config/mod.rs)
 
 Manage config files
@@ -33,5 +34,5 @@ Examples:
 $ mise config ls
 Path                        Tools
 ~/.config/mise/config.toml  pitchfork
-~/src/mise/mise.toml        actionlint, bun, cargo-binstall, cargo:cargo-edit, cargo:cargo-insta
+~/src/mise/mise.toml        actionlint, bun, cargo-binstall, cargo:cargo-insta
 ```

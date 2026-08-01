@@ -75,6 +75,57 @@ pub fn python_path(tv: &ToolVersion) -> PathBuf {
     }
 }
 
+/// Create the conventional `python3` entry next to `python.exe` on Windows.
+///
+/// The python-build-standalone Windows archives only ship `python.exe`, while
+/// cross-platform scripts commonly invoke `python3`. Keeping the alias inside
+/// the install directory lets normal PATH and shim discovery handle it just
+/// like an upstream executable.
+#[cfg(windows)]
+fn install_python3_windows(tv: &ToolVersion) -> Result<()> {
+    let python_exe = tv.install_path().join("python.exe");
+    let python3_exe = tv.install_path().join("python3.exe");
+
+    file::remove_all(&python3_exe)?;
+    match std::fs::hard_link(&python_exe, &python3_exe) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            debug!(
+                "python: hardlink {python_exe} as {python3_exe} failed ({e}); copying executable",
+                python_exe = python_exe.display(),
+                python3_exe = python3_exe.display(),
+            );
+            std::fs::copy(&python_exe, &python3_exe)?;
+            Ok(())
+        }
+    }
+}
+
+/// Create `pip.cmd`/`pip3.cmd` wrappers next to `python.exe` on Windows.
+///
+/// python-build-standalone Windows archives ship pip only as a site-packages
+/// module — there is no `Scripts\pip.exe` launcher (upstream quirk), and
+/// `python -m pip install --upgrade pip` is a no-op while pip is current, so
+/// the launcher never appears on its own. Like the synthesized `python3.exe`
+/// above, keeping the wrappers inside the install root lets normal PATH and
+/// shim discovery handle them. Delegating to `python -m pip` means the
+/// wrappers always dispatch to the pip currently in site-packages, so they
+/// never go stale even if the user later reinstalls pip itself.
+#[cfg(windows)]
+fn install_pip_wrappers_windows(tv: &ToolVersion) -> Result<()> {
+    // if a real pip launcher ever ships, prefer it over synthesizing wrappers
+    if tv.install_path().join("Scripts").join("pip.exe").exists() {
+        return Ok(());
+    }
+    // CRLF endings per batch-file convention; no trailing `exit /b` needed —
+    // cmd returns the errorlevel of the script's last command.
+    const WRAPPER: &str = "@echo off\r\n\"%~dp0python.exe\" -m pip %*\r\n";
+    for name in ["pip.cmd", "pip3.cmd"] {
+        file::write(tv.install_path().join(name), WRAPPER)?;
+    }
+    Ok(())
+}
+
 /// Sort key for Python versions that handles miniconda's two versioning schemes correctly.
 ///
 /// Miniconda has two formats:
@@ -417,6 +468,12 @@ impl PythonPlugin {
             file::make_symlink(&install.join("bin/python3"), &install.join("bin/python"))?;
         }
 
+        #[cfg(windows)]
+        {
+            install_python3_windows(tv)?;
+            install_pip_wrappers_windows(tv)?;
+        }
+
         Ok(())
     }
 
@@ -443,7 +500,7 @@ impl PythonPlugin {
             cmd = cmd.arg("--patch").stdin_string(patch)
         }
         if let Some(patches_dir) = &Settings::get().python.patches_directory {
-            let patch_file = patches_dir.join(format!("{}.patch", &tv.version));
+            let patch_file = patches_dir.join(format!("{}.patch", tv.version));
             if patch_file.exists() {
                 ctx.pr
                     .set_message(format!("with patch file: {}", patch_file.display()));
@@ -478,7 +535,7 @@ impl PythonPlugin {
             );
         }
         pr.set_message("install default packages".into());
-        CmdLineRunner::new(tv.install_path().join("bin/python"))
+        CmdLineRunner::new(python_path(tv))
             .with_pr(pr)
             .arg("-m")
             .arg("pip")
@@ -500,12 +557,17 @@ impl PythonPlugin {
         let raw_opts = tv.request.options();
         let opts = PythonOptions::new(&raw_opts);
         if let Some(virtualenv) = opts.virtualenv() {
+            deprecated_at!(
+                "2026.7.0",
+                "2027.7.0",
+                "python.virtualenv",
+                "the python `virtualenv` tool option is deprecated. Use `_.python.venv` in the `[env]` section instead: https://mise.en.dev/lang/python.html#automatic-virtualenv-activation"
+            );
             let mut virtualenv: PathBuf = file::replace_path(Path::new(virtualenv));
-            if !virtualenv.is_absolute() {
-                // TODO: use the path of the config file that specified python, not the top one like this
-                if let Some(project_root) = &config.project_root {
-                    virtualenv = project_root.join(virtualenv);
-                }
+            if !virtualenv.is_absolute()
+                && let Some(project_root) = &config.project_root
+            {
+                virtualenv = project_root.join(virtualenv);
             }
             if !virtualenv.exists() {
                 warn!(
@@ -816,13 +878,6 @@ impl Backend for PythonPlugin {
         }
     }
 
-    async fn _idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
-        Ok(vec![
-            ".python-version".to_string(),
-            ".python-versions".to_string(),
-        ])
-    }
-
     /// Python versions follow PEP 440, so `3.15.0a8`-style separator-less
     /// alpha suffixes are pre-releases that the shared filter wouldn't catch
     /// on its own. See `fuzzy_match_versions_pep440`.
@@ -885,7 +940,14 @@ impl Backend for PythonPlugin {
         _config: &Arc<Config>,
         tv: &ToolVersion,
     ) -> eyre::Result<Vec<PathBuf>> {
-        Ok(vec![tv.install_path()])
+        // The install root holds python.exe/python3.exe and the synthesized
+        // pip wrappers; Scripts is where pip installs console-script
+        // launchers (black.exe, ...). Root stays first so interpreter/pip
+        // resolution is stable. Scripts is returned unconditionally per the
+        // trait contract (candidates, not existing dirs — see
+        // Backend::list_bin_paths docs); it may not exist until the first
+        // `pip install`.
+        Ok(vec![tv.install_path(), tv.install_path().join("Scripts")])
     }
 
     async fn exec_env(
@@ -898,7 +960,9 @@ impl Backend for PythonPlugin {
         match self.get_virtualenv(config, tv).await {
             Err(e) => warn!("failed to get virtualenv: {e}"),
             Ok(Some(virtualenv)) => {
-                let bin = virtualenv.join("bin");
+                // Windows venvs place executables in Scripts, not bin (same
+                // handling as the `_.python.venv` env directive)
+                let bin = virtualenv.join(if cfg!(windows) { "Scripts" } else { "bin" });
                 hm.insert("VIRTUAL_ENV".into(), virtualenv.to_string_lossy().into());
                 hm.insert("MISE_ADD_PATH".into(), bin.to_string_lossy().into());
             }

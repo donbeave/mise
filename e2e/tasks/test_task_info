@@ -44,6 +44,11 @@ assert_json "mise tasks info lint --json" "$(
   "interactive": false,
   "sources": [],
   "outputs": [],
+  "cache": {
+    "enabled": false,
+    "env": [],
+    "command_inputs": []
+  },
   "shell": null,
   "quiet": false,
   "silent": false,

@@ -187,14 +187,20 @@ pub fn remove_all_with_progress<P: AsRef<Path>>(path: P, pr: &dyn SingleReport) 
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<()> {
     let from = from.as_ref();
     let to = to.as_ref();
-    trace!("mv {} {}", from.display(), to.display());
-    do_rename(from, to).wrap_err_with(|| {
+    try_rename(from, to).wrap_err_with(|| {
         format!(
             "failed rename: {} -> {}",
             display_path(from),
             display_path(to)
         )
     })
+}
+
+pub(crate) fn try_rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> std::io::Result<()> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    trace!("mv {} {}", from.display(), to.display());
+    do_rename(from, to)
 }
 
 #[cfg(windows)]
@@ -228,17 +234,18 @@ fn do_rename(from: &Path, to: &Path) -> std::io::Result<()> {
 ///
 /// This preserves the normal `rename` behavior when possible, but avoids cross-device failures
 /// (`ErrorKind::CrossesDevices`) when `from` and `to` live on separate mounts (for example, when
-/// downloads are cached on one volume and installs are written to another).
+/// downloads are cached on one volume and installs are written to another). Directory fallbacks
+/// preserve symlinks and file/directory permissions.
 pub fn move_file<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<()> {
     let from = from.as_ref();
     let to = to.as_ref();
 
-    match do_rename(from, to) {
+    match try_rename(from, to) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
             if from.is_dir() {
                 create_dir_all(to)?;
-                copy_dir_all(from, to)?;
+                copy_dir_all_preserve_symlinks(from, to)?;
                 remove_all(from)?;
             } else {
                 copy(from, to)?;
@@ -284,14 +291,16 @@ pub fn copy_dir_all<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<()
     })
 }
 
-fn copy_dir_all_preserve_symlinks(from: &Path, to: &Path) -> Result<()> {
+pub fn copy_dir_all_preserve_symlinks(from: &Path, to: &Path) -> Result<()> {
     trace!("cp -a {} {}", from.display(), to.display());
+    let mut directory_permissions = vec![(to.to_path_buf(), fs::metadata(from)?.permissions())];
     for entry in WalkDir::new(from).follow_links(false).min_depth(1) {
         let entry = entry?;
         let relative = entry.path().strip_prefix(from)?;
         let dest = to.join(relative);
         if entry.file_type().is_dir() {
             create_dir_all(&dest)?;
+            directory_permissions.push((dest, entry.metadata()?.permissions()));
         } else if entry.file_type().is_symlink() {
             create_dir_all(dest.parent().unwrap())?;
             make_symlink(&fs::read_link(entry.path())?, &dest)?;
@@ -299,6 +308,11 @@ fn copy_dir_all_preserve_symlinks(from: &Path, to: &Path) -> Result<()> {
             create_dir_all(dest.parent().unwrap())?;
             copy(entry.path(), &dest)?;
         }
+    }
+    // Apply directory permissions after copying children so read-only source
+    // directories do not prevent populating their destination.
+    for (path, permissions) in directory_permissions.into_iter().rev() {
+        fs::set_permissions(path, permissions)?;
     }
     Ok(())
 }
@@ -321,6 +335,56 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String> {
     trace!("cat {}", path.display_user());
     fs::read_to_string(path)
         .wrap_err_with(|| format!("failed read_to_string: {}", path.display_user()))
+}
+
+/// Decode text that may begin with a byte-order mark.
+///
+/// `std`'s UTF-8-only readers reject UTF-16 outright, which is how a checksum file sank an install
+/// in #5399: PowerShell shipped `hashes.sha256` as UTF-16LE and mise stopped at "stream did not
+/// contain valid UTF-8". Windows PowerShell 5.1's `Out-File` writes UTF-16LE by default, so any
+/// project generating checksums that way produces the same thing.
+///
+/// Only a BOM switches the encoding. Detecting UTF-16 without one means guessing from the density
+/// of NUL bytes, which can misfire on binary input; `Out-File` always writes a BOM, so the guess
+/// buys nothing here. Input with no BOM is decoded as UTF-8, exactly as before.
+pub fn decode_text(bytes: &[u8]) -> Result<String> {
+    fn from_utf16(bytes: &[u8], to_u16: fn([u8; 2]) -> u16, label: &str) -> Result<String> {
+        if !bytes.len().is_multiple_of(2) {
+            bail!(
+                "truncated {label} text: {} bytes is not a whole number of code units",
+                bytes.len()
+            );
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|c| to_u16([c[0], c[1]]))
+            .collect_vec();
+        String::from_utf16(&units).wrap_err_with(|| format!("invalid {label} text"))
+    }
+
+    match bytes {
+        [0xef, 0xbb, 0xbf, rest @ ..] => {
+            String::from_utf8(rest.to_vec()).wrap_err("invalid UTF-8 text after a UTF-8 BOM")
+        }
+        [0xff, 0xfe, rest @ ..] => from_utf16(rest, u16::from_le_bytes, "UTF-16LE"),
+        [0xfe, 0xff, rest @ ..] => from_utf16(rest, u16::from_be_bytes, "UTF-16BE"),
+        _ => String::from_utf8(bytes.to_vec())
+            .wrap_err("invalid UTF-8 text, and no byte-order mark identifying another encoding"),
+    }
+}
+
+/// [`read_to_string`], but tolerant of a byte-order mark. See [`decode_text`].
+///
+/// Only reads *from disk* need this. Bodies fetched over HTTP already arrive decoded: reqwest's
+/// `text()` goes through `text_with_charset` -> `encoding_rs::Encoding::decode`, which sniffs a BOM
+/// and lets it override the declared charset. `std::fs::read_to_string` has no such step, and that
+/// asymmetry is the only reason this function exists — reaching for it on an `HTTP.get_text` result
+/// would be redundant.
+pub fn read_to_string_bom<P: AsRef<Path>>(path: P) -> Result<String> {
+    let path = path.as_ref();
+    trace!("cat {}", path.display_user());
+    let bytes = fs::read(path).wrap_err_with(|| format!("failed read: {}", path.display_user()))?;
+    decode_text(&bytes).wrap_err_with(|| format!("failed to decode {}", path.display_user()))
 }
 
 pub async fn read_to_string_async<P: AsRef<Path>>(path: P) -> Result<String> {
@@ -362,6 +426,14 @@ pub fn display_path<P: AsRef<Path>>(path: P) -> String {
     path.as_ref().display_user()
 }
 
+pub fn display_filename<P: AsRef<Path>>(path: P) -> String {
+    let path = path.as_ref();
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn display_rel_path<P: AsRef<Path>>(path: P) -> String {
     let path = path.as_ref();
     match path.strip_prefix(dirs::CWD.as_ref().unwrap()) {
@@ -378,11 +450,35 @@ pub fn replace_paths_in_string<S: Display>(input: S) -> String {
 }
 
 /// replaces "~" with $HOME
+///
+/// The remainder is re-joined one component at a time rather than pushed as a
+/// single slice. `Path::strip_prefix` returns a raw subslice of the input — it
+/// trims the remainder's leading/trailing separators but leaves interior ones
+/// untouched — so `HOME.join(rest)` only prepends a separator. On Windows that
+/// made `~/.local/share/mise` expand to `C:\Users\me\.local/share/mise`, and
+/// since `MISE_DATA_DIR` flows into `dirs::DATA`/`INSTALLS`, that mixed-separator
+/// path surfaced verbatim in `mise where`, `mise which`, `mise ls --json`,
+/// `mise bin-paths`, shims, and error messages.
+///
+/// Rebuilding from `components()` also folds redundant separators and `.`
+/// segments; `..` is preserved. On unix the result is byte-identical to the old
+/// behavior for any ordinary input.
+///
+/// Paths without a `~/` prefix are returned unchanged: a user-supplied
+/// `C:/mise/data` stays exactly as typed. This is a tilde expander, not a path
+/// normalizer — one caller passes glob patterns through it
+/// (`config::expand_task_include`).
 pub fn replace_path<P: AsRef<Path>>(path: P) -> PathBuf {
     let path = path.as_ref();
-    match path.starts_with("~/") {
-        true => dirs::HOME.join(path.strip_prefix("~/").unwrap()),
-        false => path.to_path_buf(),
+    match path.strip_prefix("~/") {
+        Ok(rest) => {
+            let mut expanded = dirs::HOME.to_path_buf();
+            for component in rest.components() {
+                expanded.push(component.as_os_str());
+            }
+            expanded
+        }
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -654,6 +750,20 @@ pub fn resolve_symlink(link: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+pub fn is_symlink_to(link: &Path, target: &Path) -> bool {
+    is_symlink_or_junction(link) && same_file::is_same_file(link, target).unwrap_or(false)
+}
+
+#[cfg(unix)]
+pub fn is_symlink_or_junction(path: &Path) -> bool {
+    path.is_symlink()
+}
+
+#[cfg(windows)]
+pub fn is_symlink_or_junction(path: &Path) -> bool {
+    path.is_symlink() || junction::get_target(path).is_ok()
+}
+
 #[cfg(unix)]
 pub fn make_symlink_or_file(target: &Path, link: &Path) -> Result<()> {
     make_symlink(target, link)?;
@@ -730,6 +840,54 @@ pub fn has_shebang(path: &Path) -> bool {
             Ok(buf == *b"#!")
         })
         .unwrap_or(false)
+}
+
+/// Extensions that `windows_executable_extensions` lists but `CreateProcess` cannot
+/// launch: they need an interpreter (`pwsh -File`, `wscript`/`cscript`). `.bat` and
+/// `.cmd` are not here — std routes those through cmd.exe with escaped arguments.
+///
+/// `pub(crate)` so `task::task_executor` can assert that its `shell_from_extension` names
+/// an interpreter for every entry. That function is not `cfg(windows)`-gated, so it cannot
+/// match against this list directly; the correspondence is enforced by a test instead.
+#[cfg(windows)]
+pub(crate) const INTERPRETER_ONLY_EXTENSIONS: [&str; 2] = ["ps1", "vbs"];
+
+/// Check if a file can be executed directly by the OS without a shell wrapper.
+/// On Unix, this checks the executable permission bit.
+/// On Windows, this checks for a known executable extension (.bat, .cmd, .exe, ...)
+/// minus the ones that only an interpreter can run.
+///
+/// Distinct from [`is_executable`], which on Windows deliberately also accepts a
+/// shebang-only file. Callers that hand the path to `Command::new` need this one:
+/// `CreateProcess` can run `.exe`/`.com`/`.cmd`/`.bat`, but not a `.ps1`, a `.vbs`,
+/// or a script that only carries a shebang.
+///
+/// Note that on Windows this never touches the filesystem — it is pure extension
+/// inspection, so it answers true for a `foo.exe` that does not exist. `is_executable`
+/// checks `is_file()` inline; this one does not. A lookup that walks candidate paths must
+/// compose the two, which is what `backend::is_spawnable` does.
+pub fn can_execute_directly(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Compared case-insensitively, the way has_known_executable_extension does:
+        // Windows extensions are not case-sensitive, so PIPX.PS1 is the same file.
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                INTERPRETER_ONLY_EXTENSIONS
+                    .iter()
+                    .any(|only| ext.eq_ignore_ascii_case(only))
+            })
+        {
+            return false;
+        }
+        has_known_executable_extension(path)
+    }
+    #[cfg(not(windows))]
+    {
+        is_executable(path)
+    }
 }
 
 #[cfg(unix)]
@@ -1447,6 +1605,43 @@ pub fn un7z(archive: &Path, dest: &Path, opts: &ExtractOptions<'_>) -> Result<()
     })
 }
 
+/// Whether `name` is a plain file name: exactly one normal path component, with
+/// no separators, parent/root components, or drive prefixes on any platform.
+/// Use to validate user-supplied names (e.g. `bin`, `rename_exe`, `filter_bins`
+/// tool options) before joining them onto a directory, so a value like
+/// `../evil` or `/abs/path` cannot escape it.
+pub fn is_plain_file_name(name: &str) -> bool {
+    // Reject both separators explicitly: `\` is a legal file-name character on
+    // Unix, but these names come from cross-platform config.
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+/// Whether `path` is a non-empty relative path containing only normal
+/// components. Both slash styles are treated as separators so config values are
+/// validated consistently across platforms.
+pub fn is_safe_relative_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if normalized.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return false;
+    }
+    let mut components = Path::new(&normalized).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 fn sanitize_7z_entry_path(path: &str) -> Result<PathBuf> {
     let normalized = PathBuf::from(path.replace('\\', "/"));
     let mut safe_path = PathBuf::new();
@@ -1475,18 +1670,83 @@ pub fn split_file_name(path: &Path) -> (String, String) {
 }
 
 pub fn same_file(a: &Path, b: &Path) -> bool {
-    desymlink_path(a) == desymlink_path(b)
+    a == b || desymlink_path(a) == desymlink_path(b)
+}
+
+/// Returns whether `path` starts with `prefix` either lexically or after
+/// resolving symlinks and the existing path prefix.
+pub fn path_starts_with_resolved(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix) || desymlink_path(path).starts_with(desymlink_path(prefix))
+}
+
+fn resolve_path_with_existing_prefix(path: &Path) -> PathBuf {
+    let mut resolved = if path.is_relative() {
+        env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::new()
+    };
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if matches!(component, std::path::Component::CurDir) {
+            continue;
+        }
+        #[cfg(windows)]
+        if matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            // A drive prefix such as `C:` is drive-relative until its root is
+            // present, so do not canonicalize the two components separately.
+            resolved.push(component.as_os_str());
+            continue;
+        }
+        let candidate = resolved.join(component.as_os_str());
+        match candidate.canonicalize() {
+            Ok(candidate) => resolved = candidate,
+            Err(_) => {
+                #[cfg(windows)]
+                {
+                    // PathBuf::push lexically resolves `..` after a verbatim
+                    // (`\\?\`) prefix, but the unresolved suffix must remain
+                    // opaque so two potentially different files stay distinct.
+                    let mut raw = resolved.into_os_string();
+                    if Path::new(&raw).file_name().is_some() {
+                        raw.push("\\");
+                    }
+                    raw.push(component.as_os_str());
+                    for component in components {
+                        raw.push("\\");
+                        raw.push(component.as_os_str());
+                    }
+                    resolved = raw.into();
+                }
+                #[cfg(not(windows))]
+                {
+                    resolved.push(component.as_os_str());
+                    resolved.extend(components.map(|component| component.as_os_str()));
+                }
+                break;
+            }
+        }
+    }
+    resolved
 }
 
 pub fn desymlink_path(p: &Path) -> PathBuf {
     if p.is_symlink()
         && let Ok(target) = fs::read_link(p)
     {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            p.parent().unwrap_or_else(|| Path::new("")).join(target)
+        };
         return target
             .canonicalize()
-            .unwrap_or_else(|_| target.to_path_buf());
+            .unwrap_or_else(|_| resolve_path_with_existing_prefix(&target));
     }
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    p.canonicalize()
+        .unwrap_or_else(|_| resolve_path_with_existing_prefix(p))
 }
 
 pub fn clone_dir(from: &PathBuf, to: &PathBuf) -> Result<()> {
@@ -1814,6 +2074,103 @@ mod tests {
         assert_eq!(run_blocking(|| 42), 42);
     }
 
+    fn utf16le(s: &str) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    #[test]
+    fn test_decode_text_honours_a_byte_order_mark() {
+        // the encoding that broke #5399 — PowerShell shipped hashes.sha256 as UTF-16LE
+        assert_eq!(decode_text(&utf16le("abc\n")).unwrap(), "abc\n");
+
+        let mut be = vec![0xfe, 0xff];
+        be.extend("abc\n".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(decode_text(&be).unwrap(), "abc\n");
+
+        // a UTF-8 BOM is stripped rather than left to poison the first token
+        assert_eq!(decode_text(b"\xef\xbb\xbfabc\n").unwrap(), "abc\n");
+
+        // no BOM: unchanged from plain `read_to_string`
+        assert_eq!(decode_text(b"abc\n").unwrap(), "abc\n");
+        assert_eq!(decode_text(b"").unwrap(), "");
+    }
+
+    #[test]
+    fn test_decode_text_rejects_what_it_cannot_decode() {
+        // invalid UTF-8 with no BOM still fails, but says why rather than "stream did not
+        // contain valid UTF-8"
+        let err = decode_text(b"\xff\x00abc").unwrap_err().to_string();
+        assert!(err.contains("byte-order mark"), "{err}");
+
+        // an odd trailing byte cannot be a whole UTF-16 code unit
+        let mut truncated = utf16le("abc");
+        truncated.pop();
+        let err = decode_text(&truncated).unwrap_err().to_string();
+        assert!(err.contains("truncated UTF-16LE"), "{err}");
+
+        // an unpaired surrogate is well-formed UTF-16 bytes but not a valid string
+        let err = decode_text(&[0xff, 0xfe, 0x00, 0xd8])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid UTF-16LE"), "{err}");
+    }
+
+    #[test]
+    fn test_read_to_string_bom_decodes_a_utf16_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("hashes.sha256");
+        fs::write(&path, utf16le("deadbeef *tool.tar.gz\n")).unwrap();
+
+        assert_eq!(
+            read_to_string_bom(&path).unwrap(),
+            "deadbeef *tool.tar.gz\n"
+        );
+        // the plain reader is what #5399 hit, and is deliberately left alone
+        assert!(read_to_string(&path).is_err());
+    }
+
+    #[test]
+    fn test_is_plain_file_name() {
+        for ok in ["tool", "my-tool.exe", "tool.tar.gz", "..hidden", "a b"] {
+            assert!(is_plain_file_name(ok), "should accept {ok:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../tool",
+            "a/b",
+            "/abs/tool",
+            "..\\tool",
+            "a\\b",
+            "C:\\tool",
+        ] {
+            assert!(!is_plain_file_name(bad), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_safe_relative_path() {
+        for ok in ["tool", "bin/tool", "nested/path/tool.exe", "a b/tool"] {
+            assert!(is_safe_relative_path(ok), "should accept {ok:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../tool",
+            "bin/../../tool",
+            "/abs/tool",
+            "..\\tool",
+            "C:\\tool",
+            "\\\\server\\share\\tool",
+        ] {
+            assert!(!is_safe_relative_path(bad), "should reject {bad:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_run_blocking_current_thread_runtime() {
         // #[tokio::test] uses a current-thread runtime, where
@@ -1827,6 +2184,108 @@ mod tests {
         // matches mise's actual runtime (see main.rs) — takes the real
         // tokio::task::block_in_place path
         assert_eq!(run_blocking(|| 42), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_desymlink_path_resolves_relative_target_from_link_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target_dir = root.path().join("target");
+        let link_dir = root.path().join("links");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::create_dir_all(&link_dir).unwrap();
+        let target = target_dir.join("file");
+        fs::write(&target, "test").unwrap();
+        let link = link_dir.join("file");
+        symlink("../target/file", &link).unwrap();
+
+        assert_eq!(desymlink_path(&link), target.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_desymlink_path_normalizes_broken_relative_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let link_dir = root.path().join("links");
+        let nested_dir = root.path().join("nested");
+        fs::create_dir_all(&link_dir).unwrap();
+        fs::create_dir_all(&nested_dir).unwrap();
+        let link = link_dir.join("missing");
+        symlink("../nested/../missing", &link).unwrap();
+        let expected = root.path().canonicalize().unwrap().join("missing");
+
+        assert_eq!(desymlink_path(&link), expected);
+        assert_eq!(
+            desymlink_path(&link),
+            desymlink_path(&root.path().join("missing"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_desymlink_path_resolves_existing_symlink_prefix_before_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_nested = outside.path().join("nested");
+        fs::create_dir_all(&outside_nested).unwrap();
+        let link = root.path().join("link");
+        symlink(&outside_nested, &link).unwrap();
+
+        let through_link = link.join("../.config/mise/tasks/same");
+        let expected = outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".config/mise/tasks/same");
+        let false_match = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".config/mise/tasks/same");
+
+        assert_eq!(desymlink_path(&through_link), expected);
+        assert_ne!(desymlink_path(&through_link), desymlink_path(&false_match));
+    }
+
+    #[test]
+    fn test_desymlink_path_preserves_parent_after_missing_component() {
+        let root = tempfile::tempdir().unwrap();
+        let unresolved = root.path().join("missing/../target");
+        let canonical_root = root.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let expected = {
+            let mut expected = canonical_root.as_os_str().to_os_string();
+            expected.push("\\missing\\..\\target");
+            PathBuf::from(expected)
+        };
+        #[cfg(not(windows))]
+        let expected = canonical_root.join("missing/../target");
+
+        assert_eq!(desymlink_path(&unresolved), expected);
+        assert_ne!(
+            desymlink_path(&unresolved),
+            desymlink_path(&canonical_root.join("target"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_desymlink_path_preserves_absolute_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::write(&target, "test").unwrap();
+        let link = root.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(desymlink_path(&link), target.canonicalize().unwrap());
     }
 
     #[test]
@@ -2037,9 +2496,7 @@ mod tests {
             .into_iter()
             .map(|s| s.to_string())
             .collect_vec();
-        #[allow(clippy::needless_collect)]
-        let find_up = FindUp::new(path, &filenames).collect::<Vec<_>>();
-        let mut find_up = find_up.into_iter();
+        let mut find_up = FindUp::new(path, &filenames);
         assert_eq!(
             find_up.next(),
             Some(dirs::HOME.join("cwd/.test-tool-versions"))
@@ -2077,11 +2534,73 @@ mod tests {
         assert_eq!(display_path(&path), path.display().to_string());
     }
 
+    #[test]
+    fn test_display_filename() {
+        assert_eq!(display_filename("/tmp/mise.toml"), "mise.toml");
+        assert_eq!(display_filename("/"), "/");
+    }
+
     #[tokio::test]
     async fn test_replace_path() {
         let _config = Config::get().await.unwrap();
         assert_eq!(replace_path(Path::new("~/cwd")), dirs::HOME.join("cwd"));
         assert_eq!(replace_path(Path::new("/cwd")), Path::new("/cwd"));
+    }
+
+    #[test]
+    fn test_replace_path_uses_platform_separators() {
+        // `strip_prefix("~/")` returns a raw subslice of the input, so the naive
+        // `HOME.join(rest)` only prepended a separator and left the interior ones
+        // alone: on Windows `MISE_DATA_DIR=~/.local/share/mise` used to expand to
+        // `C:\Users\me\.local/share/mise`, which then leaked out through
+        // `mise where`, `mise which`, `mise ls --json`, shims, and error messages.
+        //
+        // NOTE: comparing PathBufs is not enough here — `Path`'s `PartialEq` is
+        // component-based and treats `/` and `\` as equivalent on Windows, so the
+        // buggy value compares equal to the correct one. The string form is the
+        // assertion that matters.
+        let expanded = replace_path(Path::new("~/a/b"));
+        let expected = dirs::HOME.join("a").join("b");
+        assert_eq!(expanded, expected);
+        assert_eq!(expanded.to_string_lossy(), expected.to_string_lossy());
+
+        // independent of whatever HOME itself looks like
+        #[cfg(windows)]
+        {
+            let rest = expanded.strip_prefix(*dirs::HOME).unwrap();
+            assert!(
+                !rest.to_string_lossy().contains('/'),
+                "expanded remainder must use `\\`: {}",
+                expanded.display()
+            );
+        }
+
+        // a bare `~` expands to $HOME: `strip_prefix("~/")` is component-based,
+        // so `~` matches the prefix and the remainder is empty
+        assert_eq!(replace_path(Path::new("~")), *dirs::HOME);
+
+        // non-`~/` input is passed through untouched, separators and all
+        assert_eq!(
+            replace_path(Path::new("/cwd/x")).to_string_lossy(),
+            "/cwd/x"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_pathbuf_hashset_is_separator_insensitive() {
+        // `EnvDiff::path` is Vec<PathBuf> and `get_pristine_env` strips
+        // mise-added PATH entries via a HashSet<&PathBuf>. `Path`'s Hash/Eq are
+        // component-based and both `/` and `\` are separators on Windows, so a
+        // `__MISE_DIFF` written by an older mise (mixed separators) still matches
+        // after the expansion fix above — no migration is needed.
+        let mut set = std::collections::HashSet::new();
+        set.insert(PathBuf::from(
+            r"C:\Users\me\.local/share/mise/installs/go/1/bin",
+        ));
+        assert!(set.contains(&PathBuf::from(
+            r"C:\Users\me\.local\share\mise\installs\go\1\bin"
+        )));
     }
 
     #[test]

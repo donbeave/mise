@@ -225,10 +225,20 @@ fn linked_keg(opt_link: &Path) -> Option<(String, PathBuf)> {
 
 fn unlink_and_remove_keg(candidate: &PruneCandidate) -> Result<()> {
     let links = links_into_keg(&candidate.name, &candidate.keg)?;
+    let prefix_path = prefix::prefix();
     for link in links {
         std::fs::remove_file(&link)
             .wrap_err_with(|| format!("failed rm: {}", file::display_path(&link)))?;
-        remove_empty_parents(&link, &prefix::prefix())?;
+        let linked_dir = prefix::linked_keg_record(&candidate.name)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let stop = if link.parent() == Some(linked_dir.as_path()) {
+            &linked_dir
+        } else {
+            &prefix_path
+        };
+        remove_empty_parents(&link, stop)?;
     }
     file::remove_all(&candidate.keg)?;
     let rack = prefix::cellar().join(&candidate.name);
@@ -242,6 +252,10 @@ fn links_into_keg(name: &str, keg: &Path) -> Result<Vec<PathBuf>> {
     let opt = prefix_path.join("opt").join(name);
     if symlink_points_into(&opt, keg) {
         links.insert(opt);
+    }
+    let linked = prefix::linked_keg_record(name);
+    if symlink_points_into(&linked, keg) {
+        links.insert(linked);
     }
     for dir in pour::LINK_DIRS {
         let root = prefix_path.join(dir);
@@ -268,13 +282,20 @@ fn symlink_points_into(link: &Path, keg: &Path) -> bool {
     let Ok(target) = std::fs::read_link(link) else {
         return false;
     };
-    let target = if target.is_absolute() {
-        target
-    } else {
-        link.parent().unwrap_or_else(|| Path::new("/")).join(target)
+    // resolve one hop only, like link_keg's ownership checks — a Cellar
+    // dylib alias is itself a relative symlink, and chasing the chain
+    // resolved it against the CWD, leaving such links behind as dangling
+    let target =
+        pour::lexical_normalize(&link.parent().unwrap_or_else(|| Path::new("/")).join(target));
+    // canonicalize the parent only, for path spelling (/var -> /private/var);
+    // the final component must stay unresolved
+    let resolved = match (target.parent(), target.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or_else(|_| target.clone()),
+        _ => target.clone(),
     };
-    let keg = file::desymlink_path(keg);
-    file::desymlink_path(&target).starts_with(keg)
+    resolved.starts_with(file::desymlink_path(keg))
 }
 
 fn remove_empty_parents(path: &Path, stop: &Path) -> Result<()> {
@@ -341,6 +362,16 @@ mod tests {
         let bin_link = bin.join(name);
         file::make_symlink(&bin_target, &bin_link)?;
         Ok(file::desymlink_path(&keg))
+    }
+
+    fn write_linked_record(prefix: &Path, name: &str, version: &str) -> Result<()> {
+        let linked = prefix.join("var/homebrew/linked");
+        file::create_dir_all(&linked)?;
+        file::make_symlink(
+            &Path::new("../../../Cellar").join(name).join(version),
+            &linked.join(name),
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -551,15 +582,63 @@ mod tests {
             version: "1.7".to_string(),
             keg: keg.clone(),
         };
+        write_linked_record(tmp.path(), "jq", "1.7")?;
 
         unlink_and_remove_keg(&candidate)?;
 
         assert!(!tmp.path().join("bin").join("jq").exists());
         assert!(!tmp.path().join("opt").join("jq").exists());
+        assert!(
+            tmp.path()
+                .join("var/homebrew/linked/jq")
+                .symlink_metadata()
+                .is_err()
+        );
         assert!(tmp.path().join("bin").exists());
         assert!(tmp.path().join("opt").exists());
         assert!(!keg.exists());
         assert!(!tmp.path().join("Cellar").join("jq").exists());
+        Ok(())
+    }
+
+    /// a prefix link to a Cellar dylib alias resolves through a relative
+    /// symlink chain and must still be removed, not left dangling
+    #[test]
+    fn unlink_and_remove_keg_removes_dylib_alias_links() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let keg = write_keg(
+            tmp.path(),
+            "foo",
+            "1.0",
+            r#"{"installed_on_request":true,"source":{"tap":"homebrew/core"}}"#,
+        )?;
+        file::create_dir_all(keg.join("lib"))?;
+        file::write(keg.join("lib").join("libfoo.1.dylib"), "")?;
+        file::make_symlink(
+            Path::new("libfoo.1.dylib"),
+            &keg.join("lib").join("libfoo.dylib"),
+        )?;
+        let lib = tmp.path().join("lib");
+        file::create_dir_all(&lib)?;
+        for name in ["libfoo.1.dylib", "libfoo.dylib"] {
+            file::make_symlink(
+                &Path::new("../Cellar/foo/1.0/lib").join(name),
+                &lib.join(name),
+            )?;
+        }
+        let candidate = PruneCandidate {
+            name: "foo".to_string(),
+            version: "1.0".to_string(),
+            keg: keg.clone(),
+        };
+
+        unlink_and_remove_keg(&candidate)?;
+
+        assert!(lib.join("libfoo.1.dylib").symlink_metadata().is_err());
+        assert!(lib.join("libfoo.dylib").symlink_metadata().is_err());
+        assert!(!keg.exists());
         Ok(())
     }
 
@@ -581,11 +660,13 @@ mod tests {
                 keg: keg.clone(),
             }],
         };
+        write_linked_record(tmp.path(), "jq", "1.7")?;
 
         apply_prune_plan(&plan, true)?;
 
         assert!(tmp.path().join("bin").join("jq").exists());
         assert!(tmp.path().join("opt").join("jq").exists());
+        assert!(tmp.path().join("var/homebrew/linked/jq").is_symlink());
         assert!(keg.exists());
         Ok(())
     }

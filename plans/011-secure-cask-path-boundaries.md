@@ -146,12 +146,12 @@ prefix lookalike; valid app names and valid in-root absolute targets pass.
 
 ## Done criteria
 
-- [ ] Every API-derived path has an explicit policy and central validator.
-- [ ] Validation runs before side effects.
-- [ ] Token/version remain opaque after single-component validation.
-- [ ] App containment is component-aware, not lexical string prefixing.
-- [ ] Adversarial tests prove no out-of-root mutation.
-- [ ] Focused tests and lint pass.
+- [x] Every API-derived path has an explicit policy and central validator.
+- [x] Validation runs before side effects.
+- [x] Token/version remain opaque after single-component validation.
+- [x] App containment is component-aware, not lexical string prefixing.
+- [x] Adversarial tests prove no out-of-root mutation.
+- [x] Focused tests and lint pass.
 
 ## STOP conditions
 

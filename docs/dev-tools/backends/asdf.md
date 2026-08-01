@@ -53,6 +53,13 @@ need to set env vars other than `PATH`.
 
 See the asdf documentation for more information on [writing plugins](https://asdf-vm.com/plugins/create.html).
 
+The `bin/list-all` and `bin/latest-stable` version scripts receive environment variables and PATH
+additions resolved from mise configuration before tools are loaded. This allows private plugins to
+use credentials, helper executables from `_.path`, or other project-specific values from `[env]`
+while listing versions. Because these values can change the available versions, mise stores
+version-list caches separately for each resolved configuration environment without writing the
+original values or paths to the cache.
+
 ## Tool Options
 
 The following [tool-options](/dev-tools/#tool-options) are available for the `asdf` backend—these
@@ -66,3 +73,17 @@ Set environment variables for asdf plugin install scripts:
 [tools]
 "asdf:owner/plugin" = { version = "latest", install_env = { MAKEFLAGS = "-j8" } }
 ```
+
+### Install dependencies
+
+Tools declared with the [`depends` option](/dev-tools/#tool-dependencies) are installed before the
+asdf tool and added to the `PATH` used by its `bin/download` and `bin/install` scripts:
+
+```toml
+[tools]
+python = "3.12"
+"asdf:owner/plugin" = { version = "latest", depends = ["python"] }
+```
+
+This allows an asdf plugin to invoke an executable supplied by another mise-managed tool during
+the same `mise install`.

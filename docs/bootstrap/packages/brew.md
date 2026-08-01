@@ -67,20 +67,27 @@ installs app bundles into `/Applications` while recording the version under
 "brew-cask:homebrew/cask/visual-studio-code" = "latest"
 ```
 
-`brew-cask` currently supports app-bundle casks (`app` artifacts), binary casks
-(`binary` artifacts), and simple macOS installer packages (`pkg` artifacts)
-from dmg and common archive formats. Binary artifacts are staged in the Caskroom
-and linked into the Homebrew prefix, usually under `<prefix>/bin`. Package
-installers run through mise's normal system-package sudo path, so non-interactive
-runs never hang waiting for a password. Pkg casks must include `pkgutil` receipt
-IDs in their `uninstall` or `zap` metadata so mise can verify installed state
-after the installer writes files outside the Caskroom. For casks with lifecycle
-hooks, mise fetches the sha256-verified cask Ruby source pinned by the API
-metadata and runs supported `preflight`/`postflight` hooks through its own Cask
-DSL shim, without delegating to Homebrew. Casks that require custom installer
-choices, services, unsupported hook DSL, or other cask artifact types fail with
-a clear unsupported artifact error instead of delegating to Homebrew. Generated
-shell completions are not installed.
+`brew-cask` currently supports app-bundle casks (`app` artifacts), binary and
+generated command-wrapper casks (`binary` and `command_wrapper` artifacts),
+simple macOS installer packages (`pkg` artifacts), and shell completions
+(`bash_completion`, `fish_completion`, `zsh_completion`, and
+`generate_completions_from_executable`) from dmg and common archive formats.
+Binary artifacts and generated wrappers are staged in the Caskroom and linked
+into the Homebrew prefix, usually under `<prefix>/bin`. Package installers run
+through mise's normal system-package sudo path, so non-interactive runs never
+hang waiting for a password. Pkg casks must include `pkgutil` receipt IDs in
+their `uninstall` metadata so mise can verify installed state after the
+installer writes files outside the Caskroom. `zap` `pkgutil` IDs are treated as
+cleanup metadata, not install receipts. For casks with lifecycle hooks, mise
+fetches the sha256-verified cask Ruby source pinned by the API metadata and runs
+supported `preflight`/`postflight` hooks through its own Cask DSL shim, without
+delegating to Homebrew. mise also supports structured `preflight_steps` and
+`postflight_steps` for `move`/`remove` operations against `staged_path` and
+`run` operations using Homebrew's serialized command bases, arguments,
+environment, guards, and sudo setting. Casks that require custom installer
+choices, services, unsupported hook DSL, unsupported structured lifecycle
+steps, or other cask artifact types fail with a clear unsupported artifact
+error instead of delegating to Homebrew.
 
 This exists because shared-library packages — postgres, ffmpeg, imagemagick,
 php — fundamentally can't be served by mise's per-project backends like
@@ -127,11 +134,18 @@ against it. Those commands require Homebrew-authored lifecycle authority.
 
 - Genuine Homebrew-authored `.metadata` is **preserved** and never rewritten
   or deleted by mise cleanup.
-- An explicit one-way handoff to Homebrew (for example via supported
-  `brew install --cask --adopt`) is under evaluation; it is not promised
-  until disposable isolation tests prove eligibility and safety.
+- No one-way handoff to Homebrew is supported. In particular,
+  `brew install --cask --adopt` is not supported for production. Use Homebrew
+  from the start when Homebrew lifecycle management is required.
 - Mise package **status** uses the mise/payload ledger only — a missing brew
   tab is not "package missing".
+
+For non-keg-only formulae, mise maintains Homebrew's
+`<prefix>/var/homebrew/linked/<name>` record alongside the `opt` record. For a
+configured formula, if either record is missing, `mise bootstrap packages
+apply` restores it without repouring the keg or replacing its public links.
+Older mise installs are recognised as linked only when their existing public
+links match the keg's layout. Dependency-closure migration is not performed.
 
 mise reads the Homebrew prefix directly, whether formulae were poured by mise
 or by a real Homebrew. It never overwrites files in the prefix that it didn't
@@ -170,8 +184,9 @@ trusted, loadable tracked configs as the source of truth. It removes linked
 Homebrew formulae that are not in the resolved dependency closure of those
 configured `brew:` entries, including formulae installed by a real Homebrew.
 
-Prune removes the active keg, the `opt` link, and prefix symlinks pointing into
-that keg. Use `--dry-run` to preview and `--yes` to skip the confirmation prompt.
+Prune removes the active keg, its `opt` and linked-keg records, and prefix
+symlinks pointing into that keg. Use `--dry-run` to preview and `--yes` to skip
+the confirmation prompt.
 
 This command is mise's declarative cleanup for bootstrap packages, similar to
 [`brew bundle cleanup`](https://docs.brew.sh/Manpage). It is not upstream
@@ -199,7 +214,8 @@ For each formula in the dependency closure (dependencies first):
    signature doesn't match.
 5. **Receipt**: a brew-compatible `INSTALL_RECEIPT.json` is written.
 6. **Link**: `<prefix>/opt/<name>` is created and the keg's `bin`, `lib`,
-   `include`, `share`, etc. are symlinked into the prefix —
+   `include`, `share`, etc. are symlinked into the prefix. The Homebrew
+   linked-keg record is created for non-keg-only formulae.
    [keg-only](https://docs.brew.sh/FAQ#what-does-keg-only-mean) formulae get
    the `opt` link but are not linked into the prefix, same as brew.
 

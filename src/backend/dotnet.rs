@@ -65,7 +65,7 @@ impl Backend for DotnetBackend {
                 // version arrays of packages that are visible.
                 "{}?q={}&packageType=dotnettool&take=1&prerelease={}&semVerLevel=2.0.0",
                 feed_url,
-                &self.tool_name(),
+                self.tool_name(),
                 true
             ))
             .await?;
@@ -119,12 +119,15 @@ impl Backend for DotnetBackend {
         )
         .await;
 
-        let mut cli = CmdLineRunner::new("dotnet")
-            .arg("tool")
-            .arg("install")
-            .arg(self.tool_name())
-            .arg("--tool-path")
-            .arg(tv.install_path().join("bin"));
+        let mut cli = CmdLineRunner::new(
+            self.spawn_program(&ctx.config, Some(&ctx.ts), "dotnet")
+                .await,
+        )
+        .arg("tool")
+        .arg("install")
+        .arg(self.tool_name())
+        .arg("--tool-path")
+        .arg(tv.install_path().join("bin"));
 
         if &tv.version != "latest" {
             cli = cli.arg("--version").arg(&tv.version);

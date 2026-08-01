@@ -3,25 +3,26 @@ use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings, env_directive::EnvDirective};
 use crate::duration;
 use crate::env_diff::EnvDiff;
-#[cfg(not(windows))]
-use crate::file::is_executable;
-use crate::file::{display_path, replace_path};
+use crate::file::{can_execute_directly, display_path, replace_path};
 use crate::sandbox::SandboxConfig;
-use crate::task::TaskKey;
+use crate::task::TaskArtifactCache;
+use crate::task::task_cache::{CommandInput, TaskCacheContext};
 use crate::task::task_context_builder::TaskContextBuilder;
 use crate::task::task_list::split_task_spec;
 use crate::task::task_output::{TaskOutput, trunc};
 use crate::task::task_output_handler::OutputHandler;
+use crate::task::task_scheduler::SchedMsg;
 use crate::task::task_script_parser::subcommand_name_from_parse;
 use crate::task::task_source_checker::{
     remove_auto_output, save_checksum, sources_are_fresh, task_cwd,
 };
-use crate::task::{Deps, FailedTasks, GetMatchingExt, Task};
+use crate::task::{Deps, FailedTasks, GetMatchingExt, Task, TaskCacheMode, TaskCacheOutput};
+use crate::task::{TaskCompletionState, TaskDependencyState};
 use crate::tera::{contains_template_syntax, render_str};
 use crate::toolset::env_cache::CachedEnv;
 use crate::ui::{style, time};
 use duct::IntoExecutablePath;
-use eyre::{Report, Result, ensure, eyre};
+use eyre::{Context, Report, Result, ensure, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(unix)]
@@ -31,6 +32,7 @@ use std::iter::once;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
@@ -41,6 +43,49 @@ use xx::file;
 /// Global lock for interactive task exclusivity.
 /// Interactive tasks acquire a write lock (exclusive), non-interactive tasks acquire a read lock (shared).
 static TASK_RUNTIME_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+type TaskOutputCapture = Arc<StdMutex<Vec<TaskCacheOutput>>>;
+const COMMAND_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_INPUT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) struct TaskRunContext<'a> {
+    pub(crate) task: &'a Task,
+    pub(crate) config: &'a Arc<Config>,
+    pub(crate) sched_tx: Arc<mpsc::UnboundedSender<SchedMsg>>,
+    pub(crate) completion_state: TaskCompletionState,
+    pub(crate) dependency_state: TaskDependencyState,
+    pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) permit: &'a mut Option<OwnedSemaphorePermit>,
+    pub(crate) allow_during_interruption: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TaskExecContext<'a> {
+    task: &'a Task,
+    env: &'a BTreeMap<String, String>,
+    prefix: &'a str,
+    output_capture: Option<&'a TaskOutputCapture>,
+    allow_during_interruption: bool,
+}
+
+struct TaskRunEntriesContext<'a> {
+    config: &'a Arc<Config>,
+    exec: TaskExecContext<'a>,
+    task_env: &'a [(String, String)],
+    sched_tx: Arc<mpsc::UnboundedSender<SchedMsg>>,
+    existing_guard: Option<RuntimeLockGuard<'static>>,
+    completion_state: &'a TaskCompletionState,
+    semaphore: Arc<Semaphore>,
+    permit: &'a mut Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone, Copy)]
+struct TaskInjectionContext<'a> {
+    config: &'a Arc<Config>,
+    task_env: &'a [(String, String)],
+    sched_tx: &'a Arc<mpsc::UnboundedSender<SchedMsg>>,
+    completion_state: &'a TaskCompletionState,
+    allow_during_interruption: bool,
+}
 
 #[allow(dead_code)] // Guards are held for their Drop impl, not read
 enum RuntimeLockGuard<'a> {
@@ -110,6 +155,49 @@ fn display_first_command(script: &str) -> String {
     cmd
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum InlineArgsStyle {
+    PosixCommandText,
+    CmdCommandText,
+    SeparateArgv,
+}
+
+fn inline_args_style(program: &str, shell_args: &[String]) -> InlineArgsStyle {
+    #[cfg(windows)]
+    {
+        let runs_command = shell_args
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case("/c") || f.eq_ignore_ascii_case("/k"));
+        if crate::path::is_cmd_shell_program(Path::new(program)) && runs_command {
+            return InlineArgsStyle::CmdCommandText;
+        }
+        if !crate::path::is_posix_shell_program(Path::new(program)) {
+            return InlineArgsStyle::SeparateArgv;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (program, shell_args);
+    InlineArgsStyle::PosixCommandText
+}
+
+fn append_inline_args(script: &str, args: &[String], style: InlineArgsStyle) -> String {
+    let args = match style {
+        InlineArgsStyle::PosixCommandText => shell_words::join(args),
+        InlineArgsStyle::CmdCommandText => args
+            .iter()
+            .map(|arg| crate::path::quote_arg_for_cmd_body(arg))
+            .join(" "),
+        InlineArgsStyle::SeparateArgv => return script.to_string(),
+    };
+    match (script.is_empty(), args.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => args,
+        (false, true) => script.to_string(),
+        (false, false) => format!("{script} {args}"),
+    }
+}
+
 /// Configuration for TaskExecutor
 pub struct TaskExecutorConfig {
     pub force: bool,
@@ -120,6 +208,7 @@ pub struct TaskExecutorConfig {
     pub continue_on_error: bool,
     pub dry_run: bool,
     pub skip_deps: bool,
+    pub task_cache: TaskCacheMode,
     /// CLI-level sandbox overrides (merged with task-level sandbox config)
     pub sandbox: crate::sandbox::SandboxConfig,
 }
@@ -129,6 +218,7 @@ pub struct TaskExecutor {
     pub context_builder: TaskContextBuilder,
     pub output_handler: OutputHandler,
     pub failed_tasks: FailedTasks,
+    interrupted: AtomicBool,
 
     // CLI flags
     pub force: bool,
@@ -139,7 +229,14 @@ pub struct TaskExecutor {
     pub continue_on_error: bool,
     pub dry_run: bool,
     pub skip_deps: bool,
+    pub task_cache: TaskCacheMode,
     pub sandbox: crate::sandbox::SandboxConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRunOutcome {
+    pub did_work: bool,
+    pub cache_key: Option<String>,
 }
 
 impl TaskExecutor {
@@ -152,6 +249,7 @@ impl TaskExecutor {
             context_builder,
             output_handler,
             failed_tasks: Arc::new(StdMutex::new(Vec::new())),
+            interrupted: AtomicBool::new(false),
             force: config.force,
             cd: config.cd,
             shell: config.shell,
@@ -160,12 +258,28 @@ impl TaskExecutor {
             continue_on_error: config.continue_on_error,
             dry_run: config.dry_run,
             skip_deps: config.skip_deps,
+            task_cache: config.task_cache,
             sandbox: config.sandbox,
         }
     }
 
     pub fn is_stopping(&self) -> bool {
-        !self.failed_tasks.lock().unwrap().is_empty()
+        self.is_interrupted() || !self.failed_tasks.lock().unwrap().is_empty()
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_interrupted(&self) {
+        self.interrupted.store(true, Ordering::Relaxed);
+    }
+
+    fn check_interruption(allow_during_interruption: bool) -> Result<()> {
+        if !allow_during_interruption && crate::ui::ctrlc::is_cancelled() {
+            return Err(crate::errors::Error::TaskInterrupted.into());
+        }
+        Ok(())
     }
 
     pub fn add_failed_task(&self, task: Task, status: Option<i32>) {
@@ -232,6 +346,20 @@ impl TaskExecutor {
                 .chain(self.sandbox.allow_env.iter())
                 .cloned()
                 .collect(),
+            pass_through_env: task
+                .pass_through_env
+                .iter()
+                .chain(self.sandbox.pass_through_env.iter())
+                .cloned()
+                .collect(),
+            cache_env: task
+                .cache
+                .iter()
+                .filter(|cache| cache.enabled)
+                .flat_map(|cache| &cache.env)
+                .chain(self.sandbox.cache_env.iter())
+                .cloned()
+                .collect(),
         };
         sandbox.resolve_paths();
         Ok(sandbox)
@@ -252,33 +380,41 @@ impl TaskExecutor {
         self.timings || Settings::get().task.timings.unwrap_or(default)
     }
 
-    /// Run a task, returning true if the task actually executed (not skipped).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_task_sched(
-        &self,
-        task: &Task,
-        config: &Arc<Config>,
-        sched_tx: Arc<mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
-        completed_tasks: HashSet<TaskKey>,
-        dep_ran: bool,
-        semaphore: Arc<Semaphore>,
-        permit: &mut Option<OwnedSemaphorePermit>,
-    ) -> Result<bool> {
+    /// Run a task, returning whether it did work and any stable artifact identity
+    /// it produced or reused.
+    pub async fn run_task_sched(&self, ctx: TaskRunContext<'_>) -> Result<TaskRunOutcome> {
+        let TaskRunContext {
+            task,
+            config,
+            sched_tx,
+            completion_state,
+            dependency_state,
+            semaphore,
+            permit,
+            allow_during_interruption,
+        } = ctx;
         let prefix = task.estyled_prefix();
         let total_start = std::time::Instant::now();
+        Self::check_interruption(allow_during_interruption)?;
         if Settings::get().task.skip.contains(&task.name) {
             if !self.quiet(Some(task)) {
                 self.eprint(task, &prefix, "skipping task");
             }
-            return Ok(false);
+            return Ok(TaskRunOutcome::default());
         }
-        // If any dependency actually ran, skip the source freshness check
-        // so that downstream tasks are invalidated by upstream changes
-        if !self.force && !dep_ran && sources_are_fresh(task, config).await? {
+        // If any dependency executed or restored, skip the source freshness check
+        // so that downstream tasks are invalidated by upstream changes.
+        let artifact_cache_enabled =
+            self.task_cache.enabled() && task.cache.as_ref().is_some_and(|cache| cache.enabled);
+        if !artifact_cache_enabled
+            && !self.force
+            && !dependency_state.any_did_work
+            && sources_are_fresh(task, config).await?
+        {
             if !self.quiet(Some(task)) {
                 self.eprint(task, &prefix, "sources up-to-date, skipping");
             }
-            return Ok(false);
+            return Ok(TaskRunOutcome::default());
         }
 
         let mut tools = self.tool.clone();
@@ -443,12 +579,143 @@ impl TaskExecutor {
             env.insert("__MISE_DIFF".into(), serialized);
         }
 
+        let task_file = task.file_path(config).await?;
+        let usage_args = || {
+            if let Some(file) = &task_file {
+                once(file.to_string_lossy().to_string())
+                    .chain(task.args.iter().cloned())
+                    .collect()
+            } else {
+                once(String::new())
+                    .chain(task.args.iter().cloned())
+                    .collect()
+            }
+        };
+        self.parse_usage_spec_and_init_env(config, task, &mut env, usage_args, extra_vars.clone())
+            .await?;
+
+        // Confirmation must happen before a cache restore because restoring
+        // outputs mutates the working tree just like executing the task.
+        let confirm_guard = if task.interactive {
+            Some(acquire_runtime_lock(task.interactive).await)
+        } else {
+            None
+        };
+        self.check_confirmation(config, task, &env).await?;
+
+        let artifact_cache = if self.task_cache.enabled()
+            && task.cache.as_ref().is_some_and(|cache| cache.enabled)
+        {
+            match TaskArtifactCache::prepare(task, config, self.dry_run).await? {
+                Some(_) if self.dry_run => None,
+                Some(_) if self.raw(Some(task)) => {
+                    warn!(
+                        "task {} artifact caching disabled for raw or interactive execution",
+                        task.name
+                    );
+                    None
+                }
+                Some(prepared) => {
+                    let command_inputs = self
+                        .resolve_cache_command_inputs(task, config, &env)
+                        .await?;
+                    let cache = prepared
+                        .finish(TaskCacheContext {
+                            task,
+                            config,
+                            toolset: &ts,
+                            resolved_env: &env,
+                            declared_env: &task_env,
+                            dependency_keys: &dependency_state.cache_keys,
+                            command_inputs,
+                        })
+                        .await?;
+                    let current_output = if self.task_cache.reads()
+                        && !self.force
+                        && !dependency_state.any_unkeyed_did_work
+                        && (task.outputs.is_no_files() || sources_are_fresh(task, config).await?)
+                    {
+                        cache.current_output()
+                    } else {
+                        None
+                    };
+                    if let Some(output) = current_output {
+                        if !self.quiet(Some(task)) {
+                            self.eprint(task, &prefix, "sources up-to-date, skipping");
+                        }
+                        self.output_handler
+                            .replay_cached_output(task, &prefix, &output);
+                        return Ok(TaskRunOutcome {
+                            did_work: false,
+                            cache_key: Some(cache.key().to_string()),
+                        });
+                    }
+                    if self.task_cache.reads()
+                        && !self.force
+                        && !dependency_state.any_unkeyed_did_work
+                    {
+                        Self::check_interruption(allow_during_interruption)?;
+                        if let Some(output) = cache.restore(task)? {
+                            if !self.quiet(Some(task)) {
+                                let kind = if task.outputs.is_no_files() {
+                                    "result"
+                                } else {
+                                    "outputs"
+                                };
+                                self.eprint(
+                                    task,
+                                    &prefix,
+                                    &format!("restored {kind} from cache {}", cache.key()),
+                                );
+                            }
+                            self.output_handler
+                                .replay_cached_output(task, &prefix, &output);
+                            if let Err(err) = save_checksum(task, config).await {
+                                warn!(
+                                    "task {} artifact cache checksum update failed: {err}",
+                                    task.name
+                                );
+                            }
+                            if self.task_cache.writes()
+                                && let Err(err) = cache.mark_current()
+                            {
+                                warn!(
+                                    "task {} artifact cache state update failed: {err}",
+                                    task.name
+                                );
+                            }
+                            return Ok(TaskRunOutcome {
+                                did_work: true,
+                                cache_key: Some(cache.key().to_string()),
+                            });
+                        }
+                    }
+                    Some(cache)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let output_capture = artifact_cache
+            .as_ref()
+            .filter(|_| self.task_cache.writes())
+            .map(|_| Arc::new(StdMutex::new(Vec::new())));
+        let exec_ctx = TaskExecContext {
+            task,
+            env: &env,
+            prefix: &prefix,
+            output_capture: output_capture.as_ref(),
+            allow_during_interruption,
+        };
+
         let timer = std::time::Instant::now();
 
-        if let Some(file) = task.file_path(config).await? {
+        if let Some(file) = task_file {
             let exec_start = std::time::Instant::now();
+            Self::check_interruption(allow_during_interruption)?;
             remove_auto_output(task, config).await?;
-            self.exec_file(config, &file, task, &env, &prefix, extra_vars)
+            self.exec_file(config, &file, confirm_guard, exec_ctx)
                 .await?;
             trace!(
                 "task {} exec_file took {}ms (total {}ms)",
@@ -467,40 +734,21 @@ impl TaskExecutor {
                 )
                 .await?;
 
-            let get_args = || {
-                [String::new()]
-                    .iter()
-                    .chain(task.args.iter())
-                    .cloned()
-                    .collect()
-            };
-            self.parse_usage_spec_and_init_env(config, task, &mut env, get_args, extra_vars)
-                .await?;
-
-            // For interactive tasks, acquire the lock before confirmation so the
-            // prompt gets exclusive terminal access (consistent with exec_file path).
-            let confirm_guard = if task.interactive {
-                Some(acquire_runtime_lock(task.interactive).await)
-            } else {
-                None
-            };
-
-            // Check confirmation after usage args are parsed
-            self.check_confirmation(config, task, &env).await?;
-
             let exec_start = std::time::Instant::now();
+            Self::check_interruption(allow_during_interruption)?;
             remove_auto_output(task, config).await?;
             self.exec_task_run_entries(
-                config,
-                task,
-                (&env, &task_env),
-                &prefix,
                 rendered_run_scripts,
-                sched_tx,
-                confirm_guard,
-                &completed_tasks,
-                semaphore,
-                permit,
+                TaskRunEntriesContext {
+                    config,
+                    exec: exec_ctx,
+                    task_env: &task_env,
+                    sched_tx,
+                    existing_guard: confirm_guard,
+                    completion_state: &completion_state,
+                    semaphore,
+                    permit,
+                },
             )
             .await?;
             trace!(
@@ -522,8 +770,36 @@ impl TaskExecutor {
         }
 
         save_checksum(task, config).await?;
+        let cache_key = if self.task_cache.writes()
+            && let Some(cache) = artifact_cache
+        {
+            let output = output_capture
+                .as_ref()
+                .map(|output| output.lock().unwrap().clone())
+                .unwrap_or_default();
+            match cache.store(task, &output) {
+                Ok(()) => {
+                    if let Err(err) = cache.mark_current() {
+                        warn!(
+                            "task {} artifact cache state update failed: {err}",
+                            task.name
+                        );
+                    }
+                    Some(cache.key().to_string())
+                }
+                Err(err) => {
+                    warn!("task {} artifact cache write failed: {err}", task.name);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        Ok(true)
+        Ok(TaskRunOutcome {
+            did_work: true,
+            cache_key,
+        })
     }
 
     fn insert_env_excluded_from_nested_mise_diff(
@@ -550,23 +826,25 @@ impl TaskExecutor {
         env
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn exec_task_run_entries(
         &self,
-        config: &Arc<Config>,
-        task: &Task,
-        full_env: (&BTreeMap<String, String>, &[(String, String)]),
-        prefix: &str,
         rendered_scripts: Vec<(String, Vec<String>)>,
-        sched_tx: Arc<mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
-        existing_guard: Option<RuntimeLockGuard<'static>>,
-        completed_tasks: &HashSet<TaskKey>,
-        semaphore: Arc<Semaphore>,
-        permit: &mut Option<OwnedSemaphorePermit>,
+        ctx: TaskRunEntriesContext<'_>,
     ) -> Result<()> {
-        let (env, task_env) = full_env;
+        let TaskRunEntriesContext {
+            config,
+            exec,
+            task_env,
+            sched_tx,
+            existing_guard,
+            completion_state,
+            semaphore,
+            permit,
+        } = ctx;
+        let task = exec.task;
         use crate::task::RunEntry;
         let mut script_iter = rendered_scripts.into_iter();
+        let mut completion_state = completion_state.clone();
 
         let needs_tera = task.run().iter().any(RunEntry::has_tera_template);
         let mut tera_state = if needs_tera {
@@ -577,7 +855,7 @@ impl TaskExecutor {
             if !usage_values.is_empty() {
                 tera_ctx.insert("usage", &usage_values);
             }
-            tera_ctx.insert("env", env);
+            tera_ctx.insert("env", exec.env);
             Some((tera, tera_ctx))
         } else {
             None
@@ -606,7 +884,7 @@ impl TaskExecutor {
                         if guard.is_none() {
                             guard = Some(acquire_runtime_lock(task.interactive).await);
                         }
-                        self.exec_script(&script, &args, task, env, prefix).await?;
+                        self.exec_script(&script, &args, exec).await?;
                     }
                 }
                 RunEntry::SingleTask {
@@ -635,16 +913,21 @@ impl TaskExecutor {
                     // but we're holding the only one).
                     let had_permit = permit.is_some();
                     *permit = None;
-                    self.inject_and_wait(
-                        config,
-                        &[resolved_spec],
-                        task_env,
-                        override_args.as_deref(),
-                        override_env_ref,
-                        sched_tx.clone(),
-                        completed_tasks,
-                    )
-                    .await?;
+                    let completed = self
+                        .inject_and_wait(
+                            &[resolved_spec],
+                            override_args.as_deref(),
+                            override_env_ref,
+                            TaskInjectionContext {
+                                config,
+                                task_env,
+                                sched_tx: &sched_tx,
+                                completion_state: &completion_state,
+                                allow_during_interruption: exec.allow_during_interruption,
+                            },
+                        )
+                        .await?;
+                    completion_state.merge(completed);
                     if had_permit {
                         *permit = Some(semaphore.clone().acquire_owned().await?);
                     }
@@ -657,16 +940,21 @@ impl TaskExecutor {
                     guard = None; // drop lock before waiting on sub-tasks
                     let had_permit = permit.is_some();
                     *permit = None;
-                    self.inject_and_wait(
-                        config,
-                        &resolved_tasks,
-                        task_env,
-                        None,
-                        None,
-                        sched_tx.clone(),
-                        completed_tasks,
-                    )
-                    .await?;
+                    let completed = self
+                        .inject_and_wait(
+                            &resolved_tasks,
+                            None,
+                            None,
+                            TaskInjectionContext {
+                                config,
+                                task_env,
+                                sched_tx: &sched_tx,
+                                completion_state: &completion_state,
+                                allow_during_interruption: exec.allow_during_interruption,
+                            },
+                        )
+                        .await?;
+                    completion_state.merge(completed);
                     if had_permit {
                         *permit = Some(semaphore.clone().acquire_owned().await?);
                     }
@@ -676,17 +964,20 @@ impl TaskExecutor {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn inject_and_wait(
         &self,
-        config: &Arc<Config>,
         specs: &[String],
-        task_env: &[(String, String)],
         override_args: Option<&[String]>,
         override_env: Option<&[(String, String)]>,
-        sched_tx: Arc<mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
-        completed_tasks: &HashSet<TaskKey>,
-    ) -> Result<()> {
+        ctx: TaskInjectionContext<'_>,
+    ) -> Result<TaskCompletionState> {
+        let TaskInjectionContext {
+            config,
+            task_env,
+            sched_tx,
+            completion_state,
+            allow_during_interruption,
+        } = ctx;
         use crate::task::TaskLoadContext;
         trace!("inject start: {}", specs.join(", "));
         // Build tasks list from specs
@@ -747,7 +1038,7 @@ impl TaskExecutor {
                 to_run.push(t);
             }
         }
-        let sub_deps = Deps::new_pruned(config, to_run, completed_tasks).await?;
+        let sub_deps = Deps::new_pruned(config, to_run, completion_state).await?;
         let sub_deps = Arc::new(Mutex::new(sub_deps));
 
         // Pump subgraph into scheduler and signal completion via oneshot when done
@@ -767,7 +1058,11 @@ impl TaskExecutor {
                             any = true;
                             let task = task.derive_env(&task_env_directives);
                             trace!("inject initial leaf: {} {}", task.name, task.args.join(" "));
-                            let _ = sched_tx.send((task, sub_deps_clone.clone()));
+                            let _ = sched_tx.send(SchedMsg::new(
+                                task,
+                                sub_deps_clone.clone(),
+                                allow_during_interruption,
+                            ));
                         }
                         Ok(None) => {
                             trace!("inject initial done");
@@ -797,7 +1092,11 @@ impl TaskExecutor {
                                 task.args.join(" ")
                             );
                             let task = task.derive_env(&task_env_directives);
-                            let _ = sched_tx.send((task, sub_deps_clone.clone()));
+                            let _ = sched_tx.send(SchedMsg::new(
+                                task,
+                                sub_deps_clone.clone(),
+                                allow_during_interruption,
+                            ));
                         }
                         None => {
                             let _ = done_tx.send(());
@@ -812,7 +1111,7 @@ impl TaskExecutor {
         // Wait for completion with a check for early stopping
         loop {
             // Check if we should stop early due to failure
-            if self.is_stopping() && !self.continue_on_error {
+            if self.is_stopping() && !self.continue_on_error && !allow_during_interruption {
                 trace!("inject_and_wait: stopping early due to failure");
                 // Clean up the dependency graph to ensure completion
                 let mut deps = sub_deps.lock().await;
@@ -843,45 +1142,42 @@ impl TaskExecutor {
         }
 
         // Final check if we failed during the execution
-        if self.is_stopping() && !self.continue_on_error {
+        if self.is_stopping() && !self.continue_on_error && !allow_during_interruption {
             return Err(eyre!("task sequence aborted due to failure"));
         }
 
-        Ok(())
+        let completion_state = sub_deps.lock().await.completion_state();
+        Ok(completion_state)
     }
 
     async fn exec_script(
         &self,
         script: &str,
         args: &[String],
-        task: &Task,
-        env: &BTreeMap<String, String>,
-        prefix: &str,
+        ctx: TaskExecContext<'_>,
     ) -> Result<()> {
         let config = Config::get().await?;
         let script = script.trim_start();
+        let display_script = self.display_script_with_args(script, args, ctx.task)?;
         // For display, skip leading shebang/blank/`set ...` boilerplate and join
         // backslash-continued lines so the header shows the first real command as a
         // single logical line (see display_first_command). When show_full_cmd is set,
         // keep the whole script instead — the reduction would otherwise discard every
         // line past the first command, making the setting a no-op (#10469, #9844).
         let display_script = if Settings::get().task.show_full_cmd {
-            script.to_string()
+            display_script
         } else {
-            display_first_command(script)
+            display_first_command(&display_script)
         };
-        let args_str = args.join(" ");
-        let cmd = match (display_script.is_empty(), args_str.is_empty()) {
-            (true, true) => "$".to_string(),
-            (true, false) => format!("$ {args_str}"),
-            (false, true) => format!("$ {display_script}"),
-            (false, false) => format!("$ {display_script} {args_str}"),
+        let cmd = match display_script.is_empty() {
+            true => "$".to_string(),
+            false => format!("$ {display_script}"),
         };
-        if !self.quiet(Some(task)) {
-            let msg = style::ebold(trunc(prefix, config.redact(&cmd).trim()))
+        if !self.quiet(Some(ctx.task)) {
+            let msg = style::ebold(trunc(ctx.prefix, config.redact(&cmd).trim()))
                 .bright()
                 .to_string();
-            self.eprint(task, prefix, &msg)
+            self.eprint(ctx.task, ctx.prefix, &msg)
         }
 
         if script.starts_with("#!") {
@@ -889,14 +1185,36 @@ impl TaskExecutor {
             let file = dir.path().join("script");
             tokio::fs::write(&file, script.as_bytes()).await?;
             file::make_executable(&file)?;
-            self.exec_with_text_file_busy_retry(&file, args, task, env, prefix)
-                .await
+            self.exec_with_text_file_busy_retry(&file, args, ctx).await
         } else {
             let (program, args, cmd_verbatim) =
-                self.get_cmd_program_and_args(script, task, args)?;
-            self.exec_program(&program, &args, task, env, prefix, cmd_verbatim)
-                .await
+                self.get_cmd_program_and_args(script, ctx.task, args)?;
+            self.exec_program(&program, &args, cmd_verbatim, ctx).await
         }
+    }
+
+    /// Build the script text represented by the task command header.
+    ///
+    /// Inline task arguments follow the same shell-specific strategy used for
+    /// execution before the first command is selected for display. Shebang tasks
+    /// receive arguments as script argv instead, so attaching them to a command in
+    /// the script would be misleading.
+    fn display_script_with_args(
+        &self,
+        script: &str,
+        args: &[String],
+        task: &Task,
+    ) -> Result<String> {
+        if script.starts_with("#!") || args.is_empty() {
+            return Ok(script.to_string());
+        }
+        let shell = task.shell()?.unwrap_or(self.clone_default_inline_shell()?);
+        let (program, shell_args) = task_shell_parts(&shell, "inline shell")?;
+        Ok(append_inline_args(
+            script,
+            args,
+            inline_args_style(program, shell_args),
+        ))
     }
 
     fn get_file_program_and_args(
@@ -909,11 +1227,12 @@ impl TaskExecutor {
         if !Settings::get().use_file_shell_for_executable_tasks && can_execute_directly(file) {
             return Ok((display, args.to_vec()));
         }
-        let shell = task
+        let mut shell = task
             .shell()?
             .or_else(|| shell_from_shebang(file))
             .or_else(|| shell_from_extension(file))
             .unwrap_or(Settings::get().default_file_shell()?);
+        Settings::get().maybe_no_profile(&mut shell);
         let (program, _) = task_shell_parts(&shell, "file shell")?;
         trace!("using shell: {}", shell.join(" "));
         let mut full_args = shell.to_vec();
@@ -951,21 +1270,20 @@ impl TaskExecutor {
             // in a single outer quote pair, and use `/s` so cmd strips exactly
             // that pair and runs the rest — inner quotes included — verbatim.
             // See discussion #9355.
-            let runs_command = _shell_args
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case("/c") || f.eq_ignore_ascii_case("/k"));
-            if crate::path::is_cmd_shell_program(Path::new(program)) && runs_command {
-                let cmd_args = crate::path::cmd_verbatim_args(_shell_args, script, args);
-                return Ok((program.to_string(), cmd_args, true));
-            }
-            // Non-POSIX, non-cmd shells (e.g. `pwsh -Command`) use a different
-            // quoting convention than `shell_words` (which is POSIX), so keep
-            // passing their forwarded args as separate argv. Only POSIX shells
-            // (`bash -c`, `sh -c`, …) fall through to the shared append below.
-            if !crate::path::is_posix_shell_program(Path::new(program)) {
-                full_args.push(script.to_string());
-                full_args.extend(args.iter().cloned());
-                return Ok((program.to_string(), full_args[1..].to_vec(), false));
+            match inline_args_style(program, _shell_args) {
+                InlineArgsStyle::CmdCommandText => {
+                    let cmd_args = crate::path::cmd_verbatim_args(_shell_args, script, args);
+                    return Ok((program.to_string(), cmd_args, true));
+                }
+                InlineArgsStyle::SeparateArgv => {
+                    // Non-POSIX, non-cmd shells (e.g. `pwsh -Command`) use a
+                    // different quoting convention than `shell_words` (which is
+                    // POSIX), so keep passing forwarded args as separate argv.
+                    full_args.push(script.to_string());
+                    full_args.extend(args.iter().cloned());
+                    return Ok((program.to_string(), full_args[1..].to_vec(), false));
+                }
+                InlineArgsStyle::PosixCommandText => {}
             }
         }
 
@@ -985,84 +1303,133 @@ impl TaskExecutor {
 
     fn clone_default_inline_shell(&self) -> Result<Vec<String>> {
         if let Some(shell) = &self.shell {
-            crate::path::split_shell_command(shell)
+            let mut shell = crate::path::split_shell_command(shell)?;
+            Settings::get().maybe_no_profile(&mut shell);
+            Ok(shell)
         } else {
             Settings::get().default_inline_shell()
         }
+    }
+
+    async fn resolve_cache_command_inputs(
+        &self,
+        task: &Task,
+        config: &Arc<Config>,
+        resolved_env: &BTreeMap<String, String>,
+    ) -> Result<Vec<CommandInput>> {
+        let cache = task.cache.as_ref().expect("cache must be configured");
+        if cache.command_inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = task_cwd(task, config).await?;
+        let sandbox = self.build_sandbox_for_task(task, config).await?;
+        let filtered_env = if sandbox.is_active() {
+            sandbox.filter_env(resolved_env)
+        } else {
+            resolved_env.clone()
+        };
+        let timeout = task
+            .timeout
+            .as_ref()
+            .and_then(|value| match duration::parse_duration(value) {
+                Ok(timeout) => Some(timeout),
+                Err(err) => {
+                    warn!("invalid timeout {:?} for task {}: {err}", value, task.name);
+                    None
+                }
+            })
+            .unwrap_or(COMMAND_INPUT_TIMEOUT);
+        let mut inputs = Vec::with_capacity(cache.command_inputs.len());
+        for command in &cache.command_inputs {
+            if command.trim().is_empty() {
+                eyre::bail!(
+                    "task {} cache command input must not be empty: {command:?}",
+                    task.name
+                );
+            }
+            let (program, args, cmd_verbatim) =
+                self.get_cmd_program_and_args(command, task, &[])?;
+            #[cfg(not(windows))]
+            let _ = cmd_verbatim;
+            let program = program.to_executable();
+            #[cfg(windows)]
+            let program = crate::path::resolve_posix_shell_program_path(&program, &filtered_env)
+                .unwrap_or(program);
+            let env = maybe_convert_env_for_msys_shell(Path::new(&program), &filtered_env);
+            let runner = CmdLineRunner::new(program);
+            #[cfg(windows)]
+            let runner = if cmd_verbatim {
+                args.iter().fold(runner, |runner, arg| runner.raw_arg(arg))
+            } else {
+                runner.args(&args)
+            };
+            #[cfg(not(windows))]
+            let runner = runner.args(&args);
+            let mut runner = runner
+                .current_dir(&root)
+                .env_clear()
+                .envs(env.as_ref())
+                .with_timeout(timeout)
+                .with_sandbox(sandbox.clone());
+            runner.apply_sandbox().await?;
+            let (stdout_hash, stderr_hash) = runner
+                .execute_hashes_async(COMMAND_INPUT_MAX_OUTPUT_BYTES)
+                .await
+                .wrap_err_with(|| {
+                    format!("task {} cache command input failed: {command:?}", task.name)
+                })?;
+            inputs.push(CommandInput {
+                command: command.clone(),
+                stdout_hash,
+                stderr_hash,
+            });
+        }
+        Ok(inputs)
     }
 
     async fn exec_file(
         &self,
         config: &Arc<Config>,
         file: &Path,
-        task: &Task,
-        env: &BTreeMap<String, String>,
-        prefix: &str,
-        extra_vars: Option<IndexMap<String, String>>,
+        guard: Option<RuntimeLockGuard<'static>>,
+        ctx: TaskExecContext<'_>,
     ) -> Result<()> {
-        let mut env = env.clone();
-        let command = file.to_string_lossy().to_string();
-        let args = task.args.iter().cloned().collect_vec();
-        let get_args = || once(command.clone()).chain(args.clone()).collect_vec();
-        self.parse_usage_spec_and_init_env(config, task, &mut env, get_args, extra_vars)
-            .await?;
+        let args = ctx.task.args.iter().cloned().collect_vec();
 
-        // For interactive tasks, acquire the lock before confirmation so the
-        // prompt gets exclusive terminal access. For non-interactive tasks,
-        // acquire after confirmation to avoid blocking the task graph.
-        let guard = if task.interactive {
-            Some(acquire_runtime_lock(task.interactive).await)
-        } else {
-            None
-        };
-
-        // Check confirmation after usage args are parsed
-        self.check_confirmation(config, task, &env).await?;
-
-        if !self.quiet(Some(task)) {
+        if !self.quiet(Some(ctx.task)) {
             let cmd = format!("{} {}", display_path(file), args.join(" "))
                 .trim()
                 .to_string();
             let cmd = style::ebold(format!("$ {cmd}")).bright().to_string();
-            let cmd = trunc(prefix, config.redact(&cmd).trim());
-            self.eprint(task, prefix, &cmd);
+            let cmd = trunc(ctx.prefix, config.redact(&cmd).trim());
+            self.eprint(ctx.task, ctx.prefix, &cmd);
         }
 
         let _guard = if guard.is_some() {
             guard
         } else {
-            Some(acquire_runtime_lock(task.interactive).await)
+            Some(acquire_runtime_lock(ctx.task.interactive).await)
         };
-        self.exec(file, &args, task, &env, prefix).await
+        self.exec(file, &args, ctx).await
     }
 
-    async fn exec(
-        &self,
-        file: &Path,
-        args: &[String],
-        task: &Task,
-        env: &BTreeMap<String, String>,
-        prefix: &str,
-    ) -> Result<()> {
-        let (program, args) = self.get_file_program_and_args(file, task, args)?;
-        self.exec_program(&program, &args, task, env, prefix, false)
-            .await
+    async fn exec(&self, file: &Path, args: &[String], ctx: TaskExecContext<'_>) -> Result<()> {
+        let (program, args) = self.get_file_program_and_args(file, ctx.task, args)?;
+        self.exec_program(&program, &args, false, ctx).await
     }
 
     async fn exec_with_text_file_busy_retry(
         &self,
         file: &Path,
         args: &[String],
-        task: &Task,
-        env: &BTreeMap<String, String>,
-        prefix: &str,
+        ctx: TaskExecContext<'_>,
     ) -> Result<()> {
         const ETXTBUSY_RETRIES: usize = 3;
         const ETXTBUSY_SLEEP_MS: u64 = 50;
 
         let mut attempt = 0;
         loop {
-            match self.exec(file, args, task, env, prefix).await {
+            match self.exec(file, args, ctx).await {
                 Ok(()) => break Ok(()),
                 Err(err) if Self::is_text_file_busy(&err) && attempt < ETXTBUSY_RETRIES => {
                     attempt += 1;
@@ -1085,11 +1452,16 @@ impl TaskExecutor {
         &self,
         program: &str,
         args: &[String],
-        task: &Task,
-        env: &BTreeMap<String, String>,
-        prefix: &str,
         cmd_verbatim: bool,
+        ctx: TaskExecContext<'_>,
     ) -> Result<()> {
+        let TaskExecContext {
+            task,
+            env,
+            prefix,
+            output_capture,
+            allow_during_interruption,
+        } = ctx;
         #[cfg(not(windows))]
         let _ = cmd_verbatim;
         let config = Config::get().await?;
@@ -1166,6 +1538,8 @@ impl TaskExecutor {
                             prefix_println!(prefix, "{line}");
                         }
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stdout(|_| {});
                 } else {
                     cmd = cmd.stdout(Stdio::null());
                 }
@@ -1177,6 +1551,8 @@ impl TaskExecutor {
                             self.eprint(task, prefix, &line);
                         }
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stderr(|_| {});
                 } else {
                     cmd = cmd.stderr(Stdio::null());
                 }
@@ -1192,6 +1568,8 @@ impl TaskExecutor {
                             .unwrap()
                             .on_stdout(&task_clone, prefix_str.clone(), line);
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stdout(|_| {});
                 } else {
                     cmd = cmd.stdout(Stdio::null());
                 }
@@ -1205,6 +1583,8 @@ impl TaskExecutor {
                             .unwrap()
                             .on_stderr(&task_clone, prefix_str.clone(), line);
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stderr(|_| {});
                 } else {
                     cmd = cmd.stderr(Stdio::null());
                 }
@@ -1212,10 +1592,18 @@ impl TaskExecutor {
             TaskOutput::Replacing => {
                 // Replacing mode shows a progress indicator unless both streams are suppressed
                 if task.silent.suppresses_stdout() {
-                    cmd = cmd.stdout(Stdio::null());
+                    if output_capture.is_some() {
+                        cmd = cmd.with_on_stdout(|_| {});
+                    } else {
+                        cmd = cmd.stdout(Stdio::null());
+                    }
                 }
                 if task.silent.suppresses_stderr() {
-                    cmd = cmd.stderr(Stdio::null());
+                    if output_capture.is_some() {
+                        cmd = cmd.with_on_stderr(|_| {});
+                    } else {
+                        cmd = cmd.stderr(Stdio::null());
+                    }
                 }
                 // Show progress indicator except when both streams are fully suppressed
                 if !task.silent.suppresses_both() {
@@ -1230,8 +1618,10 @@ impl TaskExecutor {
                         timed_outputs
                             .lock()
                             .unwrap()
-                            .insert(prefix.to_string(), (SystemTime::now(), line));
+                            .insert(prefix.to_string(), (SystemTime::now(), vec![line]));
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stdout(|_| {});
                 } else {
                     cmd = cmd.stdout(Stdio::null());
                 }
@@ -1243,12 +1633,18 @@ impl TaskExecutor {
                             self.eprint(task, prefix, &line);
                         }
                     });
+                } else if output_capture.is_some() {
+                    cmd = cmd.with_on_stderr(|_| {});
                 } else {
                     cmd = cmd.stderr(Stdio::null());
                 }
             }
             TaskOutput::Silent => {
-                cmd = cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                if output_capture.is_some() {
+                    cmd = cmd.with_on_stdout(|_| {}).with_on_stderr(|_| {});
+                } else {
+                    cmd = cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                }
             }
             // `Quiet` is no longer returned by `output()` (verbosity is decoupled
             // from style; it maps to `Interleave`), but the variant still exists as
@@ -1256,6 +1652,15 @@ impl TaskExecutor {
             TaskOutput::Quiet | TaskOutput::Interleave => {
                 if raw || redactions.is_empty() {
                     cmd = cmd.stdin(Stdio::inherit());
+                }
+                if output_capture.is_some() {
+                    if task.silent.suppresses_stdout() {
+                        cmd = cmd.with_on_stdout(|_| {});
+                    }
+                    if task.silent.suppresses_stderr() {
+                        cmd = cmd.with_on_stderr(|_| {});
+                    }
+                } else if raw || redactions.is_empty() {
                     if !task.silent.suppresses_stdout() {
                         cmd = cmd.stdout(Stdio::inherit());
                     } else {
@@ -1268,6 +1673,23 @@ impl TaskExecutor {
                     }
                 }
             }
+        }
+        if let Some(output_capture) = output_capture {
+            let stdout = output_capture.clone();
+            let stderr = output_capture.clone();
+            cmd = cmd
+                .with_stdout_observer(move |line| {
+                    stdout
+                        .lock()
+                        .unwrap()
+                        .push(TaskCacheOutput::Stdout(line.to_string()));
+                })
+                .with_stderr_observer(move |line| {
+                    stderr
+                        .lock()
+                        .unwrap()
+                        .push(TaskCacheOutput::Stderr(line.to_string()));
+                });
         }
         let dir = task_cwd(task, &config).await?;
         if !dir.exists() {
@@ -1300,7 +1722,10 @@ impl TaskExecutor {
         }
         // Apply sandbox async (DNS resolution for macOS) before spawning.
         cmd.apply_sandbox().await?;
-        cmd.execute_async().await?;
+        cmd.execute_async_with_cancel_check(|| {
+            !allow_during_interruption && crate::ui::ctrlc::is_cancelled()
+        })
+        .await?;
         trace!("{prefix} exited successfully");
         Ok(())
     }
@@ -1425,30 +1850,31 @@ impl TaskExecutor {
     }
 }
 
-/// Check if a file can be executed directly by the OS without a shell wrapper.
-/// On Unix, this checks the executable permission bit.
-/// On Windows, this checks for a known executable extension (.bat, .ps1, etc.)
-/// — shebang-only files need to be run through a shell.
-fn can_execute_directly(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        // .ps1 files need pwsh -File, they can't be executed directly
-        if path.extension().is_some_and(|e| e == "ps1") {
-            return false;
-        }
-        crate::file::has_known_executable_extension(path)
-    }
-    #[cfg(not(windows))]
-    {
-        is_executable(path)
-    }
-}
-
 /// Determine the shell from a file's extension.
 /// e.g. `.ps1` → `["pwsh", "-File"]`
+///
+/// This covers exactly the extensions [`crate::file::can_execute_directly`] rejects as
+/// interpreter-only, so every file the spawn predicate turns down has an explicit
+/// interpreter here rather than falling through to `windows_default_file_shell_args`.
+///
+/// `.vbs` names `cscript`, the *console* script host, instead of letting `cmd /c` resolve
+/// the file association: the registered handler is whichever host the machine has, and
+/// `wscript` — the Windows-based host — writes its output to message boxes rather than the
+/// pipes mise reads. Naming the console host keeps task output capturable, the same reason
+/// `.ps1` names `pwsh -File`. `//nologo` keeps the banner out of the task's output.
+///
+/// That arm is `cfg(windows)`-only because `cscript` does not exist elsewhere, and this
+/// function is not gated — selecting it on unix would replace the configured default file
+/// shell with a program that cannot be found. `.ps1` needs no gate: `pwsh` is
+/// cross-platform, which is why that arm predates this and was never gated.
+///
+/// Matched case-insensitively because `can_execute_directly` is, so `TASK.PS1` cannot be
+/// rejected there and then miss its interpreter here.
 fn shell_from_extension(path: &Path) -> Option<Vec<String>> {
-    match path.extension()?.to_str()? {
+    match path.extension()?.to_str()?.to_lowercase().as_str() {
         "ps1" => Some(vec!["pwsh".to_string(), "-File".to_string()]),
+        #[cfg(windows)]
+        "vbs" => Some(vec!["cscript".to_string(), "//nologo".to_string()]),
         _ => None,
     }
 }
@@ -1584,6 +2010,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_shell_from_extension_has_a_mapping_for_every_interpreter_only_extension() {
+        // The invariant, enforced rather than merely documented: an extension that
+        // `file::can_execute_directly` rejects as interpreter-only must be named in
+        // `shell_from_extension`, or the task silently falls through to
+        // `windows_default_file_shell_args` — and for .vbs that means whichever script host
+        // the machine's file association points at, where `wscript` writes to message boxes
+        // instead of the pipes mise reads.
+        //
+        // Iterating the list is the point. `shell_from_extension` cannot match against it
+        // directly because that function is not cfg(windows)-gated while the list is, so
+        // adding an entry there without a mapping here would otherwise go unnoticed.
+        for ext in crate::file::INTERPRETER_ONLY_EXTENSIONS {
+            let path = PathBuf::from(format!("task.{ext}"));
+            assert!(
+                shell_from_extension(&path).is_some(),
+                "{ext} is rejected as interpreter-only but has no interpreter mapping"
+            );
+        }
+        // The console host specifically, and case-insensitively.
+        for name in ["task.vbs", "task.VBS"] {
+            assert_eq!(
+                shell_from_extension(Path::new(name)),
+                Some(vec!["cscript".to_string(), "//nologo".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_shell_from_extension_leaves_vbs_to_the_default_shell_off_windows() {
+        // `cscript` is Windows-only, so selecting it here would swap the configured default
+        // file shell for a program that does not exist. `shell_from_extension` is not
+        // cfg-gated, so the arm has to be.
+        assert_eq!(shell_from_extension(Path::new("task.vbs")), None);
+        assert_eq!(shell_from_extension(Path::new("task.VBS")), None);
+    }
+
+    #[test]
+    fn test_shell_from_extension_maps_ps1_on_every_platform() {
+        // `pwsh` is cross-platform, so this arm is deliberately ungated. Case-insensitive
+        // because the predicate that rejects `.ps1` for direct execution is.
+        assert_eq!(
+            shell_from_extension(Path::new("task.ps1")),
+            Some(vec!["pwsh".to_string(), "-File".to_string()])
+        );
+        assert_eq!(
+            shell_from_extension(Path::new("task.PS1")),
+            Some(vec!["pwsh".to_string(), "-File".to_string()])
+        );
+        // Anything else keeps using the configured default file shell.
+        assert_eq!(shell_from_extension(Path::new("task.sh")), None);
+        assert_eq!(shell_from_extension(Path::new("task")), None);
+    }
+
+    #[test]
     fn test_task_shell_parts_errors_on_empty_shell() {
         let shell = Vec::new();
         let err = task_shell_parts(&shell, "inline shell").unwrap_err();
@@ -1672,11 +2154,46 @@ mod tests {
     fn test_display_first_command_header_has_no_dangling_backslash_with_args() {
         // Reproduces #10083: the joined command plus extra args must not contain
         // the `\ ` sequence that confused the original output.
-        let display_script = display_first_command("echo long_command \\\n  --option1 value1");
-        let args_str = ["--extra", "args"].join(" ");
-        let header = format!("$ {display_script} {args_str}");
+        let args = ["--extra".to_string(), "args".to_string()];
+        let display_script = append_inline_args(
+            "echo long_command \\\n  --option1 value1",
+            &args,
+            InlineArgsStyle::PosixCommandText,
+        );
+        let header = format!("$ {}", display_first_command(&display_script));
         assert_eq!(header, "$ echo long_command --option1 value1 --extra args");
         assert!(!header.contains("\\ "));
+    }
+
+    #[test]
+    fn test_append_inline_args_uses_posix_quoting() {
+        let args = ["a with space".to_string(), "second".to_string()];
+        assert_eq!(
+            append_inline_args(
+                "echo first\necho last",
+                &args,
+                InlineArgsStyle::PosixCommandText
+            ),
+            "echo first\necho last 'a with space' second"
+        );
+    }
+
+    #[test]
+    fn test_append_inline_args_uses_cmd_quoting() {
+        let args = ["a with space".to_string(), "a&b".to_string()];
+        assert_eq!(
+            append_inline_args("echo", &args, InlineArgsStyle::CmdCommandText),
+            r#"echo "a with space" "a&b""#
+        );
+    }
+
+    #[test]
+    fn test_append_inline_args_keeps_separate_argv_off_command_text() {
+        let args = ["a with space".to_string()];
+        assert_eq!(
+            append_inline_args("Write-Output $args", &args, InlineArgsStyle::SeparateArgv),
+            "Write-Output $args"
+        );
     }
 
     #[test]

@@ -76,7 +76,7 @@ run = "cargo build"
 
 ### `depends`
 
-- **Type**: `string | string[] | { task: string, args?: string[], env?: { [key]: string } }[]`
+- **Type**: `string | (string | string[] | { task: string, args?: string[], env?: { [key]: string }, optional?: bool })[]`
 
 Tasks that must be run before this task. This is a list of task names or aliases. Arguments can be
 passed to the task, e.g.: `depends = ["build --release"]`. If multiple tasks have the same dependency,
@@ -127,7 +127,31 @@ depends = [
 run = "./deploy.sh"
 ```
 
+String and structured dependencies can be mixed in the same array:
+
+```mise-toml
+[tasks.check]
+depends = [
+  "lint",
+  { task = "test", env = { CI = "true" } },
+]
+run = "echo checks complete"
+```
+
 Note: These environment variables are passed only to the specified dependency, not to the current task or other dependencies.
+
+#### Optional dependencies
+
+Set `optional = true` on a structured dependency to run matching tasks when they exist without
+failing when the task name or pattern has no matches. Invalid task patterns still produce an error.
+
+```mise-toml
+[tasks.test]
+depends = [
+  { task = "//...:test", optional = true },
+  { task = "//...:test:*", optional = true },
+]
+```
 
 #### Passing parent task arguments to dependencies
 
@@ -174,7 +198,7 @@ forward its resolved arguments to its own dependencies.
 
 ### `depends_post`
 
-- **Type**: `string | string[] | { task: string, args?: string[], env?: { [key]: string } }[]`
+- **Type**: `string | (string | string[] | { task: string, args?: string[], env?: { [key]: string }, optional?: bool })[]`
 
 Like `depends` but these tasks run _after_ this task and its dependencies complete. For example, you
 may want a `postlint` task that you can run individually without also running `lint`:
@@ -187,14 +211,15 @@ depends_post = ["postlint"]
 run = "echo 'linting complete'"
 ```
 
-Supports the same argument and environment variable syntax as `depends`.
+Supports the same argument, environment variable, and optional dependency syntax as `depends`.
 
 ### `wait_for`
 
-- **Type**: `string | string[] | { task: string, args?: string[], env?: { [key]: string } }[]`
+- **Type**: `string | (string | string[] | { task: string, args?: string[], env?: { [key]: string }, optional?: bool })[]`
 
-Similar to `depends`, it will wait for these tasks to complete before running however they won't be
-added to the list of tasks to run. This is essentially optional dependencies.
+Similar to `depends`, it will wait for these tasks to complete before running. Unlike `depends`,
+`wait_for` does not add matching tasks to the run; it only waits for them when they are already
+scheduled. To allow a task name or pattern to have no configured matches, use `optional = true`.
 
 ```mise-toml
 [tasks.lint]
@@ -202,7 +227,7 @@ wait_for = ["render"] # creates some js files, so if it's running, wait for it t
 run = "eslint ."
 ```
 
-Supports the same argument and environment variable syntax as `depends`.
+Supports the same argument, environment variable, and optional dependency syntax as `depends`.
 
 `wait_for` matches tasks differently depending on whether args or env vars are specified:
 
@@ -360,7 +385,9 @@ cause the task to be run.
 
 This is also used in `mise watch` to know which files/directories to watch.
 
-This can be specified with relative paths to the config file and/or with glob patterns, e.g.: `src/**/*.rs`.
+This can be specified with relative paths to the config file and/or with glob patterns, e.g.:
+`src/**/*.rs`. Brace alternatives such as `src/**/*.{js,ts}` are supported by freshness checks,
+`mise watch`, and `task_source_files()`.
 Ensure you don't go crazy with adding a ton of files in a glob though—mise has to scan each and every one to check
 the timestamp.
 
@@ -376,6 +403,24 @@ has changed since the last build.
 
 The [`task_source_files`](../templates.md#task-source-files) function can be used to iterate over a task's
 `sources` within its template context.
+
+#### Watching VCS-ignored sources
+
+By default, `mise watch` respects VCS ignore files such as `.gitignore`, even when an ignored path is
+listed in `sources`. Set `watch.no_vcs_ignore` for tasks that need to watch generated or intermediary
+files which are intentionally excluded from version control:
+
+```mise-toml
+[tasks.generate]
+run = "process generated/output.json"
+sources = ["generated/output.json"]
+watch = { no_vcs_ignore = true }
+```
+
+This is equivalent to passing `--no-vcs-ignore` to watchexec. Because watchexec applies ignore options
+to the entire watch process, watching multiple tasks together disables VCS ignores for all of them if
+any selected task enables this option. Keep `sources` narrowly scoped: disabling VCS ignores for broad
+build, distribution, or dependency directories may substantially increase filesystem scanning.
 
 #### Excluding sources
 
@@ -397,6 +442,46 @@ non-negated entry can re-include a file an earlier `!` excluded — for example,
 
 To include a literal path that begins with `!`, escape the prefix as `\!`
 (e.g. `"\\!important.txt"` in TOML).
+
+#### Reusable and global inputs <Badge type="warning" text="experimental" />
+
+Use `[task_config.input_groups]` to define source patterns once and reuse them across tasks. Reference
+a group from `sources` with `@group:<name>`. Groups can reference other groups; undefined references
+and cycles are configuration errors.
+
+Group entries are resolved relative to the config file that defines them, even when a task uses a
+different `dir`. Ordinary entries written directly in `sources` remain relative to the task directory.
+
+```mise-toml
+[settings]
+experimental = true
+
+[task_config.input_groups]
+toolchain = ["rust-toolchain.toml", "Cargo.lock"]
+rust = ["Cargo.toml", "src/**/*.rs", "@group:toolchain"]
+
+[tasks.build]
+run = "cargo build"
+sources = ["@group:rust"]
+outputs = ["target/debug/mycli"]
+
+[tasks.test]
+run = "cargo test"
+sources = ["@group:rust"]
+outputs = []
+```
+
+`task_config.global_inputs` adds source patterns to every task in the config scope. This is useful
+for repository-wide configuration and lockfiles that should invalidate all cacheable tasks without
+being repeated in each task's `sources`. Global inputs may also reference named groups.
+
+```mise-toml
+[task_config]
+global_inputs = ["mise.toml", ".github/tool-versions", "@group:lockfiles"]
+
+[task_config.input_groups]
+lockfiles = ["Cargo.lock", "pnpm-lock.yaml"]
+```
 
 #### Dependency invalidation
 
@@ -432,6 +517,22 @@ otherwise `sources` on the dependent task would be effectively useless.
 The counterpart to `sources`, these are the files or directories that the task will create/modify after
 it executes.
 
+Entries prefixed with `!` exclude matching outputs. As with `sources`, entries
+are evaluated in order, a later entry can re-include a path, and `\!` escapes a
+literal leading bang. Output globs also support brace alternatives such as
+`dist/{client,server}/**`.
+
+```mise-toml
+[tasks.build]
+run = "npm run build"
+sources = ["src/**"]
+outputs = ["dist", "!dist/**/*.map", "!dist/.vite/**"]
+```
+
+Excluded files do not participate in output freshness checks and are not
+stored in task-cache artifacts. If excluded files already exist beneath an
+output directory when a cached artifact is restored, mise preserves them.
+
 `auto = true` is an alternative to specifying output files manually. In that case, mise will touch
 an internally tracked file based on the hash of the task definition (stored in `~/.local/state/mise/task-outputs/<hash>` if you're curious).
 This is useful if you want `mise run` to execute when sources change but don't want to have to manually `touch`
@@ -444,6 +545,203 @@ sources = ["Cargo.toml", "src/**/*.rs"]
 outputs = { auto = true } # this is the default when sources is defined
 ```
 
+### `cache` <Badge type="warning" text="experimental" />
+
+- **Type**: `{ enabled = bool, env = string[], command_inputs = string[] }`
+- **Default**: `{ enabled = false, env = [], command_inputs = [] }`
+
+Stores successful task results in a content-addressed local cache and reuses them when the same task
+inputs are seen again. Declared filesystem outputs are restored after deletion. Tasks with
+`outputs = []` cache their successful result and logs without storing filesystem artifacts, which is
+useful for checks such as linting, testing, and type checking.
+Declaring `outputs = []` asserts that the task has no filesystem side effects that a cache hit needs
+to reproduce.
+
+Artifact caching requires [`experimental`](/configuration/settings.html#experimental), at least one
+matching `source`, and either explicit output paths or `outputs = []`.
+`outputs = { auto = true }`, absolute outputs, and output patterns (including
+the body of an exclusion) that escape the task directory are not supported.
+
+```mise-toml
+[settings]
+experimental = true
+
+[tasks.build]
+run = "npm run build"
+sources = ["package.json", "src/**"]
+outputs = ["dist"]
+cache = { enabled = true, env = ["NODE_ENV"] }
+```
+
+Commands listed in `cache.command_inputs` run before cache lookup. Their command text, stdout, and
+stderr are included in the cache key. Commands use the same inline shell (including a CLI `--shell`
+override), resolved environment and tools, working directory, and sandbox policy as the task. This
+is useful when inputs such as compiler versions or generated configuration cannot be represented by
+source files alone.
+
+```mise-toml
+[tasks.build]
+run = "npm run build"
+sources = ["package.json", "src/**"]
+outputs = ["dist"]
+cache = { enabled = true, command_inputs = ["node --version", "npm config get registry"] }
+```
+
+A command input must be non-empty and exit successfully. Its output is hashed without being printed
+or retained. Command inputs inherit the task timeout, or have a 30-second timeout when the task has
+none, and may emit at most 16 MiB across stdout and stderr. They should be fast, deterministic, and
+free of side effects because they run whenever mise computes the task's cache key. Command inputs
+are not run during dry runs or when caching is disabled for raw or interactive execution.
+
+#### External dependencies and lockfiles
+
+Declare dependency manifests and lockfiles as filesystem inputs so dependency updates invalidate the
+cache. They can be listed directly in a task's `sources`, shared through an input group, or applied to
+every task in a config scope with `task_config.global_inputs`.
+
+```mise-toml
+[settings]
+experimental = true
+
+[task_config]
+global_inputs = ["@group:node-dependencies"]
+
+[task_config.input_groups]
+node-dependencies = ["package.json", "pnpm-lock.yaml"]
+
+[tasks.build]
+run = "pnpm build"
+sources = ["src/**"]
+outputs = ["dist"]
+cache = { enabled = true }
+```
+
+The lockfile content represents the resolved external dependency graph, so installed dependency
+directories such as `node_modules` generally should not be included. Resolved mise tools already
+participate in the cache key. Use `cache.command_inputs` for relevant external state that is not
+captured in committed files, such as a package registry selection or a compiler wrapper version:
+
+```mise-toml
+[tasks.build]
+run = "pnpm build"
+sources = ["package.json", "pnpm-lock.yaml", "src/**"]
+outputs = ["dist"]
+cache = { enabled = true, command_inputs = ["pnpm config get registry"] }
+```
+
+Only declare deterministic external state that can affect task outputs. Secrets and credentials
+should use pass-through environment variables instead so their values are not included in cache
+keys.
+
+#### Per-run cache access
+
+Use `mise run --task-cache <mode>` or `MISE_TASK_CACHE` to control task output cache reads and writes
+for one run:
+
+- `read-write` uses cached results and publishes new results. This is the default.
+- `read-only` uses cached results but does not publish misses.
+- `write-only` publishes results but always executes instead of restoring.
+- `off` disables task output caching and uses ordinary source/output freshness checks.
+- `local-only` reads and writes only the local cache. It currently behaves like `read-write` because
+  remote caching is not yet available.
+
+```bash
+# Prevent an untrusted pull request from publishing cache entries
+mise run --task-cache read-only test
+
+# Warm the local cache without consuming existing entries
+mise run --task-cache write-only build
+
+# Diagnose a task without reading or writing task output artifacts
+mise run --task-cache off build
+```
+
+These modes only affect the experimental task output cache configured by a task's `cache` property.
+The existing `--no-cache` option controls fetching remote task definitions instead.
+
+```mise-toml
+[tasks.lint]
+run = "eslint ."
+sources = ["package.json", "src/**"]
+outputs = []
+cache = { enabled = true }
+```
+
+To enable caching by default for every eligible task in a config scope, set
+`task_config.cache`. Only tasks with at least one source and either explicit output paths or
+`outputs = []` inherit this default; other tasks remain uncached. A task-local `cache` value
+overrides the scoped default.
+
+```mise-toml
+[settings]
+experimental = true
+
+[task_config.cache]
+enabled = true
+env = ["NODE_ENV"]
+command_inputs = ["node --version"]
+
+[tasks.build]
+run = "npm run build"
+sources = ["package.json", "src/**"]
+outputs = ["dist"]
+
+[tasks.deploy]
+run = "./deploy.sh"
+cache = { enabled = false }
+```
+
+The cache key includes source contents, the task definition and arguments, resolved task environment,
+the values (or absence) of variables named in `cache.env`, command-input output, resolved tool
+versions, dependency artifact keys, and the operating system and architecture. Variables inherited
+from the ambient process are ignored unless listed in `cache.env`.
+
+`task_config.global_env` adds ambient variable names to every enabled task cache in the config
+scope, including tasks with a task-local `cache` value. Unlike the default values under
+`task_config.cache`, these names always compose with task-local `cache.env`.
+
+```mise-toml
+[task_config]
+global_env = ["CI", "NODE_ENV"]
+```
+
+For cache-enabled tasks, variables named in `cache.env` or `task_config.global_env` remain available
+when environment inheritance is denied. Disabled and non-cache tasks do not inherit variables
+through cache configuration. Use `pass_through_env` for variables that a task needs at runtime but
+which must not affect its cache key, such as short-lived credentials. The scoped
+`task_config.global_pass_through_env` equivalent applies to every task. In mise's default,
+non-sandboxed environment mode, ambient variables already pass through; these options matter when
+`deny_env`, `deny_all`, or the corresponding CLI option is active.
+
+```mise-toml
+[task_config]
+global_pass_through_env = ["CI_JOB_TOKEN"]
+
+[tasks.build]
+pass_through_env = ["NPM_TOKEN"]
+```
+
+Pass-through variables can change task behavior without invalidating cached results. Tasks should
+not use them for values that affect generated outputs. Their values are not added to the key or
+persisted as cache metadata, but a task can still expose them by writing them to cached output files
+or logs.
+
+Cache entries are stored under `MISE_CACHE_DIR/task-artifacts/v2` by default. Set the experimental
+[`task.cache_dir`](/configuration/settings.html#task-cache-dir) setting or
+`MISE_TASK_CACHE_DIR` to choose a different parent directory; mise keeps the artifact format in its
+`v2` child directory. Default and custom locations are included in `mise cache clear` and
+manual and automatic cache pruning. Only successful task runs are cached. Cache read/write failures
+are treated as misses and never turn a successful task run into a failure.
+
+Stdout and stderr are stored as ordered, redacted streams and replayed using the output mode selected
+for the cache hit. Prefix, interleave, keep-order, timed, replacing, quiet, silent, and per-stream
+silence therefore apply to replayed output just as they do to live output. Raw and interactive tasks
+retain inherited terminal I/O and conservatively bypass artifact caching.
+
+Cacheable dependencies contribute their artifact keys to dependent task keys, so a dependent can
+restore the matching artifact after its dependencies execute, skip, or restore. If a dependency
+executes without a stable artifact key, its dependents conservatively execute.
+
 ### `shell`
 
 - **Type**: `string`
@@ -453,6 +751,12 @@ outputs = { auto = true } # this is the default when sources is defined
 The shell to use to run the task. This is useful if you want to run a task with a different shell than
 the default such as `fish`, `zsh`, or `pwsh`. Generally though, it's recommended to use a [shebang](./toml-tasks#shell-shebang) instead
 because that will allow IDEs with mise support to show syntax highlighting and linting for the script.
+
+When the shell is PowerShell (`pwsh` or `powershell`), mise passes `-NoProfile` so your PowerShell
+profile is not loaded, matching the non-interactive behavior of `sh -c`/`zsh -c`. This avoids profiles
+that mutate `PATH` (for example a mise activation snippet) shadowing a task's own installed tools. Set
+[`windows_powershell_no_profile`](/configuration/settings.html#windows_powershell_no_profile) to `false`
+if your tasks depend on side effects from your profile.
 
 ```mise-toml
 [tasks.hello]
@@ -669,7 +973,22 @@ I don't want to turn all file tasks into tera templates just for this feature.
 
 Options available in the top-level `mise.toml` `[task_config]` section. These apply to all tasks which
 are included by that config file or use the same root directory, e.g.: `~/src/myproject/mise.toml`'s `[task_config]`
-applies to file tasks like `~/src/myproject/mise-tasks/mytask` but not to tasks in `~/src/myproject/subproj/mise.toml`.
+applies to file tasks like `~/src/myproject/mise-tasks/mytask`. Set `cascade = true` to also apply the
+section to tasks owned by descendant config roots.
+
+### `task_config.cascade`
+
+Cascade this config's `[task_config]` values to descendant config roots. Descendant values override
+individual inherited fields. A descendant can set `cascade = false` to stop inheriting the section.
+
+```toml
+[task_config]
+cascade = true
+shell = "bash -c"
+```
+
+This applies to `dir`, `shell`, `cache`, and `includes`. Inherited include paths remain relative to
+the config root where they were defined, allowing a monorepo root to provide one shared task set.
 
 ### `task_config.dir`
 
@@ -678,6 +997,78 @@ Change the default directory tasks are run from.
 ```toml
 [task_config]
 dir = "{{cwd}}"
+```
+
+### `task_config.shell`
+
+Set the default shell for tasks in this config scope. A task's explicit `shell` setting takes
+precedence, including a `shell` inherited from a task template. With `task_config.cascade = true`,
+descendant config roots inherit this default and may override it with their own `task_config.shell`.
+
+```toml
+[task_config]
+shell = "bash -c"
+```
+
+Unlike the global-only
+[`unix_default_inline_shell_args`](/configuration/settings.html#unix_default_inline_shell_args) and
+[`windows_default_inline_shell_args`](/configuration/settings.html#windows_default_inline_shell_args)
+settings, this default is scoped to project tasks and cannot change the interpreter used by hooks,
+tool installation, or tasks from another config root.
+
+### `task_config.cache` <Badge type="warning" text="experimental" />
+
+Sets the default artifact-cache configuration for tasks in this config scope. The default is only
+inherited by cache-eligible tasks with sources and either explicit output paths or `outputs = []`.
+Task-local and task-template cache configuration takes precedence, including
+`cache = { enabled = false }`.
+
+```toml
+[task_config.cache]
+enabled = true
+env = ["NODE_ENV", "CI"]
+command_inputs = ["node --version"]
+```
+
+### `task_config.global_env` <Badge type="warning" text="experimental" />
+
+Adds ambient environment variable names to the cache key of every cache-enabled task in the config
+scope. These values compose with task-local `cache.env` rather than acting as defaults.
+
+```toml
+[task_config]
+global_env = ["CI", "NODE_ENV"]
+```
+
+### `task_config.global_pass_through_env` <Badge type="warning" text="experimental" />
+
+Preserves ambient environment variables when environment inheritance is denied, without adding
+their values to task cache keys.
+
+```toml
+[task_config]
+global_pass_through_env = ["CI_JOB_TOKEN"]
+```
+
+### `task_config.global_inputs` <Badge type="warning" text="experimental" />
+
+Adds config-root-relative source paths and glob patterns to every task in this config scope. Entries
+may reference a named input group with `@group:<name>`.
+
+```toml
+[task_config]
+global_inputs = ["mise.toml", "@group:lockfiles"]
+```
+
+### `task_config.input_groups` <Badge type="warning" text="experimental" />
+
+Defines reusable, config-root-relative source groups. Tasks reference them from `sources` with
+`@group:<name>`. Groups may reference other groups.
+
+```toml
+[task_config.input_groups]
+lockfiles = ["Cargo.lock", "pnpm-lock.yaml"]
+rust = ["Cargo.toml", "src/**/*.rs", "@group:lockfiles"]
 ```
 
 ### `task_config.includes` {#task-config-includes}
@@ -719,8 +1110,10 @@ includes = [
 ]
 ```
 
-For local and monorepo task discovery, mise uses the nearest config file that defines `task_config.includes`.
-That means a child config's `includes` replaces both the defaults and any `includes` defined by parent configs for that directory.
+For local and monorepo task discovery, mise uses the nearest config file that defines
+`task_config.includes`. When the parent has `task_config.cascade = true`, its includes are inherited
+until a child defines its own. A child config's `includes` replaces both the defaults and any
+inherited `includes` for that directory.
 Global config files are loaded independently, so each global config file uses its own `task_config.includes` or the default directories if `includes` is unset.
 
 Entries are evaluated in order, and when more than one include defines a task with the same name the **last** entry in the list wins.
@@ -822,7 +1215,7 @@ redactions = ["API_KEY", "PASSWORD"]
 
 Running the above task will output `echo [redacted]` instead.
 
-You can also specify these as a glob pattern, e.g.: `redactions.env = ["SECRETS_*"]`.
+You can also specify these as a glob pattern, e.g.: `redactions = ["SECRETS_*"]`.
 
 ## `[vars]` options
 

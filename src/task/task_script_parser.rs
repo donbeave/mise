@@ -1,6 +1,6 @@
 use crate::config::{Config, Settings};
 use crate::env_diff::EnvMap;
-use crate::exit::exit;
+use crate::request_exit;
 use crate::shell::ShellType;
 use crate::task::Task;
 use crate::tera::{TeraEngine, contains_template_syntax, get_tera, render_str};
@@ -172,6 +172,7 @@ impl TaskScriptParser {
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let matcher = Arc::new(crate::task::task_source_checker::build_source_matcher(
                 &root,
+                &root,
                 &task.sources,
             ));
 
@@ -195,65 +196,81 @@ impl TaskScriptParser {
                         continue;
                     }
 
-                    let pattern_path = Path::new(pattern);
-                    let is_relative = pattern_path.is_relative();
-                    let rooted_pattern = if is_relative {
-                        Path::new(&escaped_root)
-                            .join(pattern_path)
-                            .to_string_lossy()
-                            .to_string()
-                    } else {
-                        pattern.clone()
-                    };
-
-                    match glob::glob_with(
-                        &rooted_pattern,
-                        glob::MatchOptions {
-                            case_sensitive: false,
-                            require_literal_separator: false,
-                            require_literal_leading_dot: false,
-                        },
-                    ) {
+                    let expanded_patterns =
+                        crate::task::task_source_checker::expand_glob_braces(pattern);
+                    match expanded_patterns {
                         Err(error) => {
                             warn!(
                                 "tera::render::resolve_task_sources including '{pattern}' in resolved task sources, ignoring glob parsing error: {error:#?}"
                             );
                             resolved.push(pattern.clone());
                         }
-                        Ok(expanded) => {
+                        Ok(expanded_patterns) => {
                             let mut source_found = false;
-
-                            for path in expanded {
-                                source_found = true;
-
-                                match path {
-                                    Ok(path) => {
-                                        if !crate::task::task_source_checker::is_source(
-                                            &matcher, &path,
-                                        ) {
-                                            trace!(
-                                                "tera::render::resolve_task_sources excluded '{}' due to !-pattern",
-                                                path.display()
-                                            );
-                                            continue;
-                                        }
-                                        let source = if is_relative {
-                                            path.strip_prefix(&root).unwrap_or(&path)
-                                        } else {
-                                            &path
-                                        };
-                                        let source = source.display();
-                                        trace!(
-                                            "tera::render::resolve_task_sources resolved source from pattern '{pattern}': {source}"
-                                        );
-                                        resolved.push(source.to_string());
-                                    }
+                            let mut pattern_preserved = false;
+                            for expanded_pattern in expanded_patterns {
+                                let pattern_path = Path::new(&expanded_pattern);
+                                let is_relative = pattern_path.is_relative();
+                                let rooted_pattern = if is_relative {
+                                    Path::new(&escaped_root)
+                                        .join(pattern_path)
+                                        .to_string_lossy()
+                                        .to_string()
+                                } else {
+                                    expanded_pattern
+                                };
+                                let expanded = match glob::glob_with(
+                                    &rooted_pattern,
+                                    glob::MatchOptions {
+                                        case_sensitive: false,
+                                        require_literal_separator: false,
+                                        require_literal_leading_dot: false,
+                                    },
+                                ) {
+                                    Ok(expanded) => expanded,
                                     Err(error) => {
-                                        let source = error.path().display();
                                         warn!(
-                                            "tera::render::resolve_task_sources omitting '{source}' from resolved task sources due to: {:#?}",
-                                            error.error()
+                                            "tera::render::resolve_task_sources including '{pattern}' in resolved task sources, ignoring glob parsing error: {error:#?}"
                                         );
+                                        if !pattern_preserved {
+                                            resolved.push(pattern.clone());
+                                            pattern_preserved = true;
+                                        }
+                                        source_found = true;
+                                        continue;
+                                    }
+                                };
+                                for path in expanded {
+                                    source_found = true;
+                                    match path {
+                                        Ok(path) => {
+                                            if !crate::task::task_source_checker::is_source(
+                                                &matcher, &path,
+                                            ) {
+                                                trace!(
+                                                    "tera::render::resolve_task_sources excluded '{}' due to !-pattern",
+                                                    path.display()
+                                                );
+                                                continue;
+                                            }
+                                            let source = if is_relative {
+                                                path.strip_prefix(&root).unwrap_or(&path)
+                                            } else {
+                                                &path
+                                            };
+                                            let source = source.display();
+                                            trace!(
+                                                "tera::render::resolve_task_sources resolved source from pattern '{pattern}': {source}"
+                                            );
+                                            resolved.push(source.to_string());
+                                        }
+                                        Err(error) => {
+                                            let source = error.path().display();
+                                            warn!(
+                                                "tera::render::resolve_task_sources omitting '{source}' from resolved task sources due to: {:#?}",
+                                                error.error()
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -316,7 +333,7 @@ impl TaskScriptParser {
                     .unwrap_or_default();
 
                 let choices = Self::template_arg::<Vec<String>>(args, "choices")?
-                    .map(|choices| usage::SpecChoices { choices });
+                    .map(usage::SpecChoices::new);
 
                 let env = Self::template_arg::<String>(args, "env")?;
 
@@ -331,23 +348,20 @@ impl TaskScriptParser {
                     None => None,
                 };
 
-                let mut arg = usage::SpecArg {
-                    name: name.clone(),
-                    usage,
-                    help_first_line,
-                    help,
-                    help_long,
-                    help_md,
-                    required,
-                    var,
-                    var_min,
-                    var_max,
-                    hide,
-                    default,
-                    choices,
-                    env,
-                    ..Default::default()
-                };
+                let mut arg = usage::SpecArg::builder().name(name.clone()).build();
+                arg.usage = usage;
+                arg.help_first_line = help_first_line;
+                arg.help = help;
+                arg.help_long = help_long;
+                arg.help_md = help_md;
+                arg.required = required;
+                arg.var = var;
+                arg.var_min = var_min;
+                arg.var_max = var_max;
+                arg.hide = hide;
+                arg.default = default;
+                arg.choices = choices;
+                arg.env = env;
                 arg.usage = arg.usage();
 
                 input_args.lock().map_err(Self::lock_error)?.push(arg);
@@ -393,7 +407,7 @@ impl TaskScriptParser {
                 let negate = Self::template_arg::<String>(args, "negate")?;
 
                 let choices = Self::template_arg::<Vec<String>>(args, "choices")?
-                    .map(|choices| usage::SpecChoices { choices });
+                    .map(usage::SpecChoices::new);
 
                 let env = Self::template_arg::<String>(args, "env")?;
 
@@ -408,34 +422,30 @@ impl TaskScriptParser {
                     None => None,
                 };
 
-                let mut flag = usage::SpecFlag {
-                    name: name.clone(),
-                    short,
-                    long,
-                    default,
-                    var,
-                    var_min: None,
-                    var_max: None,
-                    hide,
-                    global,
-                    count,
-                    deprecated,
-                    help_first_line,
-                    help,
-                    usage,
-                    help_long,
-                    help_md,
-                    required,
-                    negate,
-                    env: env.clone(),
-                    arg: Some(usage::SpecArg {
-                        name: name.clone(),
-                        var,
-                        choices,
-                        env,
-                        ..Default::default()
-                    }),
-                };
+                let mut flag = usage::SpecFlag::builder().name(name.clone()).build();
+                flag.short = short;
+                flag.long = long;
+                flag.default = default;
+                flag.var = var;
+                flag.var_min = None;
+                flag.var_max = None;
+                flag.hide = hide;
+                flag.global = global;
+                flag.count = count;
+                flag.deprecated = deprecated;
+                flag.help_first_line = help_first_line;
+                flag.help = help;
+                flag.usage = usage;
+                flag.help_long = help_long;
+                flag.help_md = help_md;
+                flag.required = required;
+                flag.negate = negate;
+                flag.env = env.clone();
+                let mut value_arg = usage::SpecArg::builder().name(name.clone()).build();
+                value_arg.var = var;
+                value_arg.choices = choices;
+                value_arg.env = env;
+                flag.arg = Some(value_arg);
                 flag.usage = flag.usage();
 
                 input_flags.lock().map_err(Self::lock_error)?.push(flag);
@@ -482,7 +492,7 @@ impl TaskScriptParser {
                 let negate = Self::template_arg::<String>(args, "negate")?;
 
                 let choices = Self::template_arg::<Vec<String>>(args, "choices")?
-                    .map(|choices| usage::SpecChoices { choices });
+                    .map(usage::SpecChoices::new);
 
                 let env = Self::template_arg::<String>(args, "env")?;
 
@@ -500,39 +510,37 @@ impl TaskScriptParser {
                 // Create SpecArg when any arg-level properties are set (choices, env)
                 // This matches the behavior of option() which always creates SpecArg
                 let arg = if choices.is_some() || env.is_some() {
-                    Some(usage::SpecArg {
-                        name: name.clone(),
-                        var,
-                        choices,
-                        env: env.clone(),
-                        ..Default::default()
+                    Some({
+                        let mut a = usage::SpecArg::builder().name(name.clone()).build();
+                        a.var = var;
+                        a.choices = choices;
+                        a.env = env.clone();
+                        a
                     })
                 } else {
                     None
                 };
 
-                let mut flag = usage::SpecFlag {
-                    name: name.clone(),
-                    short,
-                    long,
-                    default,
-                    var,
-                    var_min: None,
-                    var_max: None,
-                    hide,
-                    global,
-                    count,
-                    deprecated,
-                    help_first_line,
-                    help,
-                    usage,
-                    help_long,
-                    help_md,
-                    required,
-                    negate,
-                    env,
-                    arg,
-                };
+                let mut flag = usage::SpecFlag::builder().name(name.clone()).build();
+                flag.short = short;
+                flag.long = long;
+                flag.default = default;
+                flag.var = var;
+                flag.var_min = None;
+                flag.var_max = None;
+                flag.hide = hide;
+                flag.global = global;
+                flag.count = count;
+                flag.deprecated = deprecated;
+                flag.help_first_line = help_first_line;
+                flag.help = help;
+                flag.usage = usage;
+                flag.help_long = help_long;
+                flag.help_md = help_md;
+                flag.required = required;
+                flag.negate = negate;
+                flag.env = env;
+                flag.arg = arg;
                 flag.usage = flag.usage();
 
                 input_flags.lock().map_err(Self::lock_error)?.push(flag);
@@ -712,7 +720,7 @@ impl TaskScriptParser {
                 // just print exactly what usage returns so the error output isn't double-wrapped
                 // this could be displaying help or a parse error
                 eprintln!("{}", format!("{e}").trim_end());
-                exit(1);
+                return Err(request_exit(1));
             }
         };
 
@@ -1349,12 +1357,13 @@ mod tests {
         let root = temp.path().join("project[1]");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("input.txt"), "test").unwrap();
+        std::fs::write(root.join("config.txt"), "test").unwrap();
         let task = Task {
-            sources: vec!["*.txt".to_string()],
+            sources: vec!["{input,config}.txt".to_string(), "!config.txt".to_string()],
             ..Default::default()
         };
         let parser = TaskScriptParser::new(Some(root));
-        let scripts = vec!["echo {{ task_source_files() | first }}".to_string()];
+        let scripts = vec!["echo {{ task_source_files() | join(sep=' ') }}".to_string()];
 
         let (parsed, _) = parser
             .parse_run_scripts(&config, &task, &scripts, &Default::default())
@@ -1362,6 +1371,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(parsed, vec!["echo input.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_task_source_files_preserves_invalid_brace_glob_once() {
+        let config = Config::get().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let task = Task {
+            sources: vec!["{a,b}/[invalid".to_string()],
+            ..Default::default()
+        };
+        let parser = TaskScriptParser::new(Some(temp.path().to_path_buf()));
+        let scripts = vec!["echo {{ task_source_files() | join(sep=' ') }}".to_string()];
+
+        let (parsed, _) = parser
+            .parse_run_scripts(&config, &task, &scripts, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(parsed, vec!["echo {a,b}/[invalid"]);
     }
 
     #[tokio::test]
@@ -1410,16 +1438,10 @@ mod tests {
         // Manually construct a spec with one arg ("foo") and one flag ("bar")
         // so this test does not rely on run-script parsing.
         let mut cmd = usage::SpecCommand::default();
-        cmd.args.push(usage::SpecArg {
-            name: "foo".to_string(),
-            ..Default::default()
-        });
-        cmd.flags.push(usage::SpecFlag {
-            name: "bar".to_string(),
-            // Ensure the flag is recognized as `--bar` by the usage parser
-            long: vec!["bar".to_string()],
-            ..Default::default()
-        });
+        cmd.args.push(usage::SpecArg::builder().name("foo").build());
+        // Ensure the flag is recognized as `--bar` by the usage parser
+        cmd.flags
+            .push(usage::SpecFlag::builder().name("bar").long("bar").build());
         let mut spec = usage::Spec::default();
         spec.cmd = cmd;
 
@@ -1486,11 +1508,8 @@ mod tests {
 
         // Manually construct a spec with a var=true arg so usage-lib will produce a MultiString value
         let mut cmd = usage::SpecCommand::default();
-        cmd.args.push(usage::SpecArg {
-            name: "tags".to_string(),
-            var: true,
-            ..Default::default()
-        });
+        cmd.args
+            .push(usage::SpecArg::builder().name("tags").var(true).build());
         let mut spec = usage::Spec::default();
         spec.cmd = cmd;
 

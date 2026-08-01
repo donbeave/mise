@@ -441,7 +441,7 @@ impl RubyPlugin {
         source == DEFAULT_RUBY_PRECOMPILED_URL
     }
 
-    fn use_versions_host_for_precompiled_attestations(source: &str) -> bool {
+    fn use_versions_host_for_precompiled_source(source: &str) -> bool {
         Self::is_default_ruby_source(source)
     }
 
@@ -580,14 +580,23 @@ impl RubyPlugin {
         locked_build_revision: Option<&str>,
     ) -> Result<Option<(String, Option<String>)>> {
         let requires_build_revision = Self::source_requires_build_revision(repo);
+        // The default precompiled repo is explicitly allowlisted by mise-versions.
+        // Custom repositories must fetch their release metadata directly from GitHub.
+        let use_versions_host = Self::use_versions_host_for_precompiled_source(repo);
         let release = if let Some(tag) = locked_build_revision {
             // Use the exact build revision from the lockfile
             debug!("using locked build revision {tag} for ruby {version}");
-            match github::get_release(repo, tag).await {
+            match github::get_release_with_versions_host(repo, tag, use_versions_host).await {
                 Ok(r) => r,
                 Err(err) => {
                     debug!("locked build revision {tag} not found, finding latest: {err}");
-                    match github::get_release_with_build_revision_status(repo, version).await {
+                    match github::get_release_with_build_revision_status(
+                        repo,
+                        version,
+                        use_versions_host,
+                    )
+                    .await
+                    {
                         Ok((r, found_build_revision)) => {
                             if requires_build_revision && !found_build_revision {
                                 debug!("no build revision release found for ruby {version}");
@@ -603,7 +612,9 @@ impl RubyPlugin {
                 }
             }
         } else {
-            match github::get_release_with_build_revision_status(repo, version).await {
+            match github::get_release_with_build_revision_status(repo, version, use_versions_host)
+                .await
+            {
                 Ok((r, found_build_revision)) => {
                     if requires_build_revision && !found_build_revision {
                         debug!("no build revision release found for ruby {version}");
@@ -837,7 +848,7 @@ impl RubyPlugin {
             repo,
             None, // Accept any workflow from repo
             None,
-            Self::use_versions_host_for_precompiled_attestations(source),
+            Self::use_versions_host_for_precompiled_source(source),
         )
         .await
         {
@@ -933,10 +944,6 @@ impl Backend for RubyPlugin {
             Settings::get().fetch_remote_versions_timeout(),
         )
         .await
-    }
-
-    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(vec![".ruby-version".into(), "Gemfile".into()])
     }
 
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
@@ -1141,8 +1148,9 @@ fn parse_gemfile(body: &str) -> String {
     let v = regex!(r#"(.*)__ENGINE__(.*)"#)
         .replace_all(&v, "$2-$1")
         .to_string();
-    // make sure it's like "ruby-3.0.0" or "3.0.0"
-    if !regex!(r"^(\w+-)?([0-9])(\.[0-9])*$").is_match(&v) {
+    // make sure it's a version string like "3.0.0", "3.4.10", "ruby-3.0.0",
+    // or "jruby-9.4.12.0" (optional engine prefix, one or more numeric segments)
+    if !regex!(r"^(\w+-)?\d+(\.\d+)*$").is_match(&v) {
         return "".to_string();
     }
     v
@@ -1244,6 +1252,19 @@ mod tests {
         "#}),
             "2.7.2"
         );
+        // Each numeric segment may be more than one digit (e.g. 3.4.10, 4.0.6)
+        assert_eq!(
+            parse_gemfile(indoc! {r#"
+            ruby "3.4.10"
+        "#}),
+            "3.4.10"
+        );
+        assert_eq!(
+            parse_gemfile(indoc! {r#"
+            ruby "4.0.6"
+        "#}),
+            "4.0.6"
+        );
         assert_eq!(
             parse_gemfile(indoc! {r#"
             ruby '1.9.3', engine: 'jruby', engine_version: "1.6.7"
@@ -1264,6 +1285,12 @@ mod tests {
         );
         assert_eq!(
             parse_gemfile(indoc! {r#"
+            ruby "3.3.0", engine: "jruby", engine_version: "9.4.12.0"
+        "#}),
+            "jruby-9.4.12.0"
+        );
+        assert_eq!(
+            parse_gemfile(indoc! {r#"
             source "https://rubygems.org"
             ruby File.read(File.expand_path(".ruby-version", __dir__)).strip
         "#}),
@@ -1273,10 +1300,10 @@ mod tests {
 
     #[test]
     fn test_ruby_precompiled_versions_host_only_for_default_source() {
-        assert!(RubyPlugin::use_versions_host_for_precompiled_attestations(
+        assert!(RubyPlugin::use_versions_host_for_precompiled_source(
             DEFAULT_RUBY_PRECOMPILED_URL
         ));
-        assert!(!RubyPlugin::use_versions_host_for_precompiled_attestations(
+        assert!(!RubyPlugin::use_versions_host_for_precompiled_source(
             "acme/ruby"
         ));
     }

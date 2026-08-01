@@ -4,6 +4,8 @@ use std::fmt::{Debug, Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+#[cfg(panic = "abort")]
+use std::sync::TryLockError;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -22,7 +24,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(not(any(test, target_os = "windows")))]
 use signal_hook::iterator::Signals;
 use std::sync::LazyLock as Lazy;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 
 use crate::config::Settings;
@@ -103,6 +105,8 @@ where
     duct::cmd(program, args)
 }
 
+type OutputObserver<'a> = Box<dyn Fn(&str) + Send + 'a>;
+
 pub struct CmdLineRunner<'a> {
     cmd: Command,
     pr: Option<&'a dyn SingleReport>,
@@ -113,6 +117,8 @@ pub struct CmdLineRunner<'a> {
     pass_signals: bool,
     on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
     on_stderr: Option<Box<dyn Fn(String) + Send + 'a>>,
+    observe_stdout: Option<OutputObserver<'a>>,
+    observe_stderr: Option<OutputObserver<'a>>,
     timeout: Option<Duration>,
     sandbox: Option<crate::sandbox::SandboxConfig>,
 }
@@ -120,6 +126,23 @@ pub struct CmdLineRunner<'a> {
 const GUARD_RUNNING: u8 = 0;
 const GUARD_CANCELLED: u8 = 1;
 const GUARD_TIMED_OUT: u8 = 2;
+
+#[cfg(unix)]
+fn signal_process_tree(pid: u32, signal: nix::sys::signal::Signal) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    if !should_use_pgroup() || nix::sys::signal::killpg(pid, signal).is_err() {
+        let _ = nix::sys::signal::kill(pid, signal);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
 
 fn wait_for_cancel_or_deadline<'a>(
     cvar: &'a Condvar,
@@ -175,14 +198,13 @@ impl TimeoutGuard {
             }
             #[cfg(unix)]
             {
-                let pid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                signal_process_tree(pid, nix::sys::signal::Signal::SIGTERM);
                 drop(guard);
                 let guard = lock.lock().unwrap();
                 let grace_deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let (_guard, cancelled) = wait_for_cancel_or_deadline(cvar, guard, grace_deadline);
                 if !cancelled {
-                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    signal_process_tree(pid, nix::sys::signal::Signal::SIGKILL);
                 }
             }
             #[cfg(windows)]
@@ -191,11 +213,7 @@ impl TimeoutGuard {
                 // TODO: Windows lacks graceful shutdown parity with Unix.
                 // Currently force-kills immediately via taskkill /F with no grace period.
                 // Consider using GenerateConsoleCtrlEvent for CTRL_C_EVENT before force kill.
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                kill_process_tree(pid);
             }
         });
         Self {
@@ -235,10 +253,52 @@ static RAW_LOCK: Lazy<tokio::sync::RwLock<()>> = Lazy::new(|| tokio::sync::RwLoc
 
 static RUNNING_PIDS: Lazy<Mutex<HashSet<u32>>> = Lazy::new(Default::default);
 
-struct RunningPidGuard(Option<u32>);
+#[cfg(all(panic = "abort", unix))]
+fn kill_pids_immediately(pids: &HashSet<u32>) {
+    let use_pgroup = should_use_pgroup();
+    for pid in pids {
+        let pid = nix::unistd::Pid::from_raw(*pid as i32);
+        if use_pgroup {
+            if nix::sys::signal::killpg(pid, nix::sys::signal::SIGKILL).is_err() {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
+            }
+        } else {
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
+        }
+    }
+}
+
+#[cfg(all(panic = "abort", windows))]
+fn kill_pids_immediately(pids: &HashSet<u32>) {
+    for pid in pids {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Best-effort synchronous cleanup for the panic hook.
+///
+/// An aborting panic does not run destructors, and there is no time for the
+/// normal TERM/grace-period/KILL sequence. Avoid blocking if the panic occurred
+/// while the PID registry was locked; a deadlocked panic hook would prevent the
+/// process from ever reaching abort.
+#[cfg(panic = "abort")]
+pub fn kill_all_on_panic() {
+    let pids = match RUNNING_PIDS.try_lock() {
+        Ok(pids) => pids,
+        Err(TryLockError::Poisoned(err)) => err.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    kill_pids_immediately(&pids);
+}
+
+pub(crate) struct RunningPidGuard(Option<u32>);
 
 impl RunningPidGuard {
-    fn new(pid: Option<u32>) -> Self {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
         if let Some(pid) = pid {
             RUNNING_PIDS.lock().unwrap().insert(pid);
         }
@@ -303,6 +363,25 @@ fn should_use_pgroup() -> bool {
     *CACHED
 }
 
+/// Put a non-interactive child in the process tree managed by mise.
+///
+/// Callers must retain a [`RunningPidGuard`] after spawning the command.
+pub(crate) fn prepare_noninteractive_child(_cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    if should_use_pgroup() {
+        _cmd.env(TASK_PGID_MANAGED_ENV, "1");
+        unsafe {
+            _cmd.pre_exec(|| {
+                let _ = nix::unistd::setpgid(
+                    nix::unistd::Pid::from_raw(0),
+                    nix::unistd::Pid::from_raw(0),
+                );
+                Ok(())
+            });
+        }
+    }
+}
+
 /// Grace period after a child's ExitStatus arrives during which we keep
 /// reading its stdout/stderr pipes. If a grandchild inherited the pipes
 /// and survived (e.g. a nested mise that escaped our pgroup, or an
@@ -310,6 +389,12 @@ fn should_use_pgroup() -> bool {
 /// block forever waiting for EOF and the parent would hang. After this
 /// deadline we abandon the readers — any tail output is dropped.
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+enum HashedProcessOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ReadError(&'static str, std::io::Error),
+}
 
 impl<'a> CmdLineRunner<'a> {
     pub fn new<P: AsRef<OsStr>>(program: P) -> Self {
@@ -328,6 +413,8 @@ impl<'a> CmdLineRunner<'a> {
             pass_signals: false,
             on_stdout: None,
             on_stderr: None,
+            observe_stdout: None,
+            observe_stderr: None,
             timeout: None,
             sandbox: None,
         }
@@ -411,6 +498,16 @@ impl<'a> CmdLineRunner<'a> {
 
     pub fn with_on_stderr<F: Fn(String) + Send + 'a>(mut self, on_stderr: F) -> Self {
         self.on_stderr = Some(Box::new(on_stderr));
+        self
+    }
+
+    pub(crate) fn with_stdout_observer<F: Fn(&str) + Send + 'a>(mut self, observer: F) -> Self {
+        self.observe_stdout = Some(Box::new(observer));
+        self
+    }
+
+    pub(crate) fn with_stderr_observer<F: Fn(&str) + Send + 'a>(mut self, observer: F) -> Self {
+        self.observe_stderr = Some(Box::new(observer));
         self
     }
 
@@ -575,7 +672,6 @@ impl<'a> CmdLineRunner<'a> {
         self
     }
 
-    #[allow(clippy::readonly_write_lock)]
     pub fn execute(mut self) -> Result<()> {
         let read_lock = raw_read_lock_blocking();
         debug!("$ {self}");
@@ -763,13 +859,25 @@ impl<'a> CmdLineRunner<'a> {
         Ok(())
     }
 
-    pub async fn execute_async(mut self) -> Result<()> {
+    pub async fn execute_async(self) -> Result<()> {
+        self.execute_async_with_cancel_check(|| false).await
+    }
+
+    /// Execute a command while preventing cancellation from being lost between
+    /// the pre-spawn check and PID registration.
+    pub async fn execute_async_with_cancel_check(
+        mut self,
+        is_cancelled: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
+        if is_cancelled() {
+            return Err(crate::errors::Error::TaskInterrupted.into());
+        }
         let read_lock = RAW_LOCK.read().await;
         debug!("$ {self}");
         if Settings::get().raw || self.raw {
             drop(read_lock);
             let _write_lock = RAW_LOCK.write().await;
-            return self.execute_raw_async().await;
+            return self.execute_raw_async_with_cancel_check(is_cancelled).await;
         }
         #[cfg(unix)]
         if should_use_pgroup() {
@@ -793,6 +901,12 @@ impl<'a> CmdLineRunner<'a> {
             .wrap_err_with(|| format!("failed to execute command: {self}"))?;
         let id = cp.id().unwrap_or_default();
         RUNNING_PIDS.lock().unwrap().insert(id);
+        if is_cancelled() {
+            #[cfg(unix)]
+            signal_process_tree(id, nix::sys::signal::SIGINT);
+            #[cfg(windows)]
+            kill_process_tree(id);
+        }
         trace!("Started process: {id} for {}", self.get_program());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(stdout) = cp.stdout.take() {
@@ -958,6 +1072,200 @@ impl<'a> CmdLineRunner<'a> {
         Ok(())
     }
 
+    /// Run a command while incrementally hashing its raw stdout and stderr.
+    ///
+    /// Unlike `read`, this never buffers the complete output in memory. The
+    /// combined byte limit also prevents commands that emit indefinitely from
+    /// consuming unbounded resources.
+    pub async fn execute_hashes_async(self, max_output_bytes: usize) -> Result<(String, String)> {
+        self.execute_hashes_async_with_drain_timeout(max_output_bytes, PIPE_DRAIN_TIMEOUT)
+            .await
+    }
+
+    async fn execute_hashes_async_with_drain_timeout(
+        mut self,
+        max_output_bytes: usize,
+        pipe_drain_timeout: Duration,
+    ) -> Result<(String, String)> {
+        let _read_lock = RAW_LOCK.read().await;
+        debug!("$ {self}");
+        self.cmd.kill_on_drop(true);
+        // These commands are non-interactive probes: nothing reads stdin and
+        // both output streams are piped. Detaching stdin from the terminal
+        // means the child can never need the controlling TTY, so unlike
+        // `execute()` we can always create a dedicated process group without
+        // risking SIGTTIN. That guarantee matters here — cleanup on timeout,
+        // an output-limit breach, or a stuck pipe relies on `killpg` reaching
+        // descendants, not just the direct child.
+        self.cmd.stdin(Stdio::null());
+        #[cfg(unix)]
+        if should_use_pgroup() {
+            self.cmd.env(TASK_PGID_MANAGED_ENV, "1");
+            unsafe {
+                self.cmd.as_std_mut().pre_exec(|| {
+                    let _ = nix::unistd::setpgid(
+                        nix::unistd::Pid::from_raw(0),
+                        nix::unistd::Pid::from_raw(0),
+                    );
+                    Ok(())
+                });
+            }
+        }
+        let mut cp = self
+            .spawn_async_with_etxtbsy_retry()
+            .await
+            .wrap_err_with(|| format!("failed to execute command: {self}"))?;
+        let id = cp.id().unwrap_or_default();
+        let _running_pid = RunningPidGuard::new(cp.id());
+        trace!("Started process: {id} for {}", self.get_program());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        if let Some(mut stdout) = cp.stdout.take() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 8192];
+                loop {
+                    match stdout.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(len) => {
+                            if tx
+                                .send(HashedProcessOutput::Stdout(buffer[..len].to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(HashedProcessOutput::ReadError("stdout", err)).await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(mut stderr) = cp.stderr.take() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 8192];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(len) => {
+                            if tx
+                                .send(HashedProcessOutput::Stderr(buffer[..len].to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(HashedProcessOutput::ReadError("stderr", err)).await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let timeout_guard = self.timeout.map(|timeout| TimeoutGuard::new(timeout, id));
+        let mut stdout_hasher = blake3::Hasher::new();
+        let mut stderr_hasher = blake3::Hasher::new();
+        let mut output_bytes = 0usize;
+        let mut consume = |output: HashedProcessOutput| -> Result<()> {
+            match output {
+                HashedProcessOutput::Stdout(bytes) => {
+                    output_bytes = output_bytes.saturating_add(bytes.len());
+                    if output_bytes > max_output_bytes {
+                        bail!("command output exceeded {max_output_bytes} bytes");
+                    }
+                    stdout_hasher.update(&bytes);
+                }
+                HashedProcessOutput::Stderr(bytes) => {
+                    output_bytes = output_bytes.saturating_add(bytes.len());
+                    if output_bytes > max_output_bytes {
+                        bail!("command output exceeded {max_output_bytes} bytes");
+                    }
+                    stderr_hasher.update(&bytes);
+                }
+                HashedProcessOutput::ReadError(stream, err) => {
+                    bail!("failed to read command {stream}: {err}");
+                }
+            }
+            Ok(())
+        };
+        let mut status = None;
+        let mut wait = Box::pin(cp.wait());
+        loop {
+            tokio::select! {
+                result = &mut wait, if status.is_none() => {
+                    status = Some(result?);
+                    break;
+                }
+                output = rx.recv() => {
+                    let Some(output) = output else {
+                        status = Some(wait.await?);
+                        break;
+                    };
+                    if let Err(err) = consume(output) {
+                        #[cfg(unix)]
+                        signal_process_tree(id, nix::sys::signal::Signal::SIGKILL);
+                        #[cfg(windows)]
+                        kill_process_tree(id);
+                        let _ = wait.await;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        let drain_deadline = Instant::now() + pipe_drain_timeout;
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                #[cfg(unix)]
+                signal_process_tree(id, nix::sys::signal::Signal::SIGKILL);
+                #[cfg(windows)]
+                kill_process_tree(id);
+                bail!("command output pipes did not close within {pipe_drain_timeout:?}");
+            }
+            let output = match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(output)) => output,
+                Ok(None) => break,
+                Err(_) => {
+                    #[cfg(unix)]
+                    signal_process_tree(id, nix::sys::signal::Signal::SIGKILL);
+                    #[cfg(windows)]
+                    kill_process_tree(id);
+                    bail!("command output pipes did not close within {pipe_drain_timeout:?}");
+                }
+            };
+            if let Err(err) = consume(output) {
+                #[cfg(unix)]
+                signal_process_tree(id, nix::sys::signal::Signal::SIGKILL);
+                #[cfg(windows)]
+                kill_process_tree(id);
+                return Err(err);
+            }
+        }
+
+        if let Some(guard) = &timeout_guard {
+            guard.cancel();
+        }
+        let status = status.expect("command wait must complete");
+        if !status.success() {
+            if let Some(timeout) = timeout_guard.as_ref().and_then(|guard| guard.timed_out()) {
+                bail!("timed out after {timeout:?}");
+            }
+            bail!("exited with non-zero status: {status}");
+        }
+        Ok((
+            stdout_hasher.finalize().to_hex().to_string(),
+            stderr_hasher.finalize().to_hex().to_string(),
+        ))
+    }
+
     /// Run the command and return stdout, even when raw mode is enabled.
     pub async fn read(mut self) -> Result<String> {
         let _read_lock = RAW_LOCK.read().await;
@@ -1042,7 +1350,10 @@ impl<'a> CmdLineRunner<'a> {
         Ok(())
     }
 
-    async fn execute_raw_async(mut self) -> Result<()> {
+    async fn execute_raw_async_with_cancel_check(
+        mut self,
+        is_cancelled: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
         if self.stdin.is_none() {
             self.cmd.stdin(Stdio::inherit());
         }
@@ -1050,6 +1361,12 @@ impl<'a> CmdLineRunner<'a> {
         self.cmd.stderr(Stdio::inherit());
         let mut cp = self.spawn_async_with_etxtbsy_retry().await?;
         let id = cp.id().unwrap_or_default();
+        if is_cancelled() {
+            #[cfg(unix)]
+            signal_process_tree(id, nix::sys::signal::SIGINT);
+            #[cfg(windows)]
+            kill_process_tree(id);
+        }
         let timeout_guard = self.timeout.map(|t| TimeoutGuard::new(t, id));
         let status = cp.wait().await?;
         if let Some(g) = &timeout_guard {
@@ -1211,6 +1528,9 @@ impl<'a> CmdLineRunner<'a> {
 
     fn on_stdout(&self, line: String) {
         let _lock = OUTPUT_LOCK.lock().unwrap();
+        if let Some(observer) = &self.observe_stdout {
+            observer(&line);
+        }
         if let Some(on_stdout) = &self.on_stdout {
             on_stdout(line);
             return;
@@ -1234,6 +1554,9 @@ impl<'a> CmdLineRunner<'a> {
 
     fn on_stderr(&self, line: String) {
         let _lock = OUTPUT_LOCK.lock().unwrap();
+        if let Some(observer) = &self.observe_stderr {
+            observer(&line);
+        }
         if let Some(on_stderr) = &self.on_stderr {
             on_stderr(line);
             return;
@@ -1375,14 +1698,20 @@ enum ChildProcessOutput {
 ///
 /// This variant **clears** the environment and sets only the provided `env` —
 /// use it for backends that pass a full env from `dependency_env()`.
-pub async fn cmd_read_async<I, K, V>(program: &str, args: &[&str], env: I) -> Result<String>
+/// `program` is `AsRef<OsStr>` rather than `&str` so callers can pass a resolved path
+/// straight through — `Backend::spawn_program` returns an `OsString`, and forcing it
+/// through `to_string_lossy()` here would mangle a Windows path that is not valid UTF-8.
+pub async fn cmd_read_async<P, I, K, V>(program: P, args: &[&str], env: I) -> Result<String>
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    let program = program.as_ref();
+    let display_program = program.to_string_lossy();
     let display_args = args.join(" ");
-    debug!("$ {program} {display_args}");
+    debug!("$ {display_program} {display_args}");
 
     let output = tokio::process::Command::new(program)
         .args(args)
@@ -1394,19 +1723,19 @@ where
         .kill_on_drop(true)
         .output()
         .await
-        .wrap_err_with(|| format!("failed to execute command: {program} {display_args}"))?;
+        .wrap_err_with(|| format!("failed to execute command: {display_program} {display_args}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "{program} {display_args} failed: exit code {}\n{}",
+            "{display_program} {display_args} failed: exit code {}\n{}",
             output.status.code().unwrap_or(-1),
             stderr.trim()
         );
     }
 
     let stdout = String::from_utf8(output.stdout)
-        .wrap_err_with(|| format!("{program} produced invalid UTF-8 output"))?;
+        .wrap_err_with(|| format!("{display_program} produced invalid UTF-8 output"))?;
     Ok(stdout.trim_end().to_string())
 }
 
@@ -1455,6 +1784,7 @@ where
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use pretty_assertions::assert_eq;
@@ -1472,17 +1802,69 @@ mod tests {
     async fn test_cmd_line_runner_execute_async() {
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
+        let observed_stdout = Arc::new(Mutex::new(Vec::new()));
+        let observed_stderr = Arc::new(Mutex::new(Vec::new()));
         let stdout_clone = stdout.clone();
         let stderr_clone = stderr.clone();
+        let observed_stdout_clone = observed_stdout.clone();
+        let observed_stderr_clone = observed_stderr.clone();
         super::CmdLineRunner::new("sh")
             .args(["-c", "printf out; printf err >&2"])
             .with_on_stdout(move |line| stdout_clone.lock().unwrap().push(line))
             .with_on_stderr(move |line| stderr_clone.lock().unwrap().push(line))
+            .with_stdout_observer(move |line| {
+                observed_stdout_clone.lock().unwrap().push(line.to_string());
+            })
+            .with_stderr_observer(move |line| {
+                observed_stderr_clone.lock().unwrap().push(line.to_string());
+            })
             .execute_async()
             .await
             .unwrap();
         assert_eq!(stdout.lock().unwrap().as_slice(), ["out"]);
         assert_eq!(stderr.lock().unwrap().as_slice(), ["err"]);
+        assert_eq!(observed_stdout.lock().unwrap().as_slice(), ["out"]);
+        assert_eq!(observed_stderr.lock().unwrap().as_slice(), ["err"]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_async_skips_pre_cancelled_command() {
+        let err = super::CmdLineRunner::new("sh")
+            .args(["-c", "exit 0"])
+            .execute_async_with_cancel_check(|| true)
+            .await
+            .unwrap_err();
+
+        assert!(crate::errors::Error::is_task_interrupted(&err));
+    }
+
+    #[tokio::test]
+    async fn test_execute_async_catches_cancellation_after_spawn() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_c = checks.clone();
+        let err = super::CmdLineRunner::new("sh")
+            .args(["-c", "sleep 30"])
+            .execute_async_with_cancel_check(move || checks_c.fetch_add(1, Ordering::SeqCst) > 0)
+            .await
+            .unwrap_err();
+
+        assert!(crate::errors::Error::is_sigint(&err));
+        assert!(checks.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_execute_raw_async_catches_cancellation_after_spawn() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_c = checks.clone();
+        let err = super::CmdLineRunner::new("sh")
+            .args(["-c", "sleep 30"])
+            .raw(true)
+            .execute_async_with_cancel_check(move || checks_c.fetch_add(1, Ordering::SeqCst) > 0)
+            .await
+            .unwrap_err();
+
+        assert!(crate::errors::Error::is_sigint(&err));
+        assert!(checks.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
@@ -1508,6 +1890,88 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("exited with non-zero status"));
         assert_eq!(stderr.lock().unwrap().as_slice(), ["err"]);
+    }
+
+    #[tokio::test]
+    async fn test_cmd_line_runner_execute_hashes_async() {
+        let (stdout_hash, stderr_hash) = super::CmdLineRunner::new("sh")
+            .args(["-c", "printf stdout; printf stderr >&2"])
+            .execute_hashes_async(1024)
+            .await
+            .unwrap();
+        assert_eq!(stdout_hash, blake3::hash(b"stdout").to_hex().to_string());
+        assert_eq!(stderr_hash, blake3::hash(b"stderr").to_hex().to_string());
+    }
+
+    #[tokio::test]
+    async fn test_cmd_line_runner_execute_hashes_async_limits_output() {
+        let err = super::CmdLineRunner::new("sh")
+            .args(["-c", "printf 12345"])
+            .execute_hashes_async(4)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("output exceeded 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_line_runner_execute_hashes_async_times_out() {
+        let err = super::CmdLineRunner::new("sh")
+            // Replace the shell so there is no descendant holding the pipes
+            // after the timed-out process is terminated.
+            .args(["-c", "exec sleep 60"])
+            .with_timeout(std::time::Duration::from_millis(10))
+            .execute_hashes_async(1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_line_runner_execute_hashes_async_rejects_undrained_pipes() {
+        let err = super::CmdLineRunner::new("sh")
+            .args(["-c", "sleep 60 &"])
+            .execute_hashes_async_with_drain_timeout(1024, std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("command output pipes did not close")
+        );
+    }
+
+    /// A descendant that outlives the shell must not survive the drain
+    /// deadline — cleanup goes through the process group, so it reaches the
+    /// leaves even though only the shell is a direct child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cmd_line_runner_execute_hashes_async_kills_descendants() {
+        if !super::should_use_pgroup() {
+            // No pgroup of our own to killpg; an ancestor owns cleanup.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let err = super::CmdLineRunner::new("sh")
+            .args([
+                "-c",
+                &format!("sleep 60 & printf %s \"$!\" >{}", pid_file.display()),
+            ])
+            .execute_hashes_async_with_drain_timeout(1024, std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("command output pipes did not close")
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..100 {
+            if nix::sys::signal::kill(pid, None).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("descendant {pid} survived cleanup");
     }
 
     #[test]

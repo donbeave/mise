@@ -207,7 +207,7 @@ impl Edit {
     async fn interactive(&self, path: &Path) -> Result<()> {
         use crate::ui::progress_report::ProgressReport;
 
-        let title = format!("mise {} by @jdx", &*VERSION_PLAIN);
+        let title = format!("mise {} by @jdx", *VERSION_PLAIN);
 
         // Show loading spinner while setting up
         let pr = ProgressReport::new("edit".into());
@@ -263,7 +263,7 @@ impl Edit {
                 info!("cancelled");
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                std::process::exit(130);
+                return Err(crate::request_exit(130));
             }
             Err(e) => return Err(eyre!(e)),
         }
@@ -297,8 +297,8 @@ impl Edit {
 
             # [env]
             # NODE_ENV = "development"
-            # mise.file = ".env"                # load vars from a dotenv file
-            # mise.path = "./node_modules/.bin" # add a directory to PATH
+            # _.file = ".env"                # load vars from a dotenv file
+            # _.path = "./node_modules/.bin" # add a directory to PATH
 
             # [tools]
             # node = "22"

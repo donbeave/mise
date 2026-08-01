@@ -2,6 +2,7 @@
 # `mise generate task-docs`
 
 - **Usage**: `mise generate task-docs [FLAGS]`
+- **Effect**: modifies state
 - **Source code**: [`src/cli/generate/task_docs.rs`](https://github.com/jdx/mise/blob/main/src/cli/generate/task_docs.rs)
 
 Generate documentation for tasks in a project
@@ -15,6 +16,7 @@ inserts the documentation into an existing file
 This will look for a special comment, `<!-- mise-tasks -->`, and replace it with the generated documentation.
 It will replace everything between the comment and the next comment, `<!-- /mise-tasks -->` so it can be
 run multiple times on the same file to update the documentation.
+The file must already contain both comments; mise errors instead of modifying the file if they are missing.
 
 ### `-I --index`
 

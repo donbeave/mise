@@ -4,7 +4,7 @@ use std::sync::Arc;
 use eyre::Result;
 use serde_json::{Value, json};
 
-use super::dotfiles::{DotfilesApply, DotfilesStatus};
+use super::dotfiles::{DotfilesAdd, DotfilesApply, DotfilesEdit, DotfilesStatus, DotfilesUnapply};
 use super::install::Install;
 use super::plugins::install::install_plugin;
 use super::run;
@@ -66,7 +66,11 @@ use clap::{Subcommand, ValueEnum};
 /// named parts. Both flags can be repeated or comma-separated, but they
 /// cannot be used together.
 #[derive(Debug, clap::Args)]
-#[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
+#[clap(
+    visible_alias = "bs",
+    verbatim_doc_comment,
+    after_long_help = AFTER_LONG_HELP
+)]
 pub struct Bootstrap {
     #[clap(subcommand)]
     command: Option<Commands>,
@@ -183,8 +187,11 @@ struct BootstrapDotfiles {
 
 #[derive(Debug, Subcommand)]
 enum BootstrapDotfilesCommands {
+    Add(DotfilesAdd),
     Apply(BootstrapDotfilesApply),
+    Edit(DotfilesEdit),
     Status(BootstrapDotfilesStatus),
+    Unapply(DotfilesUnapply),
 }
 
 /// Apply dotfiles from `[dotfiles]`
@@ -653,10 +660,12 @@ impl Bootstrap {
                     dry_run: self.dry_run,
                     verbose: false,
                     force: self.force_dotfiles,
-                    force_hint: "use --force-dotfiles or run `mise dotfiles apply --force`",
+                    force_hint: "use --force-dotfiles or run `mise bootstrap dotfiles apply --force`",
                     yes: self.yes,
                 };
-                system::files::apply(&config, &files, &opts)?;
+                if !system::files::apply(&config, &files, &opts)? {
+                    return Ok(());
+                }
             }
 
             let edits = system::edits::edits_from_config(&config);
@@ -669,11 +678,12 @@ impl Bootstrap {
                     verbose: false,
                     yes: self.yes,
                 };
-                system::edits::apply(&config, &edits, &opts)?;
+                if !system::edits::apply(&config, &edits, &opts)? {
+                    return Ok(());
+                }
             }
             if self.dry_run {
-                let config_files =
-                    self.config_files_after_dotfiles_dry_run(&config, &files, &edits)?;
+                let config_files = config_files_after_dotfiles_dry_run(&config, &files, &edits)?;
                 hooks = system::hooks_from_config_files(&config_files);
                 dry_run_config_files = Some(config_files);
             } else {
@@ -884,93 +894,6 @@ impl Bootstrap {
         }
     }
 
-    fn config_files_after_dotfiles_dry_run(
-        &self,
-        config: &Config,
-        files: &[FileRequest],
-        edits: &[system::edits::EditRequest],
-    ) -> Result<config::ConfigMap> {
-        let mut config_files = config.config_files.clone();
-        let mut bodies = indexmap::IndexMap::new();
-        for file in files {
-            if !is_mise_config_target(&file.target) || !file.source.is_file() {
-                continue;
-            }
-            match dotfile_mise_config_body(config, file) {
-                Ok(body) => match parse_mise_config_body(&file.target, &body) {
-                    Ok(cf) => {
-                        bodies.insert(file.target.clone(), body);
-                        config_files.insert(file.target.clone(), cf);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "[dotfiles].\"{}\": failed to parse config source {}: {err}",
-                            file.target_raw,
-                            file.source.display()
-                        );
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        "[dotfiles].\"{}\": failed to read config source {}: {err}",
-                        file.target_raw,
-                        file.source.display()
-                    );
-                }
-            }
-        }
-        for edit in edits {
-            if !is_mise_config_target(&edit.path) {
-                continue;
-            }
-            let body = match bodies.get(&edit.path) {
-                Some(body) => body.clone(),
-                None if edit.path.exists() => match crate::file::read_to_string(&edit.path) {
-                    Ok(body) => body,
-                    Err(err) => {
-                        warn!(
-                            "[dotfiles].\"{}\": failed to read config target {}: {err}",
-                            edit.config_key(),
-                            edit.path.display()
-                        );
-                        continue;
-                    }
-                },
-                None => String::new(),
-            };
-            match system::edits::apply_dry_run_to_string(config, edit, &body) {
-                Ok(Some(body)) => match parse_mise_config_body(&edit.path, &body) {
-                    Ok(cf) => {
-                        bodies.insert(edit.path.clone(), body);
-                        config_files.insert(edit.path.clone(), cf);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "[dotfiles].\"{}\": failed to parse edited config target {}: {err}",
-                            edit.config_key(),
-                            edit.path.display()
-                        );
-                    }
-                },
-                Ok(None) => {
-                    debug!(
-                        "bootstrap: edited config target {} skipped in dry-run config simulation \
-                         because the edit requires template rendering",
-                        edit.path.display()
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        "[dotfiles].\"{}\": failed to simulate config edit for {}: {err}",
-                        edit.config_key(),
-                        edit.path.display()
-                    );
-                }
-            }
-        }
-        Ok(config_files)
-    }
-
     async fn run_task(&self, task: &str, skip_tools: bool) -> Result<()> {
         run::Run {
             task: task.into(),
@@ -995,6 +918,7 @@ impl Bootstrap {
             context_builder: Default::default(),
             executor: None,
             no_cache: Default::default(),
+            task_cache: crate::task::TaskCacheMode::from_env()?,
             timeout: None,
             skip_deps: false,
             // a dry run must not auto-install tools before the (not actually
@@ -1105,11 +1029,109 @@ impl Drop for BootstrapFollowUp {
     }
 }
 
-fn dotfile_mise_config_body(config: &Config, file: &FileRequest) -> Result<String> {
-    match file.mode {
-        FileMode::Template => system::files::render_template(config, file),
-        _ => crate::file::read_to_string(&file.source),
+fn config_files_after_dotfiles_dry_run(
+    config: &Config,
+    files: &[FileRequest],
+    edits: &[system::edits::EditRequest],
+) -> Result<config::ConfigMap> {
+    let mut config_files = config.config_files.clone();
+    let mut bodies = indexmap::IndexMap::new();
+    let mut unavailable_bodies = HashSet::new();
+    for file in files {
+        if !is_mise_config_target(&file.target) || !file.source.is_file() {
+            continue;
+        }
+        if file.mode == FileMode::Template {
+            config_files.shift_remove(&file.target);
+            unavailable_bodies.insert(file.target.clone());
+            debug!(
+                "bootstrap: template config target {} skipped in dry-run config simulation \
+                 because template rendering may execute commands",
+                file.target.display()
+            );
+            continue;
+        }
+        match crate::file::read_to_string(&file.source) {
+            Ok(body) => match parse_mise_config_body(&file.target, &body) {
+                Ok(cf) => {
+                    bodies.insert(file.target.clone(), body);
+                    config_files.insert(file.target.clone(), cf);
+                }
+                Err(err) => {
+                    warn!(
+                        "[dotfiles].\"{}\": failed to parse config source {}: {err}",
+                        file.target_raw,
+                        file.source.display()
+                    );
+                }
+            },
+            Err(err) => {
+                warn!(
+                    "[dotfiles].\"{}\": failed to read config source {}: {err}",
+                    file.target_raw,
+                    file.source.display()
+                );
+            }
+        }
     }
+    for edit in edits {
+        if !is_mise_config_target(&edit.path) {
+            continue;
+        }
+        if unavailable_bodies.contains(&edit.path) {
+            debug!(
+                "bootstrap: edit for config target {} skipped in dry-run config simulation \
+                 because the preceding file template was not rendered",
+                edit.path.display()
+            );
+            continue;
+        }
+        let body = match bodies.get(&edit.path) {
+            Some(body) => body.clone(),
+            None if edit.path.exists() => match crate::file::read_to_string(&edit.path) {
+                Ok(body) => body,
+                Err(err) => {
+                    warn!(
+                        "[dotfiles].\"{}\": failed to read config target {}: {err}",
+                        edit.config_key(),
+                        edit.path.display()
+                    );
+                    continue;
+                }
+            },
+            None => String::new(),
+        };
+        match system::edits::apply_dry_run_to_string(config, edit, &body) {
+            Ok(Some(body)) => match parse_mise_config_body(&edit.path, &body) {
+                Ok(cf) => {
+                    bodies.insert(edit.path.clone(), body);
+                    config_files.insert(edit.path.clone(), cf);
+                }
+                Err(err) => {
+                    warn!(
+                        "[dotfiles].\"{}\": failed to parse edited config target {}: {err}",
+                        edit.config_key(),
+                        edit.path.display()
+                    );
+                }
+            },
+            Ok(None) => {
+                debug!(
+                    "bootstrap: edited config target {} skipped in dry-run config simulation \
+                     because the edit requires template rendering",
+                    edit.path.display()
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "[dotfiles].\"{}\": failed to simulate config edit for {}: {err}",
+                    edit.config_key(),
+                    edit.path.display()
+                );
+            }
+        }
+    }
+    Ok(config_files)
 }
 
 fn parse_mise_config_body(
@@ -1197,7 +1219,7 @@ impl BootstrapStatus {
             table.print()?;
         }
         if self.missing && report.any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -1316,6 +1338,9 @@ impl BootstrapStatus {
                 let (installed_version, state, missing) = match &s.state {
                     PackageState::Installed { version } => (version.clone(), "installed", false),
                     PackageState::Missing => ("".to_string(), "missing", true),
+                    PackageState::NeedsRepair { installed } => {
+                        (installed.clone(), "needs repair", true)
+                    }
                     PackageState::VersionMismatch { installed } => {
                         (installed.clone(), "version mismatch", true)
                     }
@@ -1845,15 +1870,33 @@ impl BootstrapStatus {
 impl BootstrapDotfiles {
     async fn run(self) -> Result<()> {
         match self.command {
+            BootstrapDotfilesCommands::Add(cmd) => cmd.run().await,
             BootstrapDotfilesCommands::Apply(cmd) => cmd.run().await,
+            BootstrapDotfilesCommands::Edit(cmd) => cmd.run().await,
             BootstrapDotfilesCommands::Status(cmd) => cmd.run().await,
+            BootstrapDotfilesCommands::Unapply(cmd) => cmd.run().await,
         }
     }
 }
 
 impl BootstrapDotfilesApply {
     async fn run(self) -> Result<()> {
-        self.cmd.run().await
+        let config = Config::get().await?;
+        let (files, edits) = self.cmd.requests(&config)?;
+        let dry_run = self.cmd.dry_run();
+        let hooks = system::hooks_from_config(&config);
+        hooks::run_phase(&hooks, BootstrapHookPhase::PreDotfiles, dry_run).await?;
+        if !self.cmd.run().await? {
+            return Ok(());
+        }
+        let hooks = if dry_run {
+            let config_files = config_files_after_dotfiles_dry_run(&config, &files, &edits)?;
+            system::hooks_from_config_files(&config_files)
+        } else {
+            let config = Config::reset().await?;
+            system::hooks_from_config(&config)
+        };
+        hooks::run_phase(&hooks, BootstrapHookPhase::PostDotfiles, dry_run).await
     }
 }
 
@@ -1911,7 +1954,7 @@ impl BootstrapPluginsStatus {
         }
         table.print()?;
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2050,7 +2093,7 @@ impl BootstrapReposStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2179,7 +2222,7 @@ impl BootstrapLaunchdStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2285,7 +2328,7 @@ impl BootstrapSystemdStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2382,7 +2425,7 @@ impl BootstrapMacosDefaultsStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2461,7 +2504,7 @@ impl BootstrapShellStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -2559,7 +2602,7 @@ impl BootstrapUserStatus {
             table.print()?;
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }

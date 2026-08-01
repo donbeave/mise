@@ -1,5 +1,9 @@
 # Plan 006: Model cask constraints and dependency ownership exactly
 
+> **ARCHIVED — NON-EXECUTABLE.** Handoff dependency parity was rejected by
+> Plan 012. Direct-pour dependency support shipped separately and remains
+> mise-owned.
+
 **2026-07-23 supersession note**: Depend on Plan 013's completed-action truth.
 A serialized dependency graph alone does not prove Homebrew autoremove safety;
 add dependency drift, explicit-vs-dependency provenance, takeover, and
@@ -39,9 +43,10 @@ No Homebrew handoff or autoremove claim is made.
 ## Why this matters
 
 Real `brew install --cask codex` installs the declared `ripgrep` formula and
-records the resolved formula closure in the cask tab. Mise currently ignores
-`depends_on`, so Codex is not eligible for Homebrew visibility even if its
-binary artifact is exact.
+records the resolved formula closure in the cask tab. Mise now validates
+supported `depends_on` constraints, installs formula dependencies through its
+in-process `BrewManager`, records dependency names in the completed receipt,
+and checks them during status. This does not create Homebrew visibility.
 
 This is lifecycle state, not display-only bookkeeping. Homebrew records the
 resolved closure in the cask tab and reads it for installed missing-dependency
@@ -53,15 +58,13 @@ would incorrectly pin a new dependency as `installed_on_request=true`.
 
 ## Current state
 
-- `src/system/packages/brew/cask.rs:1655` — `depends_on` is in the ignored
-  keys list; nothing else in the cask manager touches dependencies.
+- `src/system/packages/brew/cask.rs` deserializes `depends_on`, validates macOS
+  and architecture constraints, and installs declared formula dependencies.
 - `src/system/packages/brew/mod.rs:41,57` — `BrewManager` (formula pour)
   lives in the same module and exposes formula installation
   (`install_via_pour`); the cask manager can delegate to it in-process.
-- `Cask` struct (`cask.rs:32-51`) does not deserialize `depends_on`,
-  `conflicts_with`, or platform variations as lifecycle constraints. The API
-  object can contain formula/cask dependencies plus macOS, architecture, and
-  other requirement shapes.
+- Unsupported dependency and constraint shapes fail closed. Formula dependency
+  names are recorded from completed direct-pour work; no Homebrew tab is forged.
 - Formula pours already write keg receipts (`pour.rs`), including
   `installed_on_request`; the cask orchestrator must pass dependency context
   without downgrading a formula that was already explicitly requested.

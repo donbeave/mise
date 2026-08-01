@@ -17,7 +17,10 @@ use crate::install_context::InstallContext;
 use crate::semver::{semver_is_at_least, semver_is_older_than};
 use crate::timeout;
 use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset};
+use crate::ui::progress_report::SingleReport;
 use async_trait::async_trait;
+use aube::embed::EmbedderRuntime;
+use bytesize::ByteSize;
 use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -34,6 +37,7 @@ use tokio::sync::Mutex as TokioMutex;
 const BEFORE_DATE_TOLERANCE_SECS: u64 = 60;
 const NPM_ALLOW_SCRIPTS_VERSION: &str = "11.16.0";
 const NPM_MIN_RELEASE_AGE_VERSION: &str = "11.10.0";
+const AUBE_PROGRAM: &str = if cfg!(windows) { "aube.exe" } else { "aube" };
 const BUN_MIN_RELEASE_AGE_VERSION: &str = "1.3.0";
 const NPM_IGNORE_SCRIPTS_ARG: &str = "--ignore-scripts=true";
 const PNPM_MIN_RELEASE_AGE_VERSION: &str = "10.16.0";
@@ -87,6 +91,23 @@ impl<'a> NpmOptions<'a> {
         )
     }
 
+    /// Whether this tool's own package may install despite falling below
+    /// aube's weekly-download threshold. Scoped to the requested package
+    /// only — transitive dependencies stay gated.
+    fn allow_low_downloads(&self) -> eyre::Result<bool> {
+        let Some(value) = self.values.raw().opts.get("allow_low_downloads") else {
+            return Ok(false);
+        };
+        match value {
+            toml::Value::Boolean(value) => Ok(*value),
+            toml::Value::String(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            toml::Value::String(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            value => Err(eyre::eyre!(
+                "allow_low_downloads must be a boolean, got {value}"
+            )),
+        }
+    }
+
     fn allow_builds(&self) -> eyre::Result<AllowBuilds> {
         let Some(value) = self.values.raw().opts.get("allow_builds") else {
             return Ok(AllowBuilds::None);
@@ -128,6 +149,15 @@ impl<'a> NpmOptions<'a> {
                 .into_iter()
                 .map(|package| OsString::from(format!("--allow-build={package}")))
                 .collect(),
+        })
+    }
+
+    fn aube_cli_lifecycle_script_args(&self) -> eyre::Result<Vec<OsString>> {
+        let args = self.allow_build_args()?;
+        Ok(if args.is_empty() {
+            vec![OsString::from("--ignore-scripts")]
+        } else {
+            args
         })
     }
 
@@ -230,8 +260,6 @@ impl<'a> NpmOptions<'a> {
     }
 }
 
-const NPM_PROGRAM: &str = if cfg!(windows) { "npm.cmd" } else { "npm" };
-
 #[async_trait]
 impl Backend for NPMBackend {
     fn get_type(&self) -> BackendType {
@@ -284,6 +312,7 @@ impl Backend for NPMBackend {
         match installer {
             // Embedded aube — no external package-manager binary required.
             NpmPackageManager::Auto | NpmPackageManager::Aube => {}
+            NpmPackageManager::AubeCli => deps.push("aube"),
             NpmPackageManager::Npm => {
                 if !deps.contains(&"npm") {
                     deps.push("npm");
@@ -386,29 +415,33 @@ impl Backend for NPMBackend {
             NpmPackageManager::Aube => {
                 self.install_via_aube_embed(ctx, &tv, &options).await?;
             }
+            NpmPackageManager::AubeCli => {
+                self.install_via_aube_cli(ctx, &tv, &options).await?;
+            }
             NpmPackageManager::Bun => {
-                let mut cmd = CmdLineRunner::new("bun")
-                    .arg("install")
-                    .arg(format!("{}@{}", self.tool_name(), tv.version))
-                    .arg("--global")
-                    // Isolated linker does not symlink binaries into BUN_INSTALL_BIN properly.
-                    // https://github.com/jdx/mise/discussions/7541
-                    .arg("--linker")
-                    .arg("hoisted")
-                    .args(install_before_args)
-                    .with_pr(ctx.pr.as_ref())
-                    .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
-                    .env_values(tv.install_env())
-                    .env("BUN_INSTALL_GLOBAL_DIR", tv.install_path())
-                    .env("BUN_INSTALL_BIN", tv.install_path().join("bin"))
-                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
-                    .prepend_path(
-                        self.dependency_toolset(&ctx.config)
-                            .await?
-                            .list_paths(&ctx.config)
-                            .await,
-                    )?
-                    .current_dir(tv.install_path());
+                let mut cmd =
+                    CmdLineRunner::new(self.spawn_program(&ctx.config, Some(&ctx.ts), "bun").await)
+                        .arg("install")
+                        .arg(format!("{}@{}", self.tool_name(), tv.version))
+                        .arg("--global")
+                        // Isolated linker does not symlink binaries into BUN_INSTALL_BIN properly.
+                        // https://github.com/jdx/mise/discussions/7541
+                        .arg("--linker")
+                        .arg("hoisted")
+                        .args(install_before_args)
+                        .with_pr(ctx.pr.as_ref())
+                        .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
+                        .env_values(tv.install_env())
+                        .env("BUN_INSTALL_GLOBAL_DIR", tv.install_path())
+                        .env("BUN_INSTALL_BIN", tv.install_path().join("bin"))
+                        .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                        .prepend_path(
+                            self.dependency_toolset(&ctx.config)
+                                .await?
+                                .list_paths(&ctx.config)
+                                .await,
+                        )?
+                        .current_dir(tv.install_path());
                 if let Some(args) = options.bun_args() {
                     cmd = cmd.args(shell_words::split(args)?);
                 }
@@ -417,28 +450,30 @@ impl Backend for NPMBackend {
             NpmPackageManager::Pnpm => {
                 let bin_dir = tv.install_path().join("bin");
                 crate::file::create_dir_all(&bin_dir)?;
-                let mut cmd = CmdLineRunner::new("pnpm")
-                    .arg("add")
-                    .arg("--global")
-                    .arg(format!("{}@{}", self.tool_name(), tv.version))
-                    .arg("--global-dir")
-                    .arg(tv.install_path())
-                    .arg("--global-bin-dir")
-                    .arg(&bin_dir)
-                    .args(install_before_args)
-                    .with_pr(ctx.pr.as_ref())
-                    .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
-                    .env_values(tv.install_env())
-                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
-                    .prepend_path(
-                        self.dependency_toolset(&ctx.config)
-                            .await?
-                            .list_paths(&ctx.config)
-                            .await,
-                    )?
-                    // required to avoid pnpm error "global bin dir isn't in PATH"
-                    // https://github.com/pnpm/pnpm/issues/9333
-                    .prepend_path(vec![bin_dir])?;
+                let mut cmd = CmdLineRunner::new(
+                    self.spawn_program(&ctx.config, Some(&ctx.ts), "pnpm").await,
+                )
+                .arg("add")
+                .arg("--global")
+                .arg(format!("{}@{}", self.tool_name(), tv.version))
+                .arg("--global-dir")
+                .arg(tv.install_path())
+                .arg("--global-bin-dir")
+                .arg(&bin_dir)
+                .args(install_before_args)
+                .with_pr(ctx.pr.as_ref())
+                .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
+                .env_values(tv.install_env())
+                .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                .prepend_path(
+                    self.dependency_toolset(&ctx.config)
+                        .await?
+                        .list_paths(&ctx.config)
+                        .await,
+                )?
+                // required to avoid pnpm error "global bin dir isn't in PATH"
+                // https://github.com/pnpm/pnpm/issues/9333
+                .prepend_path(vec![bin_dir])?;
                 if let Some(args) = options.pnpm_args() {
                     cmd = cmd.args(shell_words::split(args)?);
                 }
@@ -464,24 +499,25 @@ impl Backend for NPMBackend {
                     NpmOptions::npm_lifecycle_script_args(allow_builds, supports_allow_scripts);
                 let skipped_lifecycle_scripts =
                     Self::effective_npm_ignore_scripts(default_ignore_scripts, &npm_args);
-                let mut cmd = CmdLineRunner::new(NPM_PROGRAM)
-                    .arg("install")
-                    .arg("-g")
-                    .arg(format!("{}@{}", self.tool_name(), tv.version))
-                    .arg("--prefix")
-                    .arg(tv.install_path())
-                    .args(install_before_args)
-                    .with_pr(ctx.pr.as_ref())
-                    .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
-                    .env_values(tv.install_env())
-                    .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
-                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
-                    .prepend_path(
-                        self.dependency_toolset(&ctx.config)
-                            .await?
-                            .list_paths(&ctx.config)
-                            .await,
-                    )?;
+                let mut cmd =
+                    CmdLineRunner::new(self.spawn_program(&ctx.config, Some(&ctx.ts), "npm").await)
+                        .arg("install")
+                        .arg("-g")
+                        .arg(format!("{}@{}", self.tool_name(), tv.version))
+                        .arg("--prefix")
+                        .arg(tv.install_path())
+                        .args(install_before_args)
+                        .with_pr(ctx.pr.as_ref())
+                        .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
+                        .env_values(tv.install_env())
+                        .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+                        .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                        .prepend_path(
+                            self.dependency_toolset(&ctx.config)
+                                .await?
+                                .list_paths(&ctx.config)
+                                .await,
+                        )?;
                 cmd = cmd.args(lifecycle_script_args);
                 if let Some(args) = &npm_args {
                     cmd = cmd.args(args);
@@ -546,9 +582,10 @@ impl NPMBackend {
             async || {
                 let env = self.dependency_env(config).await?;
                 let prefix = Self::npm_meta_prefix()?;
+                let npm = self.spawn_program(config, None, "npm").await;
 
                 let raw = cmd!(
-                    NPM_PROGRAM,
+                    npm,
                     "view",
                     self.tool_name(),
                     "versions",
@@ -573,8 +610,9 @@ impl NPMBackend {
     /// Legacy `npm view` dist-tags lookup, see [`Self::list_remote_versions_npm_view`].
     async fn latest_dist_tag_npm_view(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
         let prefix = Self::npm_meta_prefix()?;
+        let npm = self.spawn_program(config, None, "npm").await;
         let raw = cmd!(
-            NPM_PROGRAM,
+            npm,
             "view",
             self.tool_name(),
             "dist-tags",
@@ -598,7 +636,7 @@ impl NPMBackend {
         let seconds = elapsed_seconds_ceil(before_date, process_now());
         match package_manager {
             NpmPackageManager::Auto => unreachable!("auto package manager should be resolved"),
-            NpmPackageManager::Aube => Vec::new(),
+            NpmPackageManager::Aube | NpmPackageManager::AubeCli => Vec::new(),
             NpmPackageManager::Npm => {
                 // Sub-day windows always emit --before because --min-release-age
                 // is day-granular — which is also the fallback for older npm.
@@ -683,7 +721,7 @@ impl NPMBackend {
     ) -> Option<(&'static str, &'static str, &'static str)> {
         match package_manager {
             NpmPackageManager::Auto => None,
-            NpmPackageManager::Aube => None,
+            NpmPackageManager::Aube | NpmPackageManager::AubeCli => None,
             NpmPackageManager::Npm => None,
             NpmPackageManager::Bun => {
                 Some(("bun", BUN_MIN_RELEASE_AGE_VERSION, "--minimum-release-age"))
@@ -744,7 +782,8 @@ impl NPMBackend {
                 return false;
             }
         };
-        let output = match cmd!(NPM_PROGRAM, "--version")
+        let npm = self.spawn_program(config, None, "npm").await;
+        let output = match cmd!(npm, "--version")
             .full_env(env)
             .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
             .read()
@@ -774,7 +813,9 @@ impl NPMBackend {
         // TODO: Once bun supports querying packages without package.json, this can be updated
         self.warn_if_dependency_missing(
             config,
-            "npm", // Use "npm" for dependency check, which will check npm.cmd on Windows
+            // The bare name: `executable_names` expands it across
+            // `windows_executable_extensions`, so the node-bundled `npm.cmd` is found.
+            "npm",
             &["node", "npm"],
             "To use npm packages with mise, you need to install Node.js first:\n\
               mise use node@latest\n\n\
@@ -793,6 +834,23 @@ impl NPMBackend {
         match package_manager {
             // Embedded aube is compiled into mise — nothing to check for.
             NpmPackageManager::Aube => {}
+            NpmPackageManager::AubeCli => {
+                if let Some(ts) = _ts
+                    && ts.which_bin(config, AUBE_PROGRAM).await.is_some()
+                {
+                    return;
+                }
+                self.warn_if_dependency_missing(
+                    config,
+                    "aube",
+                    &["aube"],
+                    "To install npm packages with the standalone aube CLI, install aube first:\n\
+                      mise use aube@latest\n\n\
+                    Or use mise's embedded aube by setting:\n\
+                      mise settings npm.package_manager=aube",
+                )
+                .await
+            }
             NpmPackageManager::Bun => {
                 self.warn_if_dependency_missing(
                     config,
@@ -869,11 +927,18 @@ impl NPMBackend {
         tv: &ToolVersion,
         options: &NpmOptions<'_>,
     ) -> Result<()> {
+        crate::backend::aube_host::init();
         let install_path = tv.install_path();
         crate::file::create_dir_all(&install_path)?;
 
         let allow_builds = options.allow_builds()?;
-        self.write_aube_embed_project(&install_path, ctx.before_date, options, &allow_builds)?;
+        self.write_aube_embed_project(
+            &install_path,
+            ctx.before_date,
+            options,
+            &allow_builds,
+            tv.resolved_from_lockfile(),
+        )?;
 
         if let Some(args) = options.aube_args() {
             warn!(
@@ -882,6 +947,10 @@ impl NPMBackend {
             );
         }
 
+        // aube renders nothing itself: `Events` mode routes the same phase and
+        // progress numbers to us so mise's own progress job stays the only
+        // thing drawing to the terminal. See [`AubeProgressReporter`].
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut opts = aube::embed::AddToProjectOptions {
             // Global-style installs pin the exact resolved version, matching
             // what `aube add --global` wrote to its synthetic manifest.
@@ -890,30 +959,111 @@ impl NPMBackend {
             // `aube.allowBuilds`; only the "allow everything" case needs the
             // invocation flag. `None` leaves scripts skipped (aube's default).
             dangerously_allow_all_builds: matches!(allow_builds, AllowBuilds::All),
-            control: aube::embed::InstallControl::default(),
+            control: aube::embed::InstallControl::events(Arc::new(AubeProgressReporter { tx }))
+                .with_prompt_handler(Arc::new(AubePromptHandler)),
             // Run dependency lifecycle scripts on the node mise resolved as a
             // dependency, so `allow_builds` installs work even when node isn't
             // on the ambient PATH (the in-process installer doesn't inherit the
             // per-command PATH the old `aube add --global` subprocess got).
-            node_bin_dir: self.aube_embed_node_bin_dir(ctx).await,
+            runtime: self.aube_embed_runtime(ctx).await,
             ..Default::default()
         };
         opts.ignore_scripts = matches!(allow_builds, AllowBuilds::None);
 
         let package = format!("{}@{}", self.tool_name(), tv.version);
-        aube::embed::add(&install_path, std::slice::from_ref(&package), opts)
-            .await
-            .map_err(|e| eyre::eyre!("aube install failed: {e}"))?;
+        let install = aube::embed::add(&install_path, std::slice::from_ref(&package), opts);
+        tokio::pin!(install);
+        // Drain events alongside the install rather than after it: the
+        // reporter only enqueues (it must never wait on us while holding an
+        // install worker), so nothing renders unless someone is pulling.
+        let result = loop {
+            tokio::select! {
+                res = &mut install => break res,
+                Some(event) = rx.recv() => apply_aube_event(event, ctx.pr.as_ref()),
+            }
+        };
+        // Events queued between the last poll and the install returning —
+        // notably the terminal `Complete` snapshot.
+        while let Ok(event) = rx.try_recv() {
+            apply_aube_event(event, ctx.pr.as_ref());
+        }
+        result.map_err(|e| self.format_aube_install_error(e))?;
         Ok(())
     }
 
-    /// Directory containing the `node` mise resolved as a dependency, handed to
-    /// the embedded aube installer so lifecycle scripts spawn on it. `None` (no
-    /// node dependency resolved) lets aube fall back to an ambient `node`.
-    async fn aube_embed_node_bin_dir(&self, ctx: &InstallContext) -> Option<PathBuf> {
+    /// Install through a standalone aube executable while keeping version
+    /// metadata on mise's built-in registry client. Calling `aube` directly
+    /// avoids depending on the npm compatibility shim installed by
+    /// `aube activate`.
+    async fn install_via_aube_cli(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+        options: &NpmOptions<'_>,
+    ) -> Result<()> {
+        let bin_dir = tv.install_path().join("bin");
+        let aube_program = self
+            .dependency_path_for_install(&ctx.config, Some(&ctx.ts), AUBE_PROGRAM)
+            .await
+            .unwrap_or_else(|| AUBE_PROGRAM.into());
+        self.write_aube_cli_project(
+            &tv.install_path(),
+            ctx.before_date,
+            options,
+            tv.resolved_from_lockfile(),
+        )?;
+        let mut cmd = CmdLineRunner::new(aube_program)
+            .arg("add")
+            .arg("--global")
+            .arg(format!("{}@{}", self.tool_name(), tv.version))
+            .with_pr(ctx.pr.as_ref())
+            .envs(ctx.ts.env_with_path_without_tools(&ctx.config).await?)
+            .env_values(tv.install_env())
+            .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+            .prepend_path(
+                self.dependency_toolset(&ctx.config)
+                    .await?
+                    .list_paths(&ctx.config)
+                    .await,
+            )?
+            .prepend_path(vec![bin_dir])?
+            .current_dir(tv.install_path());
+        if let Some(args) = options.aube_args() {
+            cmd = cmd.args(shell_words::split(args)?);
+        }
+        cmd.args(options.aube_cli_lifecycle_script_args()?)
+            .execute()?;
+        Ok(())
+    }
+
+    /// Render an aube embedded-install failure into an eyre error that keeps
+    /// aube's full cause chain and remediation.
+    ///
+    /// aube returns a [`miette::Report`] whose `Display` prints only the
+    /// outermost message (e.g. "failed to resolve dependencies"), which hides
+    /// the actual reason — a supply-chain trust-policy block on a transitive
+    /// dependency surfaces as an opaque resolution failure otherwise. Walk the
+    /// cause chain so the real diagnostic is visible, and for the trust
+    /// downgrade code translate aube's own `.npmrc` / `pnpm-workspace.yaml`
+    /// help into the mise-native `trust_policy_excludes` / `npm.shell_out`
+    /// remedies, since mise owns the synthetic `.npmrc` aube's help tells the
+    /// user to edit.
+    fn format_aube_install_error(&self, err: miette::Report) -> eyre::Report {
+        eyre::eyre!(build_aube_install_error_message(&err, &self.ba().full()))
+    }
+
+    /// The `node` mise resolved as a dependency, handed to the embedded aube
+    /// installer so lifecycle scripts spawn on it. `None` (no node dependency
+    /// resolved) lets aube fall back to an ambient `node`.
+    ///
+    /// `selector` is the version-manager shape: mise hands over a real bin dir
+    /// holding `node`/`npm`/`npx`, aube prepends it to PATH and uses that node
+    /// for both `NODE` and `npm_node_execpath`. (`wrapper` is for hosts that
+    /// interpose a shim on `node`; mise resolves the real binary here.)
+    async fn aube_embed_runtime(&self, ctx: &InstallContext) -> Option<EmbedderRuntime> {
         let ts = self.dependency_toolset(&ctx.config).await.ok()?;
         let node = ts.which_bin(&ctx.config, "node").await?;
-        node.parent().map(Path::to_path_buf)
+        node.parent().map(EmbedderRuntime::selector)
     }
 
     /// Write the throwaway project's `package.json` + `.npmrc` for an embedded
@@ -926,13 +1076,23 @@ impl NPMBackend {
         before_date: Option<Timestamp>,
         options: &NpmOptions,
         allow_builds: &AllowBuilds,
+        resolved_from_lockfile: bool,
     ) -> Result<()> {
+        // Validate the fallible options before writing anything, so a malformed
+        // value fails without leaving a half-written project dir behind.
+        let trust_policy_excludes = options.aube_trust_policy_excludes_npmrc_value()?;
+        let allow_low_downloads = options.allow_low_downloads()?;
+
         let mut manifest = serde_json::json!({
             "name": "mise-npm-install",
             "private": true,
         });
         if let AllowBuilds::Packages(packages) = allow_builds {
-            manifest["aube"] = serde_json::json!({ "allowBuilds": packages });
+            let allow_builds = packages
+                .iter()
+                .map(|package| (package.clone(), serde_json::Value::Bool(true)))
+                .collect::<serde_json::Map<_, _>>();
+            manifest["aube"] = serde_json::json!({ "allowBuilds": allow_builds });
         }
         crate::file::write(
             install_path.join("package.json"),
@@ -948,11 +1108,59 @@ impl NPMBackend {
             // aube documents minimumReleaseAge in minutes, matching pnpm's setting.
             npmrc.push_str(&format!("minimumReleaseAge={minutes}\n"));
         }
-        if let Some(excludes) = options.aube_trust_policy_excludes_npmrc_value()? {
+        if let Some(excludes) = trust_policy_excludes {
             npmrc.push_str(&format!("trustPolicyExclude={excludes}\n"));
+        }
+        if allow_low_downloads || resolved_from_lockfile {
+            // Exempt only this tool's own package, not the whole install, so a
+            // transitive dependency below the threshold still fails the gate.
+            // aube gates the directly-requested packages, which for mise is
+            // always exactly this one. A matching mise.lock pin is itself
+            // approval for the download-count check.
+            npmrc.push_str(&format!("allowedUnpopularPackages={}\n", self.tool_name()));
         }
         crate::file::write(install_path.join(".npmrc"), npmrc)?;
         Ok(())
+    }
+
+    /// Configure a standalone `aube add --global` invocation to install into
+    /// mise's per-tool prefix rather than aube's user-global prefix.
+    fn write_aube_cli_project(
+        &self,
+        install_path: &Path,
+        before_date: Option<Timestamp>,
+        options: &NpmOptions<'_>,
+        resolved_from_lockfile: bool,
+    ) -> Result<()> {
+        let trust_policy_excludes = options.aube_trust_policy_excludes_npmrc_value()?;
+        let allow_low_downloads = options.allow_low_downloads()?;
+        let bin_dir = install_path.join("bin");
+        crate::file::create_dir_all(install_path)?;
+        crate::file::create_dir_all(&bin_dir)?;
+        let mut npmrc = format!(
+            "globalDir={}\nglobalBinDir={}\n",
+            Self::npmrc_path_value(install_path),
+            Self::npmrc_path_value(&bin_dir)
+        );
+        if let Some(before_date) = before_date {
+            let minutes = Self::build_aube_minimum_release_age(elapsed_seconds_ceil(
+                before_date,
+                process_now(),
+            ));
+            npmrc.push_str(&format!("minimumReleaseAge={minutes}\n"));
+        }
+        if let Some(excludes) = trust_policy_excludes {
+            npmrc.push_str(&format!("trustPolicyExclude={excludes}\n"));
+        }
+        if allow_low_downloads || resolved_from_lockfile {
+            npmrc.push_str(&format!("allowedUnpopularPackages={}\n", self.tool_name()));
+        }
+        crate::file::write(install_path.join(".npmrc"), npmrc)?;
+        Ok(())
+    }
+
+    fn npmrc_path_value(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
     }
 
     fn build_aube_minimum_release_age(seconds: u64) -> u64 {
@@ -1073,6 +1281,142 @@ impl NPMBackend {
     }
 }
 
+/// Feeds aube's structured install events into a channel mise drains onto its
+/// own progress job.
+///
+/// aube's default `Human` output mode renders its own clx progress display —
+/// a branded root row with overall counts plus transient child rows per
+/// in-flight tarball fetch — straight to stderr. Because mise and aube both
+/// draw through clx, those rows land as siblings of the job mise already
+/// started for the install, so the user sees two competing progress displays
+/// for one operation, the second one branded by the engine they never chose.
+/// `Events` mode suppresses every one of aube's own writes (the bar, the
+/// `Resolving <pkg>...` lines, and the post-install dependency summary, all of
+/// which are gated on `Human`) and hands the underlying numbers over instead.
+#[derive(Debug)]
+struct AubeProgressReporter {
+    tx: tokio::sync::mpsc::UnboundedSender<aube::embed::InstallEvent>,
+}
+
+impl aube::embed::InstallReporter for AubeProgressReporter {
+    fn report(&self, event: aube::embed::InstallEvent) {
+        // Unbounded, so this never blocks an install worker waiting on us —
+        // what the trait requires. A closed channel means the install already
+        // returned and nobody is left to render the event.
+        let _ = self.tx.send(event);
+    }
+}
+
+/// Routes confirmations requested by embedded aube through mise's prompt UI.
+///
+/// The prompt UI owns TTY detection and progress suspension, so unattended
+/// installs fail closed instead of waiting on stdin and interactive prompts
+/// cannot be overwritten by the progress renderer.
+#[derive(Debug)]
+struct AubePromptHandler;
+
+impl aube::embed::InstallPromptHandler for AubePromptHandler {
+    fn confirm(&self, prompt: aube::embed::InstallPrompt) -> aube::embed::InstallPromptFuture<'_> {
+        Box::pin(async move {
+            crate::ui::prompt::confirm_with_default(aube_prompt_message(&prompt), false)
+                .map_err(|err| miette::miette!("{err:#}"))
+        })
+    }
+}
+
+fn aube_prompt_message(prompt: &aube::embed::InstallPrompt) -> String {
+    use aube::embed::InstallPrompt;
+
+    match prompt {
+        InstallPrompt::SimilarPackageName {
+            package,
+            suggested_package,
+            popularity_rank,
+            edit_distance,
+        } => format!(
+            "{package} resembles {suggested_package} (top-100,000 rank #{popularity_rank}, edit distance {edit_distance}). Continue adding {package}?"
+        ),
+        InstallPrompt::LowDownloadPackage {
+            package,
+            weekly_downloads,
+            threshold,
+        } => format!(
+            "{package} looks suspicious: {weekly_downloads} downloads last week (threshold: {threshold}). Continue adding {package}?"
+        ),
+        InstallPrompt::NewPackageName {
+            package,
+            created_at,
+            minimum_age_minutes,
+        } => format!(
+            "{package} is newly registered (first published {created_at}; minimum age: {minimum_age_minutes} minutes). Continue adding {package}?"
+        ),
+        _ => "aube requires confirmation before adding this package. Continue?".to_string(),
+    }
+}
+
+/// Render one aube install event onto mise's progress job.
+///
+/// Everything goes in the message; the progress bar is deliberately left
+/// alone. Driving it would mean `set_length(snap.estimated_bytes)`, and that
+/// estimate is a moving, inflated target — aube resolves and downloads
+/// concurrently, so the denominator climbs for most of the install, and it
+/// keeps counting platform-mismatched optional deps that get pruned before
+/// anything fetches them. The result is a bar pinned near 15% with an ETA
+/// swinging between 5s and 30s. The package tally below is the honest number,
+/// and mise's spinner already says the work is live.
+fn apply_aube_event(event: aube::embed::InstallEvent, pr: &dyn SingleReport) {
+    use aube::embed::{InstallEvent, InstallOutputLevel, InstallPhase};
+
+    match event {
+        // The phase repeats on every progress snapshot, which also carries the
+        // counts, so the bare transition needs no separate render.
+        InstallEvent::Phase(_) => {}
+        InstallEvent::Progress(snap) => {
+            let (label, cur, total) = match snap.phase {
+                // Resolving walks a frontier: the denominator is still growing,
+                // and `resolved` can outrun the last total we saw.
+                Some(InstallPhase::Resolving) | None => {
+                    ("resolving", snap.resolved, snap.total.max(snap.resolved))
+                }
+                // Past resolution the package count is final, and progress is
+                // how many are in place — from the store or the network.
+                Some(InstallPhase::Fetching) => {
+                    ("fetching", snap.reused + snap.downloaded, snap.resolved)
+                }
+                Some(InstallPhase::Linking) => {
+                    ("linking", snap.reused + snap.downloaded, snap.resolved)
+                }
+                Some(InstallPhase::Complete) => ("installing", snap.resolved, snap.resolved),
+            };
+
+            // The first snapshot lands before resolution has counted anything;
+            // `0/0 pkgs` is worse than no tally at all.
+            let mut message = if total == 0 {
+                label.to_string()
+            } else {
+                format!("{label} {cur}/{total} pkgs")
+            };
+            // Bytes actually transferred — no denominator, so nothing here can
+            // be wrong the way a percentage would be. Omitted entirely for an
+            // install served from the store, which downloads nothing.
+            if snap.downloaded_bytes > 0 {
+                message.push_str(&format!(
+                    " · {}",
+                    ByteSize::b(snap.downloaded_bytes).display().iec()
+                ));
+            }
+            pr.set_message(message);
+        }
+        // Text aube would have written to stderr itself. Warnings are the
+        // user's business; a fatal error also comes back as the returned
+        // `Err`, so this is never the only place one surfaces.
+        InstallEvent::Output { level, message, .. } => match level {
+            InstallOutputLevel::Info => debug!("aube: {message}"),
+            InstallOutputLevel::Warning | InstallOutputLevel::Error => warn!("{message}"),
+        },
+    }
+}
+
 /// Returns true if `version` is a semver pre-release.
 ///
 /// npm enforces strict semver (rule 9): any hyphen-introduced identifier after
@@ -1141,6 +1485,49 @@ fn parse_bool_arg(value: &str) -> Option<bool> {
     }
 }
 
+/// Build the message for an aube embedded-install failure, preserving aube's
+/// full cause chain and remediation.
+///
+/// aube returns a [`miette::Report`] whose `Display` prints only the outermost
+/// message (e.g. "failed to resolve dependencies"), which hides the actual
+/// reason — a supply-chain trust-policy block on a transitive dependency
+/// surfaces as an opaque resolution failure otherwise. Walk the cause chain so
+/// the real diagnostic is visible, and for the trust downgrade code translate
+/// aube's own `.npmrc` / `pnpm-workspace.yaml` help into the mise-native
+/// `trust_policy_excludes` / `npm.shell_out` remedies, since mise owns the
+/// synthetic `.npmrc` aube's help tells the user to edit.
+fn build_aube_install_error_message(err: &miette::Report, tool_full: &str) -> String {
+    let mut msg = format!("aube install failed: {err}");
+    for cause in err.chain().skip(1) {
+        msg.push_str(&format!("\n  caused by: {cause}"));
+    }
+    if err.code().map(|c| c.to_string()).as_deref() == Some("ERR_AUBE_TRUST_DOWNGRADE") {
+        msg.push_str(&format!(
+            "\n\nThis is a supply-chain trust failure, not an ordinary version-resolution error. \
+             An earlier release had stronger trust evidence than the selected release. \
+             This can indicate a compromised or tampered release; it can also happen when a \
+             maintainer manually publishes, backports outside the trusted workflow, skips \
+             provenance for convenience, or uses a registry that strips metadata.\n\n\
+             Before bypassing, inspect the package's npm release, source tag/commit, publisher \
+             identity, and tarball; compare the metadata with npmjs.org. Confirm the release is \
+             expected and nothing appears tampered with, then report inconsistent evidence to the \
+             relevant upstream owner. Package-release drift belongs with the maintainer; metadata \
+             present on npmjs.org but missing from a proxy or mirror belongs with that registry \
+             operator.\n\n\
+             Only after review, add the narrowest affected `<package>@<version>` to \
+             `trust_policy_excludes` for this tool, e.g.:\n  \
+             \"{tool_full}\" = {{ version = \"latest\", trust_policy_excludes = [\"<package>@<version>\"] }}\n\
+             A bare package name exempts every version. `mise settings npm.shell_out=true` uses \
+             the npm CLI and bypasses this check entirely, so it should be a last resort.\n\n\
+             Investigation guide and known exceptions: \
+             https://aube.jdx.dev/security#trust-policy"
+        ));
+    } else if let Some(help) = err.help() {
+        msg.push_str(&format!("\n  help: {help}"));
+    }
+    msg
+}
+
 /// Returns install-time-only option keys for NPM backend.
 pub fn install_time_option_keys() -> Vec<String> {
     vec![
@@ -1150,6 +1537,7 @@ pub fn install_time_option_keys() -> Vec<String> {
         "aube_args".into(),
         "allow_builds".into(),
         "trust_policy_excludes".into(),
+        "allow_low_downloads".into(),
     ]
 }
 
@@ -1309,6 +1697,89 @@ mod tests {
         assert_eq!(NPMBackend::build_aube_minimum_release_age(1), 1);
         assert_eq!(NPMBackend::build_aube_minimum_release_age(60), 1);
         assert_eq!(NPMBackend::build_aube_minimum_release_age(61), 2);
+    }
+
+    #[test]
+    fn test_aube_prompt_messages_preserve_security_context() {
+        assert_eq!(
+            aube_prompt_message(&aube::embed::InstallPrompt::LowDownloadPackage {
+                package: "tiny".to_string(),
+                weekly_downloads: 12,
+                threshold: 1000,
+            }),
+            "tiny looks suspicious: 12 downloads last week (threshold: 1000). Continue adding tiny?"
+        );
+        assert_eq!(
+            aube_prompt_message(&aube::embed::InstallPrompt::SimilarPackageName {
+                package: "loadsh".to_string(),
+                suggested_package: "lodash".to_string(),
+                popularity_rank: 42,
+                edit_distance: 2,
+            }),
+            "loadsh resembles lodash (top-100,000 rank #42, edit distance 2). Continue adding loadsh?"
+        );
+        assert_eq!(
+            aube_prompt_message(&aube::embed::InstallPrompt::NewPackageName {
+                package: "new-package".to_string(),
+                created_at: "2026-07-28T00:00:00Z".to_string(),
+                minimum_age_minutes: 43_200,
+            }),
+            "new-package is newly registered (first published 2026-07-28T00:00:00Z; minimum age: 43200 minutes). Continue adding new-package?"
+        );
+    }
+
+    #[test]
+    fn test_build_aube_install_error_message_trust_downgrade() {
+        use miette::Diagnostic;
+        use thiserror::Error;
+
+        #[derive(Debug, Error)]
+        #[error(
+            "trust downgrade for @octokit/endpoint@9.0.6 (trustPolicy=no-downgrade): earlier published version 10.1.0 had provenance attestation but this version has no trust evidence"
+        )]
+        struct Cause;
+
+        #[derive(Debug, Error, Diagnostic)]
+        #[error("failed to resolve dependencies")]
+        #[diagnostic(code(ERR_AUBE_TRUST_DOWNGRADE))]
+        struct TopErr {
+            #[source]
+            source: Cause,
+        }
+
+        let report = miette::Report::new(TopErr { source: Cause });
+        let msg = build_aube_install_error_message(&report, "npm:danger");
+        // Outermost message is preserved and the real cause is surfaced.
+        assert!(msg.contains("aube install failed: failed to resolve dependencies"));
+        assert!(msg.contains("caused by: trust downgrade for @octokit/endpoint@9.0.6"));
+        // mise-native remediation replaces aube's .npmrc-oriented help.
+        assert!(msg.contains("not an ordinary version-resolution error"));
+        assert!(msg.contains("stronger trust evidence than the selected release"));
+        assert!(msg.contains("nothing appears tampered with"));
+        assert!(msg.contains("report inconsistent evidence to the relevant upstream owner"));
+        assert!(msg.contains("belongs with that registry operator"));
+        assert!(msg.contains("narrowest affected `<package>@<version>`"));
+        assert!(msg.contains("trust_policy_excludes"));
+        assert!(msg.contains("\"npm:danger\""));
+        assert!(msg.contains("npm.shell_out=true"));
+        assert!(msg.contains("https://aube.jdx.dev/security#trust-policy"));
+    }
+
+    #[test]
+    fn test_build_aube_install_error_message_other_error_keeps_aube_help() {
+        use miette::Diagnostic;
+        use thiserror::Error;
+
+        #[derive(Debug, Error, Diagnostic)]
+        #[error("something else failed")]
+        #[diagnostic(code(ERR_AUBE_OTHER), help("try again later"))]
+        struct OtherErr;
+
+        let report = miette::Report::new(OtherErr);
+        let msg = build_aube_install_error_message(&report, "npm:foo");
+        assert!(msg.contains("aube install failed: something else failed"));
+        assert!(msg.contains("help: try again later"));
+        assert!(!msg.contains("trust_policy_excludes"));
     }
 
     fn assert_npm_view_versions_time(data: &serde_json::Value) {
@@ -1622,6 +2093,10 @@ mod tests {
             None
         );
         assert_eq!(
+            NPMBackend::release_age_package_manager_requirement(NpmPackageManager::AubeCli),
+            None
+        );
+        assert_eq!(
             NPMBackend::release_age_package_manager_requirement(NpmPackageManager::Npm),
             None
         );
@@ -1784,16 +2259,158 @@ mod tests {
         let allow_builds = options.allow_builds().unwrap();
 
         backend
-            .write_aube_embed_project(&install_path, None, &options, &allow_builds)
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds, false)
             .unwrap();
 
         // Trust-policy excludes go in .npmrc for the resolver to read.
         let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
         assert!(npmrc.contains("trustPolicyExclude=undici,undici@^5\n"));
         // The build-script allowlist goes in package.json's aube namespace.
-        let manifest = std::fs::read_to_string(install_path.join("package.json")).unwrap();
-        assert!(manifest.contains("\"allowBuilds\""));
-        assert!(manifest.contains("esbuild"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(install_path.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["aube"]["allowBuilds"],
+            serde_json::json!({ "esbuild": true })
+        );
+    }
+
+    #[test]
+    fn test_write_aube_cli_project_targets_mise_install_prefix() {
+        let backend = create_npm_backend("vercel");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-vercel").join("54.20.1");
+        let mut raw_options = ToolVersionOptions::default();
+        raw_options.opts.insert(
+            "trust_policy_excludes".to_string(),
+            toml::Value::String("undici".into()),
+        );
+        let options = NpmOptions::new(&raw_options);
+
+        backend
+            .write_aube_cli_project(&install_path, None, &options, true)
+            .unwrap();
+
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(npmrc.contains(&format!(
+            "globalDir={}\n",
+            NPMBackend::npmrc_path_value(&install_path)
+        )));
+        assert!(npmrc.contains(&format!(
+            "globalBinDir={}\n",
+            NPMBackend::npmrc_path_value(&install_path.join("bin"))
+        )));
+        assert!(npmrc.contains("trustPolicyExclude=undici\n"));
+        assert!(npmrc.contains("allowedUnpopularPackages=vercel\n"));
+        assert!(install_path.join("bin").is_dir());
+        assert!(!install_path.join("package.json").exists());
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_scopes_allow_low_downloads_to_the_tool() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let mut raw_options = ToolVersionOptions::default();
+        raw_options.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        backend
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds, false)
+            .unwrap();
+
+        // Only the requested package is exempt — not a wildcard, so a
+        // transitive dependency below the threshold still fails aube's gate.
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(npmrc.contains("allowedUnpopularPackages=bibtex-tidy\n"));
+        assert!(!npmrc.contains('*'));
+        assert!(!npmrc.contains("lowDownloadThreshold"));
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_writes_nothing_when_an_option_is_malformed() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let mut raw_options = ToolVersionOptions::default();
+        raw_options.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Integer(1000),
+        );
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        assert!(
+            backend
+                .write_aube_embed_project(&install_path, None, &options, &allow_builds, false)
+                .is_err()
+        );
+        // Options are validated up front, so the aborted call leaves no
+        // half-written project behind for a later step to trip over.
+        assert!(!install_path.join("package.json").exists());
+        assert!(!install_path.join(".npmrc").exists());
+    }
+
+    #[test]
+    fn test_allow_low_downloads_defaults_off_and_rejects_non_bool() {
+        let empty = ToolVersionOptions::default();
+        assert!(!NpmOptions::new(&empty).allow_low_downloads().unwrap());
+
+        let mut string_true = ToolVersionOptions::default();
+        string_true.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::String("true".into()),
+        );
+        assert!(NpmOptions::new(&string_true).allow_low_downloads().unwrap());
+
+        let mut bad = ToolVersionOptions::default();
+        bad.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Integer(1000),
+        );
+        assert!(NpmOptions::new(&bad).allow_low_downloads().is_err());
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_omits_allow_low_downloads_by_default() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let raw_options = ToolVersionOptions::default();
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        backend
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds, false)
+            .unwrap();
+
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(!npmrc.contains("allowedUnpopularPackages"));
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_trusts_mise_lockfile_pin() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let raw_options = ToolVersionOptions::default();
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        backend
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds, true)
+            .unwrap();
+
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(npmrc.contains("allowedUnpopularPackages=bibtex-tidy\n"));
     }
 
     #[test]
@@ -1843,6 +2460,29 @@ mod tests {
                 .allow_build_args()
                 .unwrap(),
             vec![OsString::from("--dangerously-allow-all-builds")]
+        );
+    }
+
+    #[test]
+    fn test_aube_cli_lifecycle_script_args_ignore_scripts_by_default() {
+        let default_options = ToolVersionOptions::default();
+        assert_eq!(
+            NpmOptions::new(&default_options)
+                .aube_cli_lifecycle_script_args()
+                .unwrap(),
+            vec![OsString::from("--ignore-scripts")]
+        );
+
+        let mut allow_options = ToolVersionOptions::default();
+        allow_options.opts.insert(
+            "allow_builds".to_string(),
+            toml::Value::String("esbuild".into()),
+        );
+        assert_eq!(
+            NpmOptions::new(&allow_options)
+                .aube_cli_lifecycle_script_args()
+                .unwrap(),
+            vec![OsString::from("--allow-build=esbuild")]
         );
     }
 

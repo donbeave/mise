@@ -70,7 +70,7 @@ impl Toolset {
     pub async fn env_with_path(&self, config: &Arc<Config>) -> Result<EnvMap> {
         // Try to load from cache if enabled
         if CachedEnv::is_enabled()
-            && let Some(mut cached) = self.try_load_env_cache(config)?
+            && let Some(mut cached) = self.try_load_env_cache(config).await?
         {
             trace!("env_cache: using cached environment");
             github::oauth::inject_token_env(&mut cached);
@@ -114,7 +114,7 @@ impl Toolset {
     ) -> Result<(EnvMap, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
         // Try to load from cache if enabled
         if CachedEnv::is_enabled()
-            && let Some(cached) = self.try_load_env_cache_full(config)?
+            && let Some(cached) = self.try_load_env_cache_full(config).await?
         {
             trace!("env_cache: using cached environment with split paths");
             let mut env = cached.env;
@@ -163,17 +163,18 @@ impl Toolset {
     }
 
     /// Try to load environment from cache (returns full CachedEnv)
-    pub(crate) fn try_load_env_cache_full(
+    pub(crate) async fn try_load_env_cache_full(
         &self,
         config: &Arc<Config>,
     ) -> Result<Option<CachedEnv>> {
+        config.env_results().await?;
         let cache_key = self.compute_env_cache_key(config)?;
         CachedEnv::load(&cache_key)
     }
 
     /// Try to load environment from cache (returns reconstructed EnvMap)
-    fn try_load_env_cache(&self, config: &Arc<Config>) -> Result<Option<EnvMap>> {
-        match self.try_load_env_cache_full(config)? {
+    async fn try_load_env_cache(&self, config: &Arc<Config>) -> Result<Option<EnvMap>> {
+        match self.try_load_env_cache_full(config).await? {
             Some(cached) => {
                 let mut env = cached.env;
                 // Reconstruct PATH from cached paths
@@ -283,7 +284,7 @@ impl Toolset {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Include the auto-sourced uv venv (uv.lock + .venv) in the key so a venv
+        // Include the auto-sourced uv venv (uv.lock + resolved venv) in the key so a venv
         // dir and a sibling sharing the same config files don't collide on one
         // cache entry, which would leak the venv across directories.
         let mut uv_venv_inputs: Vec<(PathBuf, u64)> = Vec::new();
@@ -291,7 +292,7 @@ impl Toolset {
             && let Some(uv_root) = uv::uv_root()
         {
             let lock = uv_root.join("uv.lock");
-            let venv = uv_root.join(".venv");
+            let venv = uv::uv_venv_path(config, &uv_root);
             let lock_mtime = get_file_mtime(&lock).unwrap_or(0);
             let venv_mtime = get_file_mtime(&venv).unwrap_or(0);
             uv_venv_inputs.push((lock, lock_mtime));
@@ -417,7 +418,11 @@ impl Toolset {
 
         // Apply redactions from tools-only env vars (e.g. redact=true + tools=true)
         if !env_results.redactions.is_empty() {
-            config.add_redactions(env_results.redactions.iter().cloned(), &env);
+            config.add_redactions_excluding(
+                env_results.redactions.iter().cloned(),
+                &env,
+                &env_results.redaction_exclusions,
+            );
         }
 
         Ok((env, env_results))
@@ -446,7 +451,7 @@ impl Toolset {
             .flatten()
             .collect();
         // trace!("load_env: entries: {:#?}", entries);
-        let env_results = EnvResults::resolve(
+        let env_results = EnvResults::resolve_with_toolset(
             config,
             ctx,
             env,
@@ -456,6 +461,9 @@ impl Toolset {
                 tools: tools_filter,
                 warn_on_missing_required: *WARN_ON_MISSING_REQUIRED_ENV,
             },
+            // `_.python.venv` needs the *active* python, which is only knowable here: a
+            // `--tool python@3.12` override lives in this toolset and never reaches `Config`.
+            Some(self),
         )
         .await?;
         if log::log_enabled!(log::Level::Trace) {

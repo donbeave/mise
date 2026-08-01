@@ -173,13 +173,13 @@ handoff-eligible automatically.
 
 ## Done criteria
 
-- [ ] Declarative `CaskArtifacts` and completed actions are separate types.
-- [ ] Only mutators emit completed-action facts.
-- [ ] Final receipt is published after all required activations.
-- [ ] Journal durability includes file and parent-directory sync.
-- [ ] Status does not use current API to invent historical actions.
-- [ ] Legacy receipts cannot become interop/handoff eligible automatically.
-- [ ] Focused tests and lint pass.
+- [x] Declarative `CaskArtifacts` and completed actions are separate types.
+- [x] Only mutators emit completed-action facts.
+- [x] Final receipt is published after all required activations.
+- [x] Journal durability includes file and parent-directory sync.
+- [x] Status does not use current API to invent historical actions.
+- [x] Legacy receipts cannot become interop/handoff eligible automatically.
+- [x] Focused tests and lint pass.
 
 ## STOP conditions
 

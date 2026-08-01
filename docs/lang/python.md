@@ -80,12 +80,16 @@ mise has two ways to manage Python virtualenvs:
 | `python.uv_venv_auto` | uv projects (with `uv.lock`) | `[settings]` section |
 | `_.python.venv`       | Projects not using uv        | `[env]` section      |
 
-**`python.uv_venv_auto`** detects and sources the `.venv` managed by `uv`. Use `"source"` to only activate existing venvs, or `"create|source"` to create if missing. See the [mise + uv Cookbook](/mise-cookbook/python.html#mise-uv) for full examples.
+**`python.uv_venv_auto`** detects and sources the virtual environment managed by `uv` (`.venv` by default, or the path configured by `UV_PROJECT_ENVIRONMENT`). Use `"source"` to only activate existing venvs, or `"create|source"` to create if missing. mise locates the uv project by walking up for a `uv.lock` file, so a `uv.lock` must be present — without one the setting does nothing. See the [mise + uv Cookbook](/mise-cookbook/python.html#mise-uv) for full examples.
 
 **`_.python.venv`** creates/activates a venv and adds it to PATH. It works with both `mise activate` and `mise exec`. Use this for projects that don't use uv.
 
 ::: warning
 These are separate mechanisms with different code paths. Options like `uv_create_args` and `python_create_args` in `_.python.venv` are not used by `python.uv_venv_auto`.
+:::
+
+::: warning
+The legacy `virtualenv` tool option (`python = { version = "3.15", virtualenv = ".venv" }` in `[tools]`) is deprecated and will be removed in a future release. Use `_.python.venv` (below) instead.
 :::
 
 ### `_.python.venv` configuration
@@ -123,13 +127,25 @@ Virtualenv activation requires `mise activate` or `mise exec`. When using [shims
 
 ### `python.uv_venv_auto` setting
 
-For uv-managed projects (those with a `uv.lock` file), you can use the `python.uv_venv_auto` setting to automatically source or create the `.venv` that uv manages. See the [mise + uv Cookbook](/mise-cookbook/python.html#mise-uv) for full examples.
+For uv-managed projects (those with a `uv.lock` file), you can use the `python.uv_venv_auto` setting to automatically source or create the virtual environment that uv manages. mise finds the project root by walking up for a `uv.lock`; the presence of that lockfile is how mise knows the project uses uv, so a `uv.lock` must be present. If no `uv.lock` is found the setting is a no-op — run `uv sync` (or `uv lock`) to generate one first. See the [mise + uv Cookbook](/mise-cookbook/python.html#mise-uv) for full examples.
 
 ```toml [mise.toml]
 [settings]
 python.uv_venv_auto = "source"        # activate existing .venv
 # or
 python.uv_venv_auto = "create|source" # create .venv if missing, then activate
+```
+
+mise respects uv's `UV_PROJECT_ENVIRONMENT` variable when choosing the environment path. A relative
+path is resolved from the uv project root (the directory containing `uv.lock`), while an absolute
+path is used as-is. When the variable is unset or empty, mise uses `.venv`.
+
+```toml [mise.toml]
+[env]
+UV_PROJECT_ENVIRONMENT = "my.venv"
+
+[settings]
+python.uv_venv_auto = "create|source"
 ```
 
 ## mise & uv
@@ -218,6 +234,25 @@ are more compatible with older CPUs by setting `MISE_PYTHON_PRECOMPILED_ARCH` wi
 a different version. See <https://gregoryszorc.com/docs/python-build-standalone/main/running.html> for
 more information
 on this option. Set it to "x86_64" for the most compatible binaries.
+
+## Windows
+
+mise uses the same precompiled python-build-standalone binaries on Windows
+(compiling with python-build is not supported there). Two of the upstream
+[quirks](https://github.com/astral-sh/python-build-standalone/blob/main/docs/quirks.rst)
+are smoothed over by mise:
+
+- The archives only ship `python.exe`, so mise creates a `python3.exe` alias
+  next to it.
+- The archives ship no `pip.exe` (pip is only available as `python -m pip`),
+  so mise creates `pip.cmd`/`pip3.cmd` wrappers in the install root that
+  delegate to `python -m pip`. Because they delegate, they keep working even
+  after pip upgrades itself.
+
+The install's `Scripts` directory is included in `PATH`, so console scripts
+from `pip install` (e.g. `black`) are runnable. If you rely on shims instead
+of `mise activate`, run `mise reshim` after `pip install` to generate shims
+for newly installed executables.
 
 ## python-build
 

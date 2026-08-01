@@ -1,5 +1,8 @@
 # Plan 004: Expand Homebrew interoperability one lifecycle class at a time
 
+> **ARCHIVED — NON-EXECUTABLE.** Candidate matrix below describes a rejected
+> plan, not supported Homebrew-visible pours. Plan 012 rejected every class.
+
 **2026-07-23 supersession note**: Promotion means native handoff eligibility
 unless an explicit private-experiment decision says otherwise. Do not infer
 parity from mise install support. Every class still needs install, upgrade,
@@ -126,14 +129,14 @@ Do not push or open a PR unless operator asks.
 
 Add a test-owned matrix with one row per artifact class:
 
-| Class              | Mise install layout    | Homebrew layout       | Exact snapshot | Upgrade | Uninstall | Rollback | Eligible |
-| ------------------ | ---------------------- | --------------------- | -------------- | ------- | --------- | -------- | -------- |
-| binary             | Plan 002               | symlink from Caskroom | required       | tested  | tested    | tested   | yes      |
-| completion/manpage | measure                | measure               | missing        | missing | missing   | missing  | no       |
-| app                | copy + retained source | move/activate         | mismatch       | missing | missing   | missing  | no       |
-| font               | measure                | measure               | missing        | missing | missing   | missing  | no       |
-| pkg                | installer receipt      | installer receipt     | missing        | missing | missing   | missing  | no       |
-| hook/flight block  | partial execution      | Ruby lifecycle        | missing        | missing | missing   | missing  | no       |
+| Rejected candidate | Mise install layout    | Homebrew layout       | Exact snapshot | Upgrade | Uninstall | Rollback | Eligible    |
+| ------------------ | ---------------------- | --------------------- | -------------- | ------- | --------- | -------- | ----------- |
+| binary             | Plan 002               | symlink from Caskroom | required       | tested  | tested    | tested   | unsupported |
+| completion/manpage | measure                | measure               | missing        | missing | missing   | missing  | no          |
+| app                | copy + retained source | move/activate         | mismatch       | missing | missing   | missing  | no          |
+| font               | measure                | measure               | missing        | missing | missing   | missing  | no          |
+| pkg                | installer receipt      | installer receipt     | missing        | missing | missing   | missing  | no          |
+| hook/flight block  | partial execution      | Ruby lifecycle        | missing        | missing | missing   | missing  | no          |
 
 Replace `measure` only with behavior observed from current Homebrew source and a
 disposable real install. Record the Homebrew commit and macOS version in fixture

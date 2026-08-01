@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::LazyLock as Lazy;
+use std::sync::{LazyLock as Lazy, Mutex};
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use xx::regex;
@@ -197,7 +197,7 @@ async fn list_releases_(api_url: &str, repo: &str) -> Result<Vec<GithubRelease>>
         {
             break;
         }
-        url = resolve_pagination_url(&url, &next)?;
+        url = crate::http::resolve_pagination_url(&url, &next)?;
         headers = get_headers(&url)?;
         let (more, h) = crate::http::HTTP_FETCH
             .json_headers_with_headers::<Vec<GithubRelease>, _>(&url, &headers)
@@ -216,7 +216,9 @@ pub async fn list_tags(repo: &str) -> Result<Vec<String>> {
     let cache = get_tags_cache(&key).await;
     let cache = cache.get(&key).unwrap();
     Ok(cache
-        .get_or_try_init_async(async || list_tags_(API_URL, repo).await)
+        .get_or_try_init_async(async || {
+            list_tags_(API_URL, repo, *env::MISE_LIST_ALL_VERSIONS).await
+        })
         .await?
         .to_vec())
 }
@@ -226,21 +228,26 @@ pub async fn list_tags_from_url(api_url: &str, repo: &str) -> Result<Vec<String>
     let cache = get_tags_cache(&key).await;
     let cache = cache.get(&key).unwrap();
     Ok(cache
-        .get_or_try_init_async(async || list_tags_(api_url, repo).await)
+        .get_or_try_init_async(async || {
+            list_tags_(api_url, repo, *env::MISE_LIST_ALL_VERSIONS).await
+        })
         .await?
         .to_vec())
 }
 
-async fn list_tags_(api_url: &str, repo: &str) -> Result<Vec<String>> {
+/// `list_all` is `MISE_LIST_ALL_VERSIONS`, taken as an argument rather than read here so
+/// tests can exercise the pagination loop: the env var is a process-wide `Lazy` that other
+/// modules' tests have already forced by the time this one runs.
+async fn list_tags_(api_url: &str, repo: &str, list_all: bool) -> Result<Vec<String>> {
     let mut url = format!("{api_url}/repos/{repo}/tags?per_page=100");
     let headers = get_headers(&url)?;
     let (mut tags, mut headers) = crate::http::HTTP_FETCH
         .json_headers_with_headers::<Vec<GithubTag>, _>(&url, &headers)
         .await?;
 
-    if *env::MISE_LIST_ALL_VERSIONS {
+    if list_all {
         while let Some(next) = next_page(&headers) {
-            url = resolve_pagination_url(&url, &next)?;
+            url = crate::http::resolve_pagination_url(&url, &next)?;
             headers = get_headers(&url)?;
             let (more, h) = crate::http::HTTP_FETCH
                 .json_headers_with_headers::<Vec<GithubTag>, _>(&url, &headers)
@@ -268,7 +275,7 @@ async fn list_tags_with_dates_(api_url: &str, repo: &str) -> Result<Vec<GithubTa
 
     // Fetch all pages when MISE_LIST_ALL_VERSIONS is set
     while let Some(next) = next_page(&response_headers) {
-        url = resolve_pagination_url(&url, &next)?;
+        url = crate::http::resolve_pagination_url(&url, &next)?;
         response_headers = get_headers(&url)?;
         let (more, h) = crate::http::HTTP_FETCH
             .json_headers_with_headers::<Vec<GithubTag>, _>(&url, &response_headers)
@@ -305,12 +312,20 @@ async fn list_tags_with_dates_(api_url: &str, repo: &str) -> Result<Vec<GithubTa
 }
 
 pub async fn get_release(repo: &str, tag: &str) -> Result<GithubRelease> {
-    let key = release_cache_key(API_URL, repo, tag, true);
+    get_release_with_versions_host(repo, tag, true).await
+}
+
+pub async fn get_release_with_versions_host(
+    repo: &str,
+    tag: &str,
+    use_versions_host: bool,
+) -> Result<GithubRelease> {
+    let key = release_cache_key(API_URL, repo, tag, use_versions_host);
     let cache = get_release_cache(&key).await;
     let cache = cache.get(&key).unwrap();
     cache
         .get_or_try_init_async_if(
-            async || get_release_with_options(API_URL, repo, tag, true).await,
+            async || get_release_with_options(API_URL, repo, tag, use_versions_host).await,
             should_cache_release,
         )
         .await
@@ -363,13 +378,17 @@ fn should_cache_release(release: &GithubRelease) -> bool {
 pub async fn get_release_with_build_revision_status(
     repo: &str,
     version: &str,
+    use_versions_host: bool,
 ) -> Result<(GithubRelease, bool)> {
     let releases = list_releases(repo).await?;
     match pick_best_numeric_build_revision(releases.clone(), version) {
         Some(release) => Ok((release, true)),
         None => match pick_best_build_revision(releases, version) {
             Some(release) => Ok((release, false)),
-            None => Ok((get_release(repo, version).await?, false)),
+            None => Ok((
+                get_release_with_versions_host(repo, version, use_versions_host).await?,
+                false,
+            )),
         },
     }
 }
@@ -458,20 +477,6 @@ fn next_page(headers: &HeaderMap) -> Option<String> {
     regex!(r#"<([^>]+)>; rel="next""#)
         .captures(&link)
         .map(|c| c.get(1).unwrap().as_str().to_string())
-}
-
-fn resolve_pagination_url(current: &str, next: &str) -> Result<String> {
-    if next.starts_with("http://") || next.starts_with("https://") {
-        return Ok(next.to_string());
-    }
-    let base = url::Url::parse(current)
-        .wrap_err_with(|| format!("invalid pagination base URL: {current}"))?;
-    if next.starts_with('/') {
-        return Ok(format!("{}{next}", base.origin().ascii_serialization()));
-    }
-    base.join(next)
-        .map(|u| u.to_string())
-        .wrap_err_with(|| format!("invalid pagination URL: {next}"))
 }
 
 fn cache_dir() -> PathBuf {
@@ -597,6 +602,36 @@ pub async fn pick_reachable_asset_url(browser_url: &str, api_url: &str) -> Strin
     }
 }
 
+/// Standard GitHub token env vars, in precedence order (applies to every host).
+const GITHUB_TOKEN_ENV_VARS: &[&str] = &["MISE_GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_TOKEN"];
+
+static TOKEN_SOURCES: Lazy<Mutex<HashMap<String, (String, TokenSource)>>> =
+    Lazy::new(Default::default);
+
+/// Remembers the source of the token used to build a request header.
+///
+/// The 401 error path must not call [`resolve_token`] again: OAuth resolution can
+/// synchronously refresh a token, which would block inside the async HTTP send path.
+pub(crate) fn remember_token_source(host: &str, token: &str, source: TokenSource) {
+    TOKEN_SOURCES
+        .lock()
+        .unwrap()
+        .insert(host.to_string(), (token.to_string(), source));
+}
+
+/// Returns the recorded source only when `token` is the token sent for `host`.
+///
+/// Matching both values prevents a netrc or caller-provided Authorization header
+/// from being attributed to an unrelated GitHub credential.
+pub(crate) fn token_source_for_token(host: &str, token: &str) -> Option<TokenSource> {
+    TOKEN_SOURCES
+        .lock()
+        .unwrap()
+        .get(host)
+        .filter(|(recorded, _)| recorded == token)
+        .map(|(_, source)| source.clone())
+}
+
 /// Resolve the GitHub token for the given hostname, returning the token and its source.
 ///
 /// Priority:
@@ -614,6 +649,11 @@ pub fn resolve_token(host: &str) -> Option<(String, TokenSource)> {
         return None;
     }
 
+    #[cfg(test)]
+    if let Some(token) = test_support::lookup_tokens_file_override(&token_lookup_hosts(host)) {
+        return Some((token, TokenSource::TokensFile));
+    }
+
     let is_ghcom = host == "github.com" || host == "api.github.com";
     let lookup_hosts = token_lookup_hosts(host);
 
@@ -626,7 +666,7 @@ pub fn resolve_token(host: &str) -> Option<(String, TokenSource)> {
     }
 
     // 2. Standard env vars (checked individually for correct precedence and source reporting)
-    for var_name in &["MISE_GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_TOKEN"] {
+    for var_name in GITHUB_TOKEN_ENV_VARS {
         if let Some(token) = std::env::var(var_name)
             .ok()
             .map(|t| t.trim().to_string())
@@ -657,12 +697,6 @@ pub fn resolve_token(host: &str) -> Option<(String, TokenSource)> {
     }
 
     // 5. github_tokens.toml
-    #[cfg(test)]
-    if let Some((token, source)) = test_support::lookup_tokens_file_override(&lookup_hosts)
-        .map(|t| (t, TokenSource::TokensFile))
-    {
-        return Some((token, source));
-    }
     for lookup_host in &lookup_hosts {
         if let Some(token) = MISE_GITHUB_TOKENS.get(*lookup_host) {
             return Some((token.clone(), TokenSource::TokensFile));
@@ -707,17 +741,21 @@ pub fn get_headers<U: IntoUrl>(url: U) -> Result<HeaderMap> {
         .into_url()
         .wrap_err("invalid request URL for GitHub auth headers")?;
 
-    if is_github_api_url(&url)
-        && let Some((token, _source)) = resolve_token(url.host_str().unwrap_or("github.com"))
-    {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
-        );
-        headers.insert(
-            "x-github-api-version",
-            HeaderValue::from_static("2022-11-28"),
-        );
+    if is_github_api_url(&url) {
+        let host = url.host_str().unwrap_or("github.com");
+        if let Some((token, source)) = resolve_token(host) {
+            remember_token_source(host, &token, source);
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
+            );
+            headers.insert(
+                "x-github-api-version",
+                HeaderValue::from_static("2022-11-28"),
+            );
+        } else {
+            TOKEN_SOURCES.lock().unwrap().remove(host);
+        }
     }
 
     if is_github_api_url(&url) && url.path().contains("/releases/assets/") {
@@ -758,30 +796,76 @@ fn read_mise_github_tokens() -> Option<HashMap<String, String>> {
 /// Maps hostname (e.g. "github.com") to oauth_token.
 static GH_HOSTS: Lazy<HashMap<String, String>> = Lazy::new(|| read_gh_hosts().unwrap_or_default());
 
-/// Resolve the path to gh CLI's hosts.yml, matching gh's own config resolution:
-/// 1. $GH_CONFIG_DIR/hosts.yml
-/// 2. $XDG_CONFIG_HOME/gh/hosts.yml (env::XDG_CONFIG_HOME handles the fallback to ~/.config)
-/// 3. ~/Library/Application Support/gh/hosts.yml (macOS native path from Go's os.UserConfigDir)
+/// Resolve the path to gh CLI's hosts.yml, following go-gh's own `ConfigDir()`:
+/// 1. `$GH_CONFIG_DIR/hosts.yml`
+/// 2. `$XDG_CONFIG_HOME/gh/hosts.yml` — only when that variable is actually set, which is gh's
+///    condition; `env::XDG_CONFIG_HOME` defaults to `~/.config` and so cannot express it
+/// 3. `%APPDATA%\GitHub CLI\hosts.yml` on Windows — gh checks `AppData` explicitly rather than
+///    going through XDG, so this is the default location there and mise never looked at it.
+///    Like gh, this branch is taken only when the variable is actually set.
+/// 4. `~/.config/gh/hosts.yml`, gh's own last branch, used as the fallback
+///
+/// The macOS candidate is kept for compatibility but does not correspond to a gh branch: gh
+/// uses `~/.config/gh` on macOS too.
 fn gh_hosts_path() -> Option<PathBuf> {
-    // Explicit GH_CONFIG_DIR takes priority
-    if let Ok(dir) = std::env::var("GH_CONFIG_DIR") {
+    // Explicit GH_CONFIG_DIR takes priority. Empty means unset, as in go-gh's
+    // `os.Getenv(ghConfigDir) != ""`; `var_os` rather than `var` so a non-UTF-8 directory is
+    // honoured instead of silently skipped.
+    if let Some(dir) = std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir).join("hosts.yml"));
     }
-    // Try XDG path (env::XDG_CONFIG_HOME falls back to ~/.config)
-    let xdg_path = env::XDG_CONFIG_HOME.join("gh/hosts.yml");
-    if xdg_path.exists() {
-        return Some(xdg_path);
-    }
-    // Try macOS native config dir
-    #[cfg(target_os = "macos")]
-    {
-        let macos_path = dirs::HOME.join("Library/Application Support/gh/hosts.yml");
-        if macos_path.exists() {
-            return Some(macos_path);
-        }
-    }
-    // Fall back to XDG path even if it doesn't exist (will produce a trace log)
-    Some(xdg_path)
+
+    // When XDG_CONFIG_HOME is set it is both gh's next branch and the right thing to name in a
+    // trace if nothing is found; otherwise the branch gh would fall to on this platform.
+    // `var_path` treats an empty value as unset, matching go-gh's
+    // `os.Getenv(xdgConfigHome) != ""`.
+    let xdg_path = env::var_path("XDG_CONFIG_HOME").map(|dir| dir.join("gh/hosts.yml"));
+    let fallback = xdg_path.clone().unwrap_or_else(gh_default_hosts_path);
+
+    let candidates = xdg_path
+        .into_iter()
+        .chain(gh_native_hosts_paths())
+        .collect();
+    Some(tokens::first_existing_file(candidates, fallback))
+}
+
+/// `%APPDATA%\GitHub CLI\hosts.yml`, or `None` when `APPDATA` is unset or empty.
+///
+/// go-gh guards that branch with `os.Getenv(appData) != ""` and otherwise falls through to
+/// `~/.config/gh`, so the variable being absent is meaningful — synthesizing `~/AppData/Roaming`
+/// here would send mise to a directory gh would never have used.
+#[cfg(windows)]
+fn gh_appdata_hosts_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(|v| PathBuf::from(v).join("GitHub CLI/hosts.yml"))
+}
+
+/// Where gh lands when neither `GH_CONFIG_DIR` nor `XDG_CONFIG_HOME` is set.
+#[cfg(windows)]
+fn gh_default_hosts_path() -> PathBuf {
+    gh_appdata_hosts_path().unwrap_or_else(|| dirs::HOME.join(".config/gh/hosts.yml"))
+}
+
+#[cfg(not(windows))]
+fn gh_default_hosts_path() -> PathBuf {
+    dirs::HOME.join(".config/gh/hosts.yml")
+}
+
+/// Platform-native locations gh may have written to, probed after the XDG one.
+#[cfg(target_os = "macos")]
+fn gh_native_hosts_paths() -> Vec<PathBuf> {
+    vec![dirs::HOME.join("Library/Application Support/gh/hosts.yml")]
+}
+
+#[cfg(windows)]
+fn gh_native_hosts_paths() -> Vec<PathBuf> {
+    gh_appdata_hosts_path().into_iter().collect()
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn gh_native_hosts_paths() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn read_gh_hosts() -> Option<HashMap<String, String>> {
@@ -833,7 +917,7 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use std::sync::RwLock;
 
-    /// Overrides the `github_tokens.toml` path (source #4 in [`super::resolve_token`]).
+    /// Overrides the `github_tokens.toml` source in [`super::resolve_token`].
     /// Keyed by the same lookup hosts `resolve_token` walks — e.g. `"github.com"`.
     /// Hold [`super::TEST_ENV_LOCK`] while mutating; always clear before returning.
     pub(crate) static TOKENS_FILE_OVERRIDE: RwLock<Option<HashMap<String, String>>> =
@@ -961,10 +1045,12 @@ mod tests {
         let orig_mise = std::env::var("MISE_GITHUB_TOKEN").ok();
         let orig_api = std::env::var("GITHUB_API_TOKEN").ok();
         let orig_gh = std::env::var("GITHUB_TOKEN").ok();
+        let orig_enterprise = std::env::var("MISE_GITHUB_ENTERPRISE_TOKEN").ok();
 
         env::remove_var("MISE_GITHUB_TOKEN");
         env::remove_var("GITHUB_API_TOKEN");
         env::set_var("GITHUB_TOKEN", "ghp_test");
+        env::remove_var("MISE_GITHUB_ENTERPRISE_TOKEN");
 
         let result = test_fn();
 
@@ -980,8 +1066,64 @@ mod tests {
             Some(v) => env::set_var("GITHUB_TOKEN", v),
             None => env::remove_var("GITHUB_TOKEN"),
         }
+        match orig_enterprise {
+            Some(v) => env::set_var("MISE_GITHUB_ENTERPRISE_TOKEN", v),
+            None => env::remove_var("MISE_GITHUB_ENTERPRISE_TOKEN"),
+        }
 
         result
+    }
+
+    struct TokensFileOverrideGuard;
+
+    impl TokensFileOverrideGuard {
+        fn set(host: &str, token: &str) -> Self {
+            let mut tokens = HashMap::new();
+            tokens.insert(host.to_string(), token.to_string());
+            *test_support::TOKENS_FILE_OVERRIDE.write().unwrap() = Some(tokens);
+            Self
+        }
+    }
+
+    impl Drop for TokensFileOverrideGuard {
+        fn drop(&mut self) {
+            *test_support::TOKENS_FILE_OVERRIDE.write().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn test_token_source_memo_matches_only_the_supplying_token_and_host() {
+        let host = "github-source-test.example.com";
+        remember_token_source(host, "ghp_test", TokenSource::EnvVar("GITHUB_TOKEN"));
+
+        assert_eq!(
+            token_source_for_token(host, "ghp_test"),
+            Some(TokenSource::EnvVar("GITHUB_TOKEN"))
+        );
+        assert_eq!(token_source_for_token(host, "from-netrc"), None);
+        assert_eq!(
+            token_source_for_token("another-github.example.com", "ghp_test"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_headers_remembers_tokens_file_source() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let host = "github-tokens-file-test.example.com";
+        let _tokens_file = TokensFileOverrideGuard::set(host, "ghp_from_tokens_file");
+
+        let headers =
+            get_headers(format!("https://{host}/api/v3/repos/owner/repo/releases")).unwrap();
+
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer ghp_from_tokens_file"
+        );
+        assert_eq!(
+            token_source_for_token(host, "ghp_from_tokens_file"),
+            Some(TokenSource::TokensFile)
+        );
     }
 
     #[test]
@@ -1089,23 +1231,6 @@ something_else = "value"
             err.to_string()
                 .contains("invalid request URL for GitHub auth headers"),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_pagination_url() {
-        let base = "https://api.github.com/repos/jdx/aube/releases?per_page=100";
-        assert_eq!(
-            resolve_pagination_url(base, "/repos/jdx/aube/releases?page=2").unwrap(),
-            "https://api.github.com/repos/jdx/aube/releases?page=2"
-        );
-        assert_eq!(
-            resolve_pagination_url(
-                base,
-                "https://api.github.com/repos/jdx/aube/releases?page=2"
-            )
-            .unwrap(),
-            "https://api.github.com/repos/jdx/aube/releases?page=2"
         );
     }
 
@@ -1431,5 +1556,165 @@ something_else = "value"
         p3.assert_async().await;
         p4.assert_async().await;
         assert_eq!(releases.len(), 3);
+    }
+
+    const PAGINATE_TEST_TOKEN: &str = "ghp_paginate_test";
+
+    /// A GHES-shaped base URL: `get_headers` only attaches auth to REST API URLs, and for a
+    /// host that is not api.github.com that means the path must sit under [`API_PATH`].
+    fn ghes_api_url(base: &str) -> String {
+        format!("{base}{API_PATH}")
+    }
+
+    fn tag_without_commit(name: &str) -> GithubTag {
+        GithubTag {
+            name: name.to_string(),
+            commit: None,
+        }
+    }
+
+    // Regression for #6318: every paginated request must carry the Authorization header.
+    // Before that fix page 2 was sent page 1's *response* headers and went out
+    // unauthenticated; nothing pinned the fix until now.
+    #[tokio::test]
+    async fn test_list_releases_sends_auth_on_every_page() {
+        let _config = crate::config::Config::get().await.unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/releases").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![make_prerelease("v2.0.0-alpha.1")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![make_release("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let releases = list_releases_(&api, repo).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(releases.len(), 2);
+    }
+
+    // Same regression for the tags loop -- see the release test above.
+    #[tokio::test]
+    async fn test_list_tags_sends_auth_on_every_page() {
+        let _config = crate::config::Config::get().await.unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/tags").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v2.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tags = list_tags_(&api, repo, true).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(tags, ["v2.0.0", "v1.0.0"]);
+    }
+
+    // `list_tags_with_dates_` paginates unconditionally, so it needs the same guarantee.
+    // Tags carry no `commit`, which keeps this to the two paginated requests.
+    #[tokio::test]
+    async fn test_list_tags_with_dates_sends_auth_on_every_page() {
+        let _config = crate::config::Config::get().await.unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page-dates";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/tags").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v2.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tags = list_tags_with_dates_(&api, repo).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(
+            tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["v2.0.0", "v1.0.0"]
+        );
+        assert!(tags.iter().all(|t| t.date.is_none()));
     }
 }

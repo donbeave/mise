@@ -50,7 +50,37 @@ respond to every PR with detailed context. A rejection may be brief.
 
 ## Packaging and Self-Update Instructions
 
-When mise is installed via a package manager, in-app self-update is disabled and users should update via their package manager. Packaging should install a TOML file with platform-specific instructions at `lib/mise-self-update-instructions.toml` (or `lib/mise/mise-self-update-instructions.toml`). Example contents:
+When mise is installed via a package manager, `mise self-update` should not replace the binary the package manager owns; users should update through the package manager instead. This is opt-in: a package that does none of the following keeps self-update fully enabled. Packagers have three ways to turn it off, and any of them makes `mise doctor` report `self_update_available: no`.
+
+The paths below are relative to the install prefix, which mise derives from its own binary: the path is canonicalized (symlinks resolved) and then taken two levels up, so `/usr/bin/mise` gives `/usr`.
+
+### Disable at build time
+
+Build without the `self_update` Cargo feature, as the Arch Linux package does:
+
+```bash
+cargo build --release --no-default-features --features native-tls
+```
+
+The subcommand still exists, so scripts that call it get a clear error rather than "unknown command", but it always fails with `mise's self-update feature has been disabled at build time, cannot update`.
+
+### Disable with a marker file
+
+Install an empty `.disable-self-update` file at any one of:
+
+- `lib/.disable-self-update` (used by Homebrew)
+- `lib/mise/.disable-self-update` (used by the AUR `mise-bin` package)
+- `lib64/mise/.disable-self-update`
+
+### Ship update instructions
+
+Installing a TOML file with platform-specific instructions also disables self-update, and mise prints its message when `mise self-update` is run and when a newer release is detected. Install it at any one of:
+
+- `lib/mise-self-update-instructions.toml`
+- `lib/mise/mise-self-update-instructions.toml`
+- `lib64/mise/mise-self-update-instructions.toml`
+
+Example contents:
 
 ```toml
 # Debian/Ubuntu (APT)
@@ -61,6 +91,14 @@ message = "To update mise from the APT repository, run:\n\n  sudo apt update && 
 # Fedora/CentOS Stream (DNF)
 message = "To update mise from COPR, run:\n\n  sudo dnf upgrade mise\n"
 ```
+
+Setting `MISE_SELF_UPDATE_INSTRUCTIONS` to a file path overrides the search.
+
+### Overriding the outcome
+
+`MISE_SELF_UPDATE_AVAILABLE=false` disables self-update without installing anything, and `MISE_SELF_UPDATE_AVAILABLE=true` re-enables it even when a marker or instructions file is present. Both are useful for testing a package build. Neither has any effect on a binary built without the `self_update` feature, where self-update is always unavailable.
+
+`mise self-update --force` also bypasses the availability check, so a user who passes it updates the binary in place even when a marker file, an instructions file, or `MISE_SELF_UPDATE_AVAILABLE=false` is in effect. Treat the runtime mechanisms as "do not update by default" rather than a hard block. A build without the `self_update` feature is the only variant `--force` cannot get past.
 
 ## Testing
 
@@ -364,7 +402,7 @@ Use `mise tasks` to see all available development tasks:
 
 ### Release Tasks
 
-- `mise run release` - Create a release
+- `mise run release-plz` - Create a release
 - `mise run ci` - Run CI tasks (format, build, test)
 
 ## Setup
@@ -459,8 +497,8 @@ eval "$(@mise activate zsh)"
 
 ## Releasing
 
-Run `mise run release -x [minor|patch]`. (minor if it is the first release in a
-month)
+Releases are cut automatically by the `release-plz` GitHub Actions workflow
+(`mise run release-plz` in CI). Do not run that task locally.
 
 ## Linting
 
@@ -633,13 +671,15 @@ of the full backend specification.
 
 ### Guidelines and Requirements
 
-When adding a new tool, the following requirements apply (automatically
-enforced by [GitHub Actions workflow](https://github.com/jdx/mise/blob/main/.github/workflows/registry_comment.yml)):
+When adding a new tool, the following requirements apply:
 
 - **A test is required in `registry/`** - Must include a `test` field to
-  verify installation.
+  verify installation. This is automatically enforced by the
+  [`validate-new-tools` job](https://github.com/jdx/mise/blob/main/.github/workflows/registry.yml)
+  in the registry workflow.
 - **Tools may be rejected if they are not notable** - The tool should be
-  reasonably popular and well-maintained. There are no specific guidelines for this and
+  reasonably popular and well-maintained. Notability is decided by maintainer
+  review (not CI). There are no specific guidelines for this and
   a lot of factors are taken into account. @jdx won't explain why a given tool wasn't
   accepted. Include a brief popularity summary (stars, downloads, recent release date) in
   the PR description so the policy can be applied without re-doing the research.
@@ -702,6 +742,51 @@ test = [
 ]
 aliases = ["alt-name"] # Optional alternative names
 os = ["linux", "macos"] # Optional OS restrictions
+```
+
+#### Idiomatic version files
+
+Registry tools can opt into [idiomatic version files](/configuration.html#idiomatic-version-files)
+with `idiomatic_files`. A filename string uses mise's default plain-text parser:
+
+```toml
+backends = ["aqua:owner/repo"]
+idiomatic_files = [".your-tool-version"]
+```
+
+For structured or tool-specific files, use a table with the same parsing options supported by the
+[HTTP backend's version listing](/dev-tools/backends/http.html#version-listing):
+
+```toml
+idiomatic_files = [
+  { path = "your-tool.json", version_json_path = ".toolchain.version" },
+  { path = "your-tool.conf", version_regex = 'version\s*=\s*"([^"]+)"' },
+]
+```
+
+The supported parser fields are:
+
+- `version_regex`: extract every regex match, using the first capture group when present.
+- `version_json_path`: extract values using mise's jq-like JSON path syntax.
+- `version_expr`: extract or post-process versions using an
+  [expr-lang](https://expr-lang.org/) expression. The original contents are available as `body`,
+  and versions produced by `version_regex` or `version_json_path` are available as `versions`.
+
+These parsers are evaluated in-process and cannot run shell commands. Plain string entries remain
+compatible with existing registry entries and backend-native parsers.
+
+Only extract a value that determines compatibility with the tool binary. Good candidates include
+an exact version, a minimum/required version, or a configuration-format major that is intentionally
+coupled to the CLI major. Do not extract unrelated project versions, dependency versions, lockfile
+schema revisions, or generic `version` fields that do not constrain the tool itself.
+
+Include all filenames that the tool officially searches, including documented nested paths such as
+`.config/tool.yml`. When suffixes overlap, mise uses the most specific matching path.
+
+Idiomatic files are disabled by default. Users enable them for a registry shorthand with:
+
+```sh
+mise settings add idiomatic_version_file_enable_tools your-tool
 ```
 
 ### Backend Priority

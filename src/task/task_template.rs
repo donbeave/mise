@@ -1,7 +1,10 @@
 use crate::config::config_file::mise_toml::{EnvList, deserialize_vars};
 use crate::config::config_file::toml::deserialize_arr;
 use crate::task::task_sources::TaskOutputs;
-use crate::task::{RunEntry, Silent, Task, TaskConfirm, TaskDep, TaskOutput, TaskToolValue};
+use crate::task::{
+    RunEntry, Silent, Task, TaskCacheConfig, TaskConfirm, TaskDep, TaskOutput, TaskToolValue,
+    TaskWatchOptions,
+};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -30,7 +33,11 @@ pub struct TaskTemplate {
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
+    pub watch: Option<TaskWatchOptions>,
+    #[serde(default)]
     pub outputs: TaskOutputs,
+    #[serde(default)]
+    pub cache: Option<TaskCacheConfig>,
     #[serde(default)]
     pub output: Option<TaskOutput>,
     #[serde(default)]
@@ -76,6 +83,9 @@ pub struct TaskTemplate {
     /// Allow specific env vars through
     #[serde(default)]
     pub allow_env: Vec<String>,
+    /// Preserve ambient env vars when env inheritance is denied without hashing their values
+    #[serde(default)]
+    pub pass_through_env: Vec<String>,
 }
 
 impl Task {
@@ -159,9 +169,17 @@ impl Task {
             self.sources = template.sources.clone();
         }
 
+        if self.watch.is_none() {
+            self.watch = template.watch.clone();
+        }
+
         // outputs: local overrides completely if default
         if self.outputs == TaskOutputs::default() && template.outputs != TaskOutputs::default() {
             self.outputs = template.outputs.clone();
+        }
+
+        if self.cache.is_none() {
+            self.cache = template.cache.clone();
         }
 
         // output: use template only if local not set
@@ -217,6 +235,8 @@ impl Task {
         self.allow_write.splice(0..0, template.allow_write.clone());
         self.allow_net.splice(0..0, template.allow_net.clone());
         self.allow_env.splice(0..0, template.allow_env.clone());
+        self.pass_through_env
+            .splice(0..0, template.pass_through_env.clone());
     }
 }
 
@@ -329,12 +349,64 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_template_watch_options() {
+        let template = TaskTemplate {
+            watch: Some(TaskWatchOptions {
+                no_vcs_ignore: true,
+            }),
+            ..Default::default()
+        };
+
+        let mut inherited = Task::default();
+        inherited.merge_template(&template);
+        assert_eq!(inherited.watch, template.watch);
+
+        let mut overridden = Task {
+            watch: Some(TaskWatchOptions {
+                no_vcs_ignore: false,
+            }),
+            ..Default::default()
+        };
+        overridden.merge_template(&template);
+        assert_eq!(
+            overridden.watch,
+            Some(TaskWatchOptions {
+                no_vcs_ignore: false
+            })
+        );
+    }
+
+    #[test]
+    fn test_merge_template_cache_can_be_disabled_locally() {
+        let template = TaskTemplate {
+            cache: Some(TaskCacheConfig {
+                enabled: true,
+                env: vec!["PROFILE".to_string()],
+                command_inputs: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let mut inherited = Task::default();
+        inherited.merge_template(&template);
+        assert!(inherited.cache.as_ref().is_some_and(|cache| cache.enabled));
+
+        let mut disabled = Task {
+            cache: Some(TaskCacheConfig::default()),
+            ..Default::default()
+        };
+        disabled.merge_template(&template);
+        assert_eq!(disabled.cache, Some(TaskCacheConfig::default()));
+    }
+
+    #[test]
     fn test_merge_template_depends_override() {
         let mut task = Task {
             depends: vec![TaskDep {
                 task: "local-dep".to_string(),
                 args: vec![],
                 env: Default::default(),
+                optional: false,
             }],
             ..Default::default()
         };
@@ -343,6 +415,7 @@ mod tests {
                 task: "template-dep".to_string(),
                 args: vec![],
                 env: Default::default(),
+                optional: false,
             }],
             ..Default::default()
         };
@@ -430,6 +503,7 @@ mod tests {
             deny_net: true,
             allow_read: vec!["task-read".into()],
             allow_env: vec!["TASK_*".to_string()],
+            pass_through_env: vec!["TASK_SECRET".to_string()],
             ..Default::default()
         };
         let template = TaskTemplate {
@@ -441,6 +515,7 @@ mod tests {
             allow_write: vec!["template-write".into()],
             allow_net: vec!["example.com".to_string()],
             allow_env: vec!["TEMPLATE_*".to_string()],
+            pass_through_env: vec!["TEMPLATE_SECRET".to_string()],
             ..Default::default()
         };
 
@@ -466,6 +541,10 @@ mod tests {
         assert_eq!(
             task.allow_env,
             vec!["TEMPLATE_*".to_string(), "TASK_*".to_string()]
+        );
+        assert_eq!(
+            task.pass_through_env,
+            vec!["TEMPLATE_SECRET".to_string(), "TASK_SECRET".to_string()]
         );
     }
 }

@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - fix/brew-cask-homebrew-metadata-receipt
+      - main
     paths:
       - src/system/packages/brew/**
+      - e2e/fixtures/brew-cask-handoff/**
+      - e2e/cli/test_system_install_brew_adopt_macos_slow
       - e2e/cli/test_system_install_brew_cask_compatibility_macos_slow
       - .github/workflows/brew-cask-handoff.yml
 

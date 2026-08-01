@@ -5,9 +5,9 @@ use crate::cmd;
 use crate::config::Config;
 use crate::dirs;
 use crate::env;
-use crate::exit::exit;
-use crate::task::Deps;
+use crate::request_exit;
 use crate::task::task_source_checker::task_cwd;
+use crate::task::{Deps, Task};
 use crate::toolset::ToolsetBuilder;
 use clap::{CommandFactory, ValueEnum, ValueHint};
 use console::style;
@@ -74,7 +74,7 @@ impl Watch {
                 eprintln!("{}: {}", style("Error").red().bold(), err);
                 eprintln!("{}: Install watchexec with:", style("Hint").bold());
                 eprintln!("  mise use -g watchexec@latest");
-                exit(1);
+                return Err(request_exit(1));
             }
         }
         let args = once(self.task)
@@ -86,6 +86,12 @@ impl Watch {
             bail!("No tasks specified");
         }
         let tasks = crate::task::task_list::get_task_lists(&config, &args, false, false).await?;
+        let watched_tasks = if self.skip_deps {
+            tasks.to_vec()
+        } else {
+            let deps = Deps::new(&config, tasks.clone()).await?;
+            deps.all().cloned().collect()
+        };
         let mut args = vec![];
         if let Some(delay_run) = self.watchexec.delay_run {
             args.push("--delay-run".to_string());
@@ -114,7 +120,7 @@ impl Watch {
         if self.watchexec.stdin_quit {
             args.push("--stdin-quit".to_string());
         }
-        if self.watchexec.no_vcs_ignore {
+        if self.watchexec.no_vcs_ignore || tasks_disable_vcs_ignores(&watched_tasks) {
             args.push("--no-vcs-ignore".to_string());
         }
         if self.watchexec.no_project_ignore {
@@ -148,14 +154,7 @@ impl Watch {
             args.push("--on-busy-update".to_string());
             args.push(self.watchexec.on_busy_update.to_string());
         }
-        // Forward --wrap-process to watchexec when it differs from watchexec's
-        // default ("group"). Without this the flag is parsed but dropped, so e.g.
-        // `mise watch --wrap-process none` had no effect and a TUI task launched in
-        // the default process group would block on terminal I/O (#10212).
-        if self.watchexec.wrap_process != WrapMode::Group {
-            args.push("--wrap-process".to_string());
-            args.push(self.watchexec.wrap_process.to_string());
-        }
+        args.extend(wrap_process_args(self.watchexec.wrap_process));
         if !self.watchexec.signal_map.is_empty() {
             for signal_map in &self.watchexec.signal_map {
                 args.push("--map-signal".to_string());
@@ -217,14 +216,8 @@ impl Watch {
         let (globs, ignores, extra_watch_dirs, filter_anchor) = if !self.glob.is_empty() {
             (self.glob.clone(), Vec::new(), Vec::new(), None)
         } else {
-            let collected: Vec<_> = if self.skip_deps {
-                tasks.to_vec()
-            } else {
-                let deps = Deps::new(&config, tasks.clone()).await?;
-                deps.all().cloned().collect()
-            };
-            let mut task_cwds: Vec<(&_, PathBuf)> = Vec::with_capacity(collected.len());
-            for t in &collected {
+            let mut task_cwds: Vec<(&_, PathBuf)> = Vec::with_capacity(watched_tasks.len());
+            for t in &watched_tasks {
                 let cwd = task_cwd(t, &config).await?;
                 task_cwds.push((t, cwd));
             }
@@ -497,6 +490,12 @@ fn relativize_source(kind: SourceKind, absolute: &Path, anchor: &Path) -> String
         }
         SourceKind::LiteralBang | SourceKind::Plain => relative,
     }
+}
+
+fn tasks_disable_vcs_ignores(tasks: &[Task]) -> bool {
+    tasks
+        .iter()
+        .any(|task| task.watch.as_ref().is_some_and(|watch| watch.no_vcs_ignore))
 }
 
 /// Merge each task's `sources` into the (filter, ignore) pair watchexec
@@ -1104,8 +1103,8 @@ pub struct WatchexecArgs {
 
     /// Configure how the process is wrapped
     ///
-    /// By default, Watchexec will run the command in a process group in Unix, and in a Job Object
-    /// in Windows.
+    /// By default, Watchexec will run the command in a session on macOS, in a process group on
+    /// other Unix platforms, and in a Job Object in Windows.
     ///
     /// Some Unix programs prefer running in a session, while others do not work in a process group.
     ///
@@ -1115,9 +1114,8 @@ pub struct WatchexecArgs {
 		long,
 		help_heading = OPTSET_COMMAND,
 		value_name = "MODE",
-		default_value = "group",
     )]
-    pub wrap_process: WrapMode,
+    pub wrap_process: Option<WrapMode>,
 
     /// Alert when commands start and end
     ///
@@ -1454,6 +1452,21 @@ pub enum OnBusyUpdate {
     Signal,
 }
 
+/// The `--wrap-process` arguments to pass on to watchexec, i.e. the user's choice or nothing.
+///
+/// The flag used to be parsed and then dropped entirely, so `--wrap-process none` had no effect
+/// and a TUI task stayed stuck in a process group waiting on terminal I/O (#10212).
+///
+/// mise deliberately has no default of its own here. watchexec's `WRAP_DEFAULT` is
+/// platform-dependent — `"session"` on macOS, `"group"` elsewhere — so any fixed default mise
+/// picked would be wrong on some platform, both in `--help` and when deciding that a value is
+/// "the same as the default" and can be dropped. Forwarding exactly what was asked for, and
+/// nothing when nothing was asked for, leaves that choice where it belongs.
+fn wrap_process_args(mode: Option<WrapMode>) -> Vec<String> {
+    mode.map(|m| vec!["--wrap-process".to_string(), m.to_string()])
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, strum::Display)]
 #[strum(serialize_all = "kebab-case")]
 pub enum WrapMode {
@@ -1503,8 +1516,9 @@ pub enum ColourMode {
 mod tests {
     use super::{
         WrapMode, common_ancestor, merge_watch_patterns, normalize_path, parse_source,
-        relativize_source, source_watch_dir,
+        relativize_source, source_watch_dir, tasks_disable_vcs_ignores, wrap_process_args,
     };
+    use crate::task::{Task, TaskWatchOptions};
     use std::path::{Path, PathBuf};
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1523,6 +1537,48 @@ mod tests {
         assert_eq!(WrapMode::Group.to_string(), "group");
         assert_eq!(WrapMode::Session.to_string(), "session");
         assert_eq!(WrapMode::None.to_string(), "none");
+    }
+
+    #[test]
+    fn wrap_process_is_forwarded_verbatim_when_given() {
+        // Every mode reaches watchexec, including `group`. The previous `!= WrapMode::Group`
+        // check dropped an explicit `group`, which on macOS left the command running under
+        // watchexec's own default of `session` instead.
+        assert_eq!(
+            wrap_process_args(Some(WrapMode::Group)),
+            s(&["--wrap-process", "group"])
+        );
+        assert_eq!(
+            wrap_process_args(Some(WrapMode::Session)),
+            s(&["--wrap-process", "session"])
+        );
+        assert_eq!(
+            wrap_process_args(Some(WrapMode::None)),
+            s(&["--wrap-process", "none"])
+        );
+    }
+
+    #[test]
+    fn wrap_process_is_omitted_when_not_given() {
+        // Nothing is forwarded, so watchexec applies its own platform-dependent default
+        // (`session` on macOS, `group` elsewhere) rather than one mise guessed.
+        assert!(wrap_process_args(None).is_empty());
+    }
+
+    #[test]
+    fn task_watch_options_disable_vcs_ignores_for_combined_watch() {
+        let default_task = Task::default();
+        let opted_in_task = Task {
+            watch: Some(TaskWatchOptions {
+                no_vcs_ignore: true,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!tasks_disable_vcs_ignores(std::slice::from_ref(
+            &default_task,
+        )));
+        assert!(tasks_disable_vcs_ignores(&[default_task, opted_in_task]));
     }
 
     #[test]

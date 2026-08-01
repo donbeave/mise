@@ -31,10 +31,19 @@ export const commands: { [key: string]: Command } = {
       dotfiles: {
         hide: false,
         subcommands: {
+          add: {
+            hide: false,
+          },
           apply: {
             hide: false,
           },
+          edit: {
+            hide: false,
+          },
           status: {
+            hide: false,
+          },
+          unapply: {
             hide: false,
           },
         },
@@ -278,19 +287,22 @@ export const commands: { [key: string]: Command } = {
     },
   },
   dotfiles: {
-    hide: false,
+    hide: true,
     subcommands: {
       add: {
-        hide: false,
+        hide: true,
       },
       apply: {
-        hide: false,
+        hide: true,
       },
       edit: {
-        hide: false,
+        hide: true,
       },
       status: {
-        hide: false,
+        hide: true,
+      },
+      unapply: {
+        hide: true,
       },
     },
   },
@@ -519,6 +531,9 @@ export const commands: { [key: string]: Command } = {
         hide: false,
       },
       edit: {
+        hide: false,
+      },
+      graph: {
         hide: false,
       },
       info: {

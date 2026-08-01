@@ -2,11 +2,12 @@ use eyre::{WrapErr, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
+use path_absolutize::Absolutize;
 use serde::Deserialize;
 use serde::de::Visitor;
 use serde::{Deserializer, de};
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,6 +17,7 @@ use tera::Context as TeraContext;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Key, Value, table, value};
 use versions::Versioning;
 
+use crate::backend::unalias_backend;
 use crate::cli::args::{BackendArg, ToolVersionType};
 use crate::config::config_file::{
     ConfigFile, TaskConfig, config_trust_root, is_ignored, trust, trust_check,
@@ -34,7 +36,8 @@ use crate::oci::OciConfig;
 use crate::redactions::Redactions;
 use crate::registry::REGISTRY;
 use crate::system::{BootstrapTomlConfig, DotfilesTomlConfig};
-use crate::task::{Task, TaskTemplate};
+use crate::task::workspace::WorkspaceProjectOverride;
+use crate::task::{Task, TaskTemplate, TaskTomlBoolPresence};
 use crate::tera::{BASE_CONTEXT, contains_template_syntax, get_tera, render_str};
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionOptions};
 use crate::watch_files::WatchFile;
@@ -256,7 +259,7 @@ pub struct MiseToml {
     /// Legacy name for monorepo_root, retained during its deprecation period
     #[serde(default)]
     experimental_monorepo_root: Option<bool>,
-    /// Configuration for monorepo task discovery
+    /// Configuration for monorepo and workspace discovery
     #[serde(default)]
     monorepo: Option<MonorepoConfig>,
 }
@@ -294,7 +297,7 @@ pub struct TaskTemplates(pub IndexMap<String, TaskTemplate>);
 #[derive(Debug, Default, Clone)]
 pub struct EnvList(pub(crate) Vec<EnvDirective>);
 
-/// Configuration for [monorepo] section in mise.toml
+/// Configuration for the [monorepo] section in mise.toml.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct MonorepoConfig {
     /// Explicit list of config roots for monorepo task discovery.
@@ -304,6 +307,14 @@ pub struct MonorepoConfig {
     /// Use a single lockfile at the monorepo root for descendant config roots.
     /// None follows the rollout default; true opts in, false keeps colocated locks.
     pub lockfile: Option<bool>,
+    /// Explicit additions, removals, and overrides for provider-inferred projects.
+    // Consumed when workspace providers are connected to task loading.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub projects: BTreeMap<String, WorkspaceProjectOverride>,
+    /// Experimental task defaults applied by task name across workspace projects.
+    #[serde(default)]
+    pub task_defaults: IndexMap<String, TaskTemplate>,
 }
 
 impl EnvList {
@@ -493,7 +504,8 @@ impl MiseToml {
             .or_default()
             .versions
             .insert(from.into(), to.into());
-        self.doc_mut()?
+        let mut doc = self.doc_mut()?;
+        let versions = doc
             .get_mut()
             .unwrap()
             .entry("tool_alias")
@@ -505,10 +517,8 @@ impl MiseToml {
             .as_table_like_mut()
             .unwrap()
             .entry("versions")
-            .or_insert_with(table)
-            .as_table_like_mut()
-            .unwrap()
-            .insert(from, value(to));
+            .or_insert_with(table);
+        insert_preserving_decor(versions, from, value(to));
         Ok(())
     }
 
@@ -567,14 +577,13 @@ impl MiseToml {
 
     pub fn set_shell_alias(&mut self, name: &str, command: &str) -> eyre::Result<()> {
         self.shell_alias.insert(name.into(), command.into());
-        self.doc_mut()?
+        let mut doc = self.doc_mut()?;
+        let shell_alias = doc
             .get_mut()
             .unwrap()
             .entry("shell_alias")
-            .or_insert_with(table)
-            .as_table_like_mut()
-            .unwrap()
-            .insert(name, value(command));
+            .or_insert_with(table);
+        insert_preserving_decor(shell_alias, name, value(command));
         Ok(())
     }
 
@@ -603,8 +612,11 @@ impl MiseToml {
         let key_parts = key.split('.').collect_vec();
         for (i, k) in key_parts.iter().enumerate() {
             if i == key_parts.len() - 1 {
+                let value_decor = get_value_decor(env_tbl, k);
                 let k = get_key_with_decor(env_tbl, k);
-                env_tbl.insert_formatted(&k, toml_edit::value(value));
+                let mut item = toml_edit::value(value);
+                set_value_decor(&mut item, &value_decor);
+                env_tbl.insert_formatted(&k, item);
                 break;
             } else if !env_tbl.contains_key(k) {
                 env_tbl.insert_formatted(&Key::from(*k), toml_edit::table());
@@ -637,7 +649,10 @@ impl MiseToml {
             .as_table_mut()
             .unwrap();
         let key = get_key_with_decor(packages, spec);
-        packages.insert_formatted(&key, toml_edit::value(version));
+        let value_decor = get_value_decor(packages, spec);
+        let mut item = toml_edit::value(version);
+        set_value_decor(&mut item, &value_decor);
+        packages.insert_formatted(&key, item);
         Ok(())
     }
 
@@ -671,7 +686,10 @@ impl MiseToml {
             .as_table_mut()
             .unwrap();
         let key = get_key_with_decor(taps, tap);
-        taps.insert_formatted(&key, toml_edit::value(url));
+        let value_decor = get_value_decor(taps, tap);
+        let mut item = toml_edit::value(url);
+        set_value_decor(&mut item, &value_decor);
+        taps.insert_formatted(&key, item);
         Ok(())
     }
 
@@ -736,9 +754,11 @@ impl MiseToml {
         let key_parts = key.split('.').collect_vec();
         for (i, k) in key_parts.iter().enumerate() {
             if i == key_parts.len() - 1 {
+                let value_decor = get_value_decor(env_tbl, k);
                 let k = get_key_with_decor(env_tbl, k);
-                env_tbl
-                    .insert_formatted(&k, toml_edit::Item::Value(Value::InlineTable(outer_table)));
+                let mut item = toml_edit::Item::Value(Value::InlineTable(outer_table));
+                set_value_decor(&mut item, &value_decor);
+                env_tbl.insert_formatted(&k, item);
                 break;
             } else if !env_tbl.contains_key(k) {
                 env_tbl.insert_formatted(&Key::from(*k), toml_edit::table());
@@ -900,7 +920,7 @@ impl ConfigFile for MiseToml {
             .into_iter()
             .map(|(k, v)| {
                 let v = self.parse_template(&v)?;
-                Ok((k, v))
+                Ok((k, resolve_plugin_source_path(&self.path, v)?))
             })
             .collect()
     }
@@ -947,7 +967,13 @@ impl ConfigFile for MiseToml {
         if let Some(tools) = doc.get_mut("tools")
             && let Some(tools) = tools.as_table_like_mut()
         {
-            tools.remove(&fa.to_string());
+            // the tool may be written as an alias ("nodejs"), a qualified name ("core:node") or the
+            // fully-qualified backend rather than as fa.short; removing only the short name leaves
+            // the entry in the document and save() writes it straight back out
+            let keys = tool_keys_for(&*tools, fa);
+            for key in &keys {
+                tools.remove(key);
+            }
             if tools.is_empty() {
                 doc.as_table_mut().remove("tools");
             }
@@ -990,18 +1016,46 @@ impl ConfigFile for MiseToml {
             .as_table_mut()
             .unwrap();
 
+        // the entry may be written under any spelling of this tool — an alias like "nodejs", a
+        // qualified "core:node", or the fully-qualified backend — so collect every key in the
+        // document that refers to it. The first one is the entry the file appears to define, so it
+        // supplies the decorations; the rest are duplicates of it and are dropped below.
+        let keys = tool_keys_for(&*tools, ba);
+        let existing = keys.first().cloned().unwrap_or_else(|| ba.short.clone());
+        if keys.len() > 1 {
+            let dupes = keys.iter().map(|k| format!("`{k}`")).join(", ");
+            warn!(
+                "{}: {dupes} are the same tool; collapsing them into a single `{}` entry",
+                display_path(&self.path),
+                ba.short
+            );
+        }
         // create a key from the short name preserving any decorations like prefix/suffix if the key already exists
-        let key = get_key_with_decor(tools, ba.short.as_str());
+        let key = get_key_with_decor_from(tools, ba.short.as_str(), &existing);
+        // and the same for the value, so a comment after the version survives the replacement
+        let value_decor = get_value_decor(tools, &existing);
+        // keep the array as it was written so its layout — multi-line shape, trailing comma and any
+        // comments between the elements — can be reused when only the versions change. Read before
+        // the removal below, which drops the entry when it is stored under a long name.
+        let existing_arr = tools
+            .get(&existing)
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_array())
+            .cloned();
 
-        // if a short name is used like "node", make sure we remove any long names like "core:node"
-        if ba.short != ba.full() {
-            tools.remove(&ba.full());
+        // drop the other spellings: they all deserialize to this one entry, so leaving one behind
+        // means the file has two keys for one tool and the later one silently wins on read-back.
+        // ba.short itself is kept so insert_formatted overwrites it in place instead of appending.
+        for k in &keys {
+            if k != &ba.short {
+                tools.remove(k);
+            }
         }
 
         if versions.len() == 1 {
             let options = versions[0].options();
-            if output_empty_opts(&options) {
-                tools.insert_formatted(&key, value(versions[0].version()));
+            let mut item = if output_empty_opts(&options) {
+                value(versions[0].version())
             } else {
                 let mut table = InlineTable::new();
                 table.insert("version", versions[0].version().into());
@@ -1009,14 +1063,23 @@ impl ConfigFile for MiseToml {
                     table.insert(k, toml_value_to_edit(v.clone()));
                 }
                 insert_core_options(&mut table, options);
-                tools.insert_formatted(&key, table.into());
-            }
+                Item::Value(Value::InlineTable(table))
+            };
+            set_value_decor(&mut item, &value_decor);
+            tools.insert_formatted(&key, item);
         } else {
-            let mut arr = Array::new();
-            for tr in versions {
+            // Reuse the existing array when the version count is unchanged: swapping the values in
+            // place keeps the layout, including comments written between the elements. A comment
+            // after an element belongs to the decor of the element that follows it, so an array
+            // built from scratch always drops it. When the count changes there is no way to line
+            // the old decor up with the new elements, so build a fresh array as before.
+            let reused = existing_arr.filter(|a| a.len() == versions.len());
+            let reusing = reused.is_some();
+            let mut arr = reused.unwrap_or_else(Array::new);
+            for (i, tr) in versions.into_iter().enumerate() {
                 let v = tr.version();
-                if output_empty_opts(&tr.options()) {
-                    arr.push(v.to_string());
+                let val: Value = if output_empty_opts(&tr.options()) {
+                    v.to_string().into()
                 } else {
                     let mut table = InlineTable::new();
                     table.insert("version", v.to_string().into());
@@ -1025,10 +1088,21 @@ impl ConfigFile for MiseToml {
                         table.insert(k, toml_value_to_edit(v.clone()));
                     }
                     insert_core_options(&mut table, options);
-                    arr.push(table);
+                    table.into()
+                };
+                match reusing.then(|| arr.get_mut(i)).flatten() {
+                    Some(slot) => {
+                        let mut val = val;
+                        *val.decor_mut() = slot.decor().clone();
+                        *slot = val;
+                    }
+                    // `push` applies the default separators, exactly as before
+                    None => arr.push(val),
                 }
             }
-            tools.insert_formatted(&key, Item::Value(Value::Array(arr)));
+            let mut item = Item::Value(Value::Array(arr));
+            set_value_decor(&mut item, &value_decor);
+            tools.insert_formatted(&key, item);
         }
 
         if is_tools_sorted {
@@ -1306,11 +1380,39 @@ impl ConfigFile for MiseToml {
     }
 }
 
+fn resolve_plugin_source_path(config_path: &Path, source: String) -> eyre::Result<String> {
+    let source_path = Path::new(&source);
+    let is_explicit_relative = matches!(
+        source_path.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    );
+    let expanded = file::replace_path(source_path);
+    let path = if expanded.is_absolute() {
+        Some(expanded)
+    } else if is_explicit_relative {
+        Some(config_root::config_root(config_path).join(expanded))
+    } else {
+        None
+    };
+
+    match path {
+        Some(path) => Ok(path.absolutize()?.to_string_lossy().into_owned()),
+        None => Ok(source),
+    }
+}
+
 /// Returns a [`toml_edit::Key`] from the given `key`.
 /// Preserves any surrounding whitespace (e.g. comments) if the key already exists in the provided [`toml_edit::Table`].
 fn get_key_with_decor(table: &toml_edit::Table, key: &str) -> Key {
+    get_key_with_decor_from(table, key, key)
+}
+
+/// Same as [`get_key_with_decor`], but takes the decor from `existing` rather than from `key`.
+/// The entry being replaced may be stored under a different key than the one written back, e.g. a
+/// fully-qualified `"core:node"` that `mise use node` rewrites to `node`.
+fn get_key_with_decor_from(table: &toml_edit::Table, key: &str, existing: &str) -> Key {
     let mut key = Key::from(key);
-    if let Some((k, _)) = table.get_key_value(&key) {
+    if let Some((k, _)) = table.get_key_value(existing) {
         if let Some(prefix) = k.leaf_decor().prefix() {
             key.leaf_decor_mut().set_prefix(prefix.clone());
         }
@@ -1321,10 +1423,75 @@ fn get_key_with_decor(table: &toml_edit::Table, key: &str) -> Key {
     key
 }
 
+/// Every key in a `[tools]` table that refers to `ba`, in document order.
+///
+/// The same tool can be written under several spellings: its short name (`node`), one of the
+/// hardcoded aliases (`nodejs`, `golang`, `dotnet-core`), a `core:`-qualified name (`core:node`),
+/// or the fully-qualified backend the short name resolves to. [`unalias_backend`] folds the first
+/// three onto the short name, and that is what happens when the file is deserialized — so mise's
+/// own view of `[tools]` holds a single entry no matter how many of those keys the document has,
+/// and when there is more than one the later one silently wins. A writer therefore has to find all
+/// of them and not just the one it would write itself, or it leaves a second key behind that
+/// outvotes the one it just wrote.
+///
+/// Registry aliases (`rg` for `ripgrep`) are a different mechanism: they resolve to *different*
+/// short names, mise keeps them as separate entries and writes each back as the user spelled it,
+/// so they are deliberately not matched here. Keys carrying inline options
+/// (`"go:example.com/x[tags=y]"`) are likewise left alone — collapsing those would have to decide
+/// what happens to the options.
+///
+/// The keys are returned owned so the caller can go on to mutate the table.
+fn tool_keys_for(tools: &dyn toml_edit::TableLike, ba: &BackendArg) -> Vec<String> {
+    let full = ba.full();
+    tools
+        .iter()
+        .filter(|&(k, _)| unalias_backend(k) == ba.short.as_str() || k == full.as_str())
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// Captures the decor of the value `key` currently holds, if any.
+///
+/// A comment written after the value on the same line lives in that decor, so replacing the value
+/// without carrying it over drops the comment. The comment *above* the line belongs to the key
+/// instead and is handled by [`get_key_with_decor`].
+fn get_value_decor(table: &toml_edit::Table, key: &str) -> Option<toml_edit::Decor> {
+    let value = table.get(key)?.as_value()?;
+    Some(value.decor().clone())
+}
+
+/// Inserts `item` under `key` in `target`, carrying over the decor of the entry being replaced:
+/// the comment above the line lives on the key, the one after the value on the value.
+///
+/// Inline tables have no `insert_formatted`, so they fall back to a plain insert — which is what
+/// every caller here did unconditionally before, so nothing regresses for them.
+fn insert_preserving_decor(target: &mut Item, key: &str, mut item: Item) {
+    if let Some(tbl) = target.as_table_mut() {
+        let k = get_key_with_decor(tbl, key);
+        let value_decor = get_value_decor(tbl, key);
+        set_value_decor(&mut item, &value_decor);
+        tbl.insert_formatted(&k, item);
+    } else if let Some(tbl) = target.as_table_like_mut() {
+        tbl.insert(key, item);
+    }
+}
+
+/// Applies decor captured by [`get_value_decor`] to the value that replaces it.
+fn set_value_decor(item: &mut Item, decor: &Option<toml_edit::Decor>) {
+    if let (Some(decor), Some(value)) = (decor, item.as_value_mut()) {
+        if let Some(prefix) = decor.prefix() {
+            value.decor_mut().set_prefix(prefix.clone());
+        }
+        if let Some(suffix) = decor.suffix() {
+            value.decor_mut().set_suffix(suffix.clone());
+        }
+    }
+}
+
 impl Debug for MiseToml {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let tools = self.to_tool_request_set().unwrap().to_string();
-        let title = format!("MiseToml({}): {tools}", &display_path(&self.path));
+        let title = format!("MiseToml({}): {tools}", display_path(&self.path));
         let mut d = f.debug_struct(&title);
         if let Some(min_version) = &self.min_version {
             d.field("min_version", min_version);
@@ -1678,19 +1845,15 @@ impl<'de> de::Deserialize<'de> for EnvList {
                                 venv: Option<EnvDirectivePythonVenv>,
                             }
 
+                            // Reuses `deserialize_arr` so each of `path`/`file`/`source`
+                            // accepts either a single value or a list, while
+                            // `ParsedEnvBlock` below iterates the `_` table in the order
+                            // the keys were written.
                             #[derive(Deserialize)]
-                            struct EnvDirectives {
-                                #[serde(default, deserialize_with = "deserialize_arr")]
-                                path: Vec<MiseTomlEnvDirective>,
-                                #[serde(default, deserialize_with = "deserialize_arr")]
-                                file: Vec<MiseTomlEnvDirective>,
-                                #[serde(default, deserialize_with = "deserialize_arr")]
-                                source: Vec<MiseTomlEnvDirective>,
-                                #[serde(default)]
-                                python: EnvDirectivePython,
-                                #[serde(flatten)]
-                                other: BTreeMap<String, toml::Value>,
-                            }
+                            struct DirectiveArr(
+                                #[serde(deserialize_with = "deserialize_arr")]
+                                Vec<MiseTomlEnvDirective>,
+                            );
 
                             impl<'de> de::Deserialize<'de> for EnvDirectivePythonVenv {
                                 fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1799,21 +1962,95 @@ impl<'de> de::Deserialize<'de> for EnvList {
                                 })
                             }
 
-                            let directives = map.next_value::<EnvDirectives>()?;
-                            // TODO: parse these in the order they're defined somehow
-                            env.extend(flatten_directives(directives.path, EnvDirective::Path));
-                            env.extend(flatten_directives(directives.file, EnvDirective::File));
-                            env.extend(flatten_directives(directives.source, EnvDirective::Source));
-                            for (key, mut value) in directives.other {
-                                let mut opts = EnvDirectiveOptions::default();
-                                if let Some(table) = value.as_table_mut()
-                                    && let Some(tools) = table.remove("tools")
-                                {
-                                    opts.tools = tools.as_bool().unwrap_or(false);
-                                }
-                                env.push(EnvDirective::Module(key, value, opts));
+                            // Parse the `_` table preserving the written order of its
+                            // sub-keys (`path`/`file`/`source`/modules) so that a later
+                            // directive's template can reference a variable exported by
+                            // an earlier one — e.g. `_.path` using a var from `_.source`
+                            // (discussion #3783). `python.venv` is applied last
+                            // regardless of position: it is a tools-phase directive whose
+                            // PATH conventionally comes after tool paths.
+                            struct ParsedEnvBlock {
+                                directives: Vec<EnvDirective>,
+                                venv: Option<EnvDirectivePythonVenv>,
                             }
-                            if let Some(venv) = directives.python.venv {
+
+                            impl<'de> Deserialize<'de> for ParsedEnvBlock {
+                                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                                where
+                                    D: Deserializer<'de>,
+                                {
+                                    struct ParsedEnvBlockVisitor;
+                                    impl<'de> Visitor<'de> for ParsedEnvBlockVisitor {
+                                        type Value = ParsedEnvBlock;
+                                        fn expecting(
+                                            &self,
+                                            formatter: &mut Formatter,
+                                        ) -> std::fmt::Result
+                                        {
+                                            formatter.write_str("the env `_` directive table")
+                                        }
+                                        fn visit_map<M>(
+                                            self,
+                                            mut map: M,
+                                        ) -> Result<Self::Value, M::Error>
+                                        where
+                                            M: de::MapAccess<'de>,
+                                        {
+                                            let mut directives = vec![];
+                                            let mut venv = None;
+                                            while let Some(key) = map.next_key::<String>()? {
+                                                match key.as_str() {
+                                                    "path" => {
+                                                        directives.extend(flatten_directives(
+                                                            map.next_value::<DirectiveArr>()?.0,
+                                                            EnvDirective::Path,
+                                                        ));
+                                                    }
+                                                    "file" => {
+                                                        directives.extend(flatten_directives(
+                                                            map.next_value::<DirectiveArr>()?.0,
+                                                            EnvDirective::File,
+                                                        ));
+                                                    }
+                                                    "source" => {
+                                                        directives.extend(flatten_directives(
+                                                            map.next_value::<DirectiveArr>()?.0,
+                                                            EnvDirective::Source,
+                                                        ));
+                                                    }
+                                                    "python" => {
+                                                        venv = map
+                                                            .next_value::<EnvDirectivePython>()?
+                                                            .venv;
+                                                    }
+                                                    _ => {
+                                                        let mut value =
+                                                            map.next_value::<toml::Value>()?;
+                                                        let mut opts =
+                                                            EnvDirectiveOptions::default();
+                                                        if let Some(table) = value.as_table_mut()
+                                                            && let Some(tools) =
+                                                                table.remove("tools")
+                                                        {
+                                                            opts.tools =
+                                                                tools.as_bool().unwrap_or(false);
+                                                        }
+                                                        directives.push(EnvDirective::Module(
+                                                            key, value, opts,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            Ok(ParsedEnvBlock { directives, venv })
+                                        }
+                                    }
+                                    deserializer.deserialize_map(ParsedEnvBlockVisitor)
+                                }
+                            }
+
+                            let block = map.next_value::<ParsedEnvBlock>()?;
+                            env.extend(block.directives);
+                            if let Some(venv) = block.venv {
                                 env.push(EnvDirective::PythonVenv {
                                     path: venv.path,
                                     create: venv.create,
@@ -1824,6 +2061,7 @@ impl<'de> de::Deserialize<'de> for EnvList {
                                         tools: true,
                                         redact: Some(false),
                                         required: RequiredValue::False,
+                                        expand: false,
                                     },
                                 });
                             }
@@ -2115,6 +2353,41 @@ impl<'de> de::Deserialize<'de> for MiseTomlTool {
     }
 }
 
+struct TaskBoolPresenceMapAccess<'a, M> {
+    inner: M,
+    presence: &'a mut TaskTomlBoolPresence,
+}
+
+impl<'de, M> de::MapAccess<'de> for TaskBoolPresenceMapAccess<'_, M>
+where
+    M: de::MapAccess<'de>,
+{
+    type Error = M::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        let Some(key) = self.inner.next_key::<String>()? else {
+            return Ok(None);
+        };
+        self.presence.record(&key);
+        seed.deserialize(de::value::StringDeserializer::<M::Error>::new(key))
+            .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        self.inner.next_value_seed(seed)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        self.inner.size_hint()
+    }
+}
+
 impl<'de> de::Deserialize<'de> for Tasks {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -2173,10 +2446,15 @@ impl<'de> de::Deserialize<'de> for Tasks {
                             where
                                 M: de::MapAccess<'de>,
                             {
-                                let t = de::Deserialize::deserialize(
-                                    de::value::MapAccessDeserializer::new(map),
-                                )?;
-                                Ok(TaskDef(t))
+                                let mut presence = TaskTomlBoolPresence::default();
+                                let map = TaskBoolPresenceMapAccess {
+                                    inner: map,
+                                    presence: &mut presence,
+                                };
+                                let mut task =
+                                    Task::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                                task.toml_bool_presence = presence;
+                                Ok(TaskDef(task))
                             }
                         }
                         deserializer.deserialize_any(TaskDefVisitor)
@@ -2382,6 +2660,7 @@ fn is_tools_sorted(tools: &IndexMap<BackendArg, MiseTomlToolList>) -> bool {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use indoc::{formatdoc, indoc};
@@ -2390,11 +2669,131 @@ mod tests {
 
     use crate::dirs;
     use crate::file;
+    use crate::task::Silent;
     use crate::test::replace_path;
     use crate::toolset::{CoreToolOptions, ToolRequest};
     use crate::{config::Config, dirs::CWD};
 
     use super::*;
+
+    #[test]
+    fn test_resolve_plugin_source_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("project/mise.toml");
+        let absolute_plugin = temp.path().join("absolute/plugin");
+        let home_plugin = dirs::HOME.join("plugins/example");
+
+        for (source, expected) in [
+            (
+                absolute_plugin.to_string_lossy().into_owned(),
+                absolute_plugin,
+            ),
+            (
+                "./plugins/example".to_string(),
+                temp.path().join("project/plugins/example"),
+            ),
+            ("../example".to_string(), temp.path().join("example")),
+            ("~/plugins/example".to_string(), home_plugin),
+        ] {
+            assert_eq!(
+                resolve_plugin_source_path(&config_path, source).unwrap(),
+                expected.to_string_lossy()
+            );
+        }
+
+        for source in [
+            "https://github.com/example/plugin.git",
+            "file:///tmp/plugin",
+            "example/plugin",
+        ] {
+            assert_eq!(
+                resolve_plugin_source_path(&config_path, source.to_string()).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_monorepo_project_overrides() {
+        let config = toml::from_str::<MiseToml>(indoc! {r#"
+            [monorepo.projects."node:app"]
+            root = "apps/app"
+            metadata = { kind = "frontend" }
+            depends = ["node:lib"]
+            depends_add = ["cargo:core"]
+            depends_remove = ["node:legacy"]
+
+            [monorepo.projects."node:legacy"]
+            remove = true
+        "#})
+        .unwrap();
+        let projects = &config.monorepo.unwrap().projects;
+        let app = projects.get("node:app").unwrap();
+
+        assert_eq!(app.root.as_deref(), Some(Path::new("apps/app")));
+        assert_eq!(
+            app.metadata
+                .as_ref()
+                .unwrap()
+                .get("kind")
+                .map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(app.depends, Some(BTreeSet::from(["node:lib".to_string()])));
+        assert_eq!(app.depends_add, BTreeSet::from(["cargo:core".to_string()]));
+        assert_eq!(
+            app.depends_remove,
+            BTreeSet::from(["node:legacy".to_string()])
+        );
+        assert!(projects.get("node:legacy").unwrap().remove);
+    }
+
+    #[test]
+    fn test_task_toml_boolean_overlay_presence() {
+        let Tasks(mut tasks) = toml::from_str(
+            r#"
+            [explicit]
+            hide = false
+            raw = false
+            raw_args = false
+            interactive = false
+            quiet = false
+            silent = false
+
+            [omitted]
+            description = "no boolean overrides"
+            "#,
+        )
+        .unwrap();
+
+        let script_task = || Task {
+            hide: true,
+            raw: true,
+            raw_args: true,
+            interactive: true,
+            quiet: true,
+            silent: Silent::Bool(true),
+            ..Default::default()
+        };
+
+        let mut explicit = script_task();
+        explicit.merge_toml_overlay(tasks.remove("explicit").unwrap());
+        assert!(!explicit.hide);
+        assert!(!explicit.raw);
+        assert!(!explicit.raw_args);
+        assert!(!explicit.interactive);
+        assert!(!explicit.quiet);
+        assert_eq!(explicit.silent, Silent::Off);
+
+        let mut omitted = script_task();
+        omitted.merge_toml_overlay(tasks.remove("omitted").unwrap());
+        assert!(omitted.hide);
+        assert!(omitted.raw);
+        assert!(omitted.raw_args);
+        assert!(omitted.interactive);
+        assert!(omitted.quiet);
+        assert_eq!(omitted.silent, Silent::Bool(true));
+    }
 
     #[tokio::test]
     async fn test_fixture() {
@@ -2409,7 +2808,7 @@ mod tests {
         )));
         assert_debug_snapshot!(cf.alias);
 
-        assert_snapshot!(replace_path(&format!("{:#?}", &cf)));
+        assert_snapshot!(replace_path(&format!("{:#?}", cf)));
     }
 
     #[tokio::test]
@@ -2438,6 +2837,39 @@ mod tests {
             assert_snapshot!(cf);
             assert_debug_snapshot!(cf);
         });
+    }
+
+    #[tokio::test]
+    async fn test_env_directive_written_order() {
+        // Directives inside `[env]._` are emitted in the order they are written,
+        // rather than the previous fixed path -> file -> source order, so a later
+        // directive's template can reference a variable set by an earlier one.
+        // https://github.com/jdx/mise/discussions/3783
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".test.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [env]
+            _.source = "a.sh"
+            _.path = "b"
+            _.file = "c.env"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let kinds: Vec<&str> = cf
+            .env
+            .0
+            .iter()
+            .map(|d| match d {
+                EnvDirective::Source(..) => "source",
+                EnvDirective::Path(..) => "path",
+                EnvDirective::File(..) => "file",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["source", "path", "file"]);
     }
 
     #[tokio::test]
@@ -3281,8 +3713,8 @@ run = 'echo "template"'
         foo3=3
         foo4=4
         unset rm
-        _.path = "/bar"
         _.file = ".env2"
+        _.path = "/bar"
         _.source = "/baz2"
         foo5=5
         foo6=6
@@ -3584,6 +4016,607 @@ run = 'echo "template"'
         assert!(
             dump.contains("install_env"),
             "install_env should be written back"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".replace-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            # renovate: datasource=github-releases depName=node
+            node = "16.0.0" # keep me
+            dummy = ["1.0.0"] # keep me too
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![ToolRequest::new(Arc::new("node".into()), "18.0.0", ToolSource::Unknown).unwrap()],
+        )
+        .unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# renovate: datasource=github-releases depName=node"),
+            "comment above the tool should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#"node = "18.0.0" # keep me"#),
+            "comment after the version should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#"dummy = ["1.0.1", "2.0.0"] # keep me too"#),
+            "comment after a multi-version tool should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_array_element_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = [
+              "1.0.0", # first
+              "2.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.1", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                dummy = [
+                  "1.0.1", # first
+                  "2.0.1", # second
+                ]"#}),
+            "the array should keep its layout with each comment on its own element: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_comments_stay_positional() {
+        // A comment written after an array element belongs to the decor of the element that
+        // follows it, so it is tied to a position rather than to a version. Reordering the
+        // versions therefore leaves the comments where the user put them, which is the same rule
+        // the scalar case follows: a comment survives its value changing.
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-reorder.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = [
+              "1.0.0", # first
+              "2.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.0", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                dummy = [
+                  "2.0.0", # first
+                  "1.0.0", # second
+                ]"#}),
+            "comments should stay at their position rather than follow a version: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_count_change_still_writes() {
+        // a different number of versions cannot reuse the old array's layout, so it falls back to
+        // building a fresh one — the versions themselves still have to be written
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-count.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = ["1.0.0", "2.0.0"]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "3.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"dummy = ["1.0.1", "2.0.1", "3.0.0"]"#),
+            "all versions should be written: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_element_comments_survive_alias_rename() {
+        // an aliased entry is renamed to the short name, and the element comments have to come
+        // along. Nothing in the reuse itself states why this works: the array is looked up under
+        // the spelling the file actually uses, which the alias-aware key list supplies. Reading it
+        // from the short name instead would drop these comments again while every other test here
+        // still passed, so pin the combination.
+        let _config = Config::get().await.unwrap();
+        let p = CWD
+            .as_ref()
+            .unwrap()
+            .join(".aliased-array-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            nodejs = [
+              "20.11.0", # first
+              "22.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node: BackendArg = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![
+                ToolRequest::new(Arc::new("node".into()), "20.11.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("node".into()), "22.1.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                node = [
+                  "20.11.1", # first
+                  "22.1.0", # second
+                ]"#}),
+            "the renamed key should keep the comments between its elements: {dump}"
+        );
+        assert!(
+            !dump.contains("nodejs"),
+            "the alias must not be left behind as a second key: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_comments_on_qualified_key() {
+        // a fully-qualified entry is rewritten to its short name, and the comments have to move
+        // with it: https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".qualified.mise.toml");
+        let node: BackendArg = "node".into();
+        let contents = formatdoc! {r#"
+            [tools]
+            # renovate: datasource=github-releases depName=node
+            "{}" = "16.0.0" # keep me
+            "#, node.full()};
+        file::write(&p, contents).unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        cf.replace_versions(
+            &node,
+            vec![ToolRequest::new(Arc::new("node".into()), "18.0.0", ToolSource::Unknown).unwrap()],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# renovate: datasource=github-releases depName=node"),
+            "comment above should survive the rename: {dump}"
+        );
+        assert!(
+            dump.contains(r#"node = "18.0.0" # keep me"#),
+            "comment after the version should survive the rename: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_renames_aliased_key() {
+        // `nodejs` is an alias for `node`, so the file defines one tool and not two: the entry has
+        // to be renamed in place rather than a second key added beside it, or the file ends up
+        // with two keys for one tool and the later one silently wins when it is read back
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".aliased-key.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            # renovate: datasource=github-releases depName=node
+            nodejs = "20.11.0" # keep me
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node: BackendArg = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![
+                ToolRequest::new(Arc::new("node".into()), "24.16.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"node = "24.16.0" # keep me"#),
+            "the aliased key should be renamed and keep its comment: {dump}"
+        );
+        assert!(
+            dump.contains("# renovate: datasource=github-releases depName=node"),
+            "the comment above should survive the rename: {dump}"
+        );
+        assert!(
+            !dump.contains("nodejs"),
+            "the alias must not be left behind as a second key: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_renames_aliased_key_with_array() {
+        // same for a multi-version entry: the array moves to the short name rather than being
+        // written out a second time
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".aliased-array.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            nodejs = ["20.11.0", "22.0.0"] # keep me
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node: BackendArg = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![
+                ToolRequest::new(Arc::new("node".into()), "20.11.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("node".into()), "22.1.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"node = ["20.11.1", "22.1.0"] # keep me"#),
+            "the array should move to the short name: {dump}"
+        );
+        assert!(
+            !dump.contains("nodejs"),
+            "the alias must not be left behind as a second key: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_collapses_duplicate_spellings() {
+        // a file damaged by the old behavior has both keys; they deserialize to one entry and the
+        // later one silently wins, so the write has to leave exactly one key behind. The first key
+        // in the file is the entry the file appears to define, so it supplies the decorations.
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".dupe-spellings.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            nodejs = "20.11.0" # keep me
+            node = "24.16.0"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node: BackendArg = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![
+                ToolRequest::new(Arc::new("node".into()), "24.17.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"node = "24.17.0" # keep me"#),
+            "the first key in the file supplies the decor: {dump}"
+        );
+        assert!(
+            !dump.contains("nodejs"),
+            "the duplicate spelling should be removed: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_keeps_registry_alias_key() {
+        // `rg` is a registry alias for `ripgrep`, not one of the hardcoded backend aliases: the two
+        // resolve to different short names, mise treats them as separate entries, and each is
+        // written back under the name it was asked for
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".registry-alias.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            ripgrep = "14.1.0"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let rg: BackendArg = "rg".into();
+        cf.replace_versions(
+            &rg,
+            vec![ToolRequest::new(Arc::new("rg".into()), "14.1.1", ToolSource::Unknown).unwrap()],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"ripgrep = "14.1.0""#),
+            "a registry alias is a different entry and must be left as written: {dump}"
+        );
+        assert!(
+            dump.contains(r#"rg = "14.1.1""#),
+            "the tool should be written under the name it was asked for: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remove_tool_removes_aliased_key() {
+        // `mise unuse nodejs` used to report success and prune the install while leaving the
+        // `nodejs` key in the file, because it only ever looked for the short name
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".remove-aliased.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = "1.0.0"
+            nodejs = "20.11.0"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        cf.remove_tool(&"nodejs".into()).unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            !dump.contains("nodejs"),
+            "the aliased key should be removed: {dump}"
+        );
+        assert!(
+            dump.contains(r#"dummy = "1.0.0""#),
+            "other tools should be left alone: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remove_tool_removes_qualified_key() {
+        // matching is done on the key as written, so this holds whatever the registry currently
+        // reports as node's backend
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".remove-qualified.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            "core:node" = "20.11.0"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        cf.remove_tool(&"node".into()).unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            !dump.contains("node"),
+            "the qualified key should be removed: {dump}"
+        );
+        assert!(
+            !dump.contains("[tools]"),
+            "the now-empty tools table should be dropped: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_update_env_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".env-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [env]
+            # keep this comment
+            FOO = "bar" # keep me
+            "#},
+        )
+        .unwrap();
+        let mut cf = MiseToml::from_file(&p).unwrap();
+        cf.update_env("FOO", "baz").unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# keep this comment"),
+            "comment above the variable should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#"FOO = "baz" # keep me"#),
+            "comment after the value should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_alias_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".alias-comments.mise.toml");
+        let node: BackendArg = "node".into();
+        let contents = formatdoc! {r#"
+            [tool_alias.{node}.versions]
+            # keep this comment
+            lts = "20" # keep me
+            "#};
+        file::write(&p, contents).unwrap();
+        let mut cf = MiseToml::from_file(&p).unwrap();
+        cf.set_alias(&node, "lts", "22").unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# keep this comment"),
+            "comment above the alias should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#"lts = "22" # keep me"#),
+            "comment after the alias should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_shell_alias_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".shell-alias.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [shell_alias]
+            # keep this comment
+            ll = "ls -l" # keep me
+            "#},
+        )
+        .unwrap();
+        let mut cf = MiseToml::from_file(&p).unwrap();
+        cf.set_shell_alias("ll", "ls -la").unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# keep this comment"),
+            "comment above the shell alias should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#"ll = "ls -la" # keep me"#),
+            "comment after the shell alias should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_update_bootstrap_package_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".bootstrap-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [bootstrap.packages]
+            # keep this comment
+            "apt:curl" = "8.5.0" # keep me
+            "#},
+        )
+        .unwrap();
+        let mut cf = MiseToml::from_file(&p).unwrap();
+        cf.update_bootstrap_package("apt:curl", "8.6.0").unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# keep this comment"),
+            "comment above the package should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#""apt:curl" = "8.6.0" # keep me"#),
+            "comment after the package version should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_bootstrap_brew_tap_preserves_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".brew-tap-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [bootstrap.brew.taps]
+            # keep this comment
+            "acme/tools" = "https://example.com/old.git" # keep me
+            "#},
+        )
+        .unwrap();
+        let mut cf = MiseToml::from_file(&p).unwrap();
+        cf.update_bootstrap_brew_tap("acme/tools", "https://example.com/new.git")
+            .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("# keep this comment"),
+            "comment above the tap should survive: {dump}"
+        );
+        assert!(
+            dump.contains(r#""acme/tools" = "https://example.com/new.git" # keep me"#),
+            "comment after the tap url should survive: {dump}"
         );
         file::remove_file(&p).unwrap();
     }

@@ -1,4 +1,4 @@
-use crate::exit;
+use crate::request_exit;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,10 +52,8 @@ pub async fn handle_shim() -> Result<()> {
     let mut args = env::ARGS.read().unwrap().clone();
     env::PREFER_OFFLINE.store(true, Ordering::Relaxed);
     trace!("shim[{bin_name}] args: {}", args.join(" "));
-    args[0] = which_shim(&mut config, &env::MISE_BIN_NAME, &args)
-        .await?
-        .to_string_lossy()
-        .to_string();
+    let (bin, ts) = which_shim(&mut config, &env::MISE_BIN_NAME, &args).await?;
+    args[0] = bin.to_string_lossy().to_string();
     env::set_var("__MISE_SHIM", "1");
     let exec = Exec {
         tool: vec![],
@@ -76,8 +74,8 @@ pub async fn handle_shim() -> Result<()> {
         allow_env: vec![],
     };
     time!("shim exec");
-    exec.run().await?;
-    exit(0);
+    exec.run_with_toolset(config, ts).await?;
+    Err(request_exit(0))
 }
 
 #[cfg(windows)]
@@ -98,7 +96,11 @@ fn invoked_shim_path() -> PathBuf {
         .unwrap_or(argv0)
 }
 
-async fn which_shim(config: &mut Arc<Config>, bin_name: &str, args: &[String]) -> Result<PathBuf> {
+async fn which_shim(
+    config: &mut Arc<Config>,
+    bin_name: &str,
+    args: &[String],
+) -> Result<(PathBuf, Toolset)> {
     // Shell completion invokes `usage complete-word` through the `usage` shim.
     // It should use the installed CLI or fail locally, never resolve a floating
     // tool version or auto-install over the network while the user is pressing
@@ -128,7 +130,7 @@ async fn which_shim(config: &mut Arc<Config>, bin_name: &str, args: &[String]) -
             "shim[{bin_name}] ToolVersion: {tv} bin: {bin}",
             bin = display_path(&bin)
         );
-        return Ok(bin);
+        return Ok((bin, ts));
     }
     // Auto-installing here would download a tool over the network; skip it for
     // offline completion so `usage complete-word` fails locally instead.
@@ -144,7 +146,7 @@ async fn which_shim(config: &mut Arc<Config>, bin_name: &str, args: &[String]) -
                     "shim[{bin_name}] NOT_FOUND ToolVersion: {tv} bin: {bin}",
                     bin = display_path(&bin)
                 );
-                return Ok(bin);
+                return Ok((bin, ts));
             }
         }
     }
@@ -164,11 +166,39 @@ async fn which_shim(config: &mut Arc<Config>, bin_name: &str, args: &[String]) -
                 continue;
             }
             trace!("shim[{bin_name}] SYSTEM {bin}", bin = display_path(&bin));
-            return Ok(bin);
+            return Ok((bin, ts));
         }
     }
     let tvs = ts.list_rtvs_with_bin(config, bin_name).await?;
-    err_no_version_set(config, ts, bin_name, tvs).await
+    match err_no_version_set(config, ts, bin_name, tvs).await {
+        Ok(_) => unreachable!("err_no_version_set always returns an error"),
+        Err(err) => Err(err),
+    }
+}
+
+/// Build the actionable, `which_shim`-style resolution error for a bin that a
+/// shim failed to resolve while dispatching through `mise x` (the exe-mode shim
+/// on Windows, invoked with `__MISE_SHIM_PATH` set). Without this, that path
+/// surfaces the opaque `cannot find binary path`; symlink shims already get
+/// this message directly from `which_shim`. See discussion #11183.
+#[cfg(not(test))]
+pub async fn err_shim_not_found(bin_name: &str) -> color_eyre::Report {
+    // Windows exe shims are invoked as `<tool>.exe`; name `<tool>` in the message.
+    let bin_stem = bin_name
+        .strip_suffix(std::env::consts::EXE_SUFFIX)
+        .unwrap_or(bin_name);
+    let build = async {
+        let config = Config::get().await?;
+        let ts = ToolsetBuilder::new().build(&config).await?;
+        let tvs = ts.list_rtvs_with_bin(&config, bin_stem).await?;
+        // err_no_version_set always returns Err; map its Ok arm defensively.
+        err_no_version_set(&config, ts, bin_stem, tvs)
+            .await
+            .map(|_| eyre!("cannot find binary path: {bin_stem}"))
+    };
+    match build.await {
+        Ok(report) | Err(report) => report,
+    }
 }
 
 pub async fn reshim(config: &Arc<Config>, ts: &Toolset, force: bool) -> Result<()> {
@@ -732,6 +762,9 @@ async fn err_no_version_set(
         .filter(|t| missing_plugins.contains(t.ba()))
         .collect_vec();
     if missing_tools.is_empty() {
+        if let Some(msg) = unavailable_configured_tool_message(config, &ts, bin_name) {
+            return Err(eyre!(msg));
+        }
         let mut msg = format!("No version is set for shim: {bin_name}\n");
         msg.push_str("Set a global default version with one of the following:\n");
         for tv in tvs {
@@ -752,9 +785,68 @@ async fn err_no_version_set(
     }
 }
 
+pub(crate) fn unavailable_configured_tool_message(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    bin_name: &str,
+) -> Option<String> {
+    let versions = ts
+        .list_current_versions()
+        .into_iter()
+        .filter(|(backend, tv)| {
+            tv.ba().matches_bin_name(bin_name) && backend.is_version_installed(config, tv, true)
+        })
+        .map(|(_, tv)| tv)
+        .collect_vec();
+    if versions.is_empty() {
+        return None;
+    }
+
+    let mut msg = format!("No executable found for configured tool: {bin_name}\n");
+    msg.push_str(
+        "The installed version does not provide this executable with its current backend metadata.\n",
+    );
+    msg.push_str("Reinstall it with:\n");
+    for tv in versions {
+        msg.push_str(&format!(
+            "mise install --force {}@{}\n",
+            tv.ba(),
+            tv.version
+        ));
+    }
+    Some(msg.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::args::BackendArg;
+    use crate::toolset::{ToolRequest, ToolSource, ToolVersionList};
+
+    #[tokio::test]
+    async fn unavailable_tool_message_prefers_matching_configured_tool() {
+        let config = Config::get().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut ts = Toolset::new(ToolSource::Argument);
+
+        for name in ["codex", "node"] {
+            let ba = Arc::new(BackendArg::from(name));
+            let request = ToolRequest::new(ba.clone(), "1.0.0", ToolSource::Argument).unwrap();
+            let mut tv = ToolVersion::new(request.clone(), "1.0.0".into());
+            let install_path = temp.path().join(name);
+            file::create_dir_all(&install_path).unwrap();
+            tv.install_path = Some(install_path);
+
+            let mut tvl = ToolVersionList::new(ba.clone(), ToolSource::Argument);
+            tvl.requests.push(request);
+            tvl.versions.push(tv);
+            ts.versions.insert(ba, tvl);
+        }
+
+        let msg = unavailable_configured_tool_message(&config, &ts, "codex").unwrap();
+        assert!(msg.contains("mise install --force codex@1.0.0"));
+        assert!(!msg.contains("node@1.0.0"));
+    }
 
     #[cfg(windows)]
     #[test]

@@ -33,6 +33,10 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "optional": {
+              "description": "do not fail when the task name or pattern has no matches",
+              "type": "boolean"
             }
           },
           "required": ["task"],
@@ -130,6 +134,11 @@
       "type": "boolean",
       "description": "load tools before resolving"
     },
+    "env_file_expand": {
+      "type": "boolean",
+      "default": false,
+      "description": "enable shell-style variable expansion for values loaded by env._.file"
+    },
     "env_redact": {
       "type": "boolean",
       "description": "redact the value from logs"
@@ -184,6 +193,9 @@
         },
         "tools": {
           "$ref": "#/$defs/env_tools"
+        },
+        "expand": {
+          "$ref": "#/$defs/env_file_expand"
         },
         "redact": {
           "$ref": "#/$defs/env_redact"
@@ -643,7 +655,7 @@
               "type": "boolean"
             },
             "binstall_native": {
-              "description": "[experimental] Use mise's native cargo binary installer when cargo-binstall is unavailable.",
+              "description": "Use mise's native cargo binary installer when cargo-binstall is unavailable.",
               "type": "boolean"
             },
             "binstall_only": {
@@ -1098,6 +1110,14 @@
           "type": "boolean",
           "deprecated": true
         },
+        "idiomatic_version_file_disable_files": {
+          "default": [],
+          "description": "Specific idiomatic version files to disable for a tool.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "idiomatic_version_file_disable_tools": {
           "default": [],
           "description": "Specific tools to disable idiomatic version files for.",
@@ -1322,7 +1342,7 @@
               "default": "auto",
               "description": "Package manager to use for installing npm packages.",
               "type": "string",
-              "enum": ["auto", "npm", "aube", "bun", "pnpm"]
+              "enum": ["auto", "npm", "aube", "aube_cli", "bun", "pnpm"]
             },
             "shell_out": {
               "default": false,
@@ -1768,6 +1788,10 @@
           "type": "object",
           "unevaluatedProperties": false,
           "properties": {
+            "cache_dir": {
+              "description": "[experimental] Directory for task output cache artifacts.",
+              "type": "string"
+            },
             "disable_paths": {
               "default": [],
               "description": "Paths that mise will not look for tasks in.",
@@ -1984,6 +2008,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "windows_powershell_no_profile": {
+          "default": true,
+          "description": "Pass `-NoProfile` to PowerShell (`pwsh`/`powershell`) shells that mise spawns for tasks and inline commands, so startup profiles are skipped.",
+          "type": "boolean"
         },
         "windows_shim_mode": {
           "default": "exe",
@@ -2248,9 +2277,75 @@
       "type": "object",
       "unevaluatedProperties": false,
       "properties": {
+        "cascade": {
+          "default": false,
+          "description": "cascade task configuration to descendant config roots",
+          "type": "boolean"
+        },
         "dir": {
           "description": "default directory to run tasks in defined in this file",
           "type": "string"
+        },
+        "shell": {
+          "description": "default shell to run tasks with in this config scope",
+          "type": "string"
+        },
+        "cache": {
+          "description": "default experimental local artifact cache configuration for eligible tasks with sources and explicit outputs",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "store and restore eligible task outputs from the local mise cache",
+              "type": "boolean"
+            },
+            "env": {
+              "description": "ambient environment variable names whose values affect eligible task cache keys",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command_inputs": {
+              "description": "commands whose stdout and stderr affect eligible task cache keys",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        },
+        "global_env": {
+          "description": "experimental ambient environment variable names added to every enabled task cache key in this config scope",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "global_pass_through_env": {
+          "description": "experimental ambient environment variable names preserved under environment denial without affecting task cache keys",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "global_inputs": {
+          "description": "experimental config-root-relative source patterns added to every task in this config scope; entries may reference input groups with @group:<name>",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "input_groups": {
+          "description": "experimental reusable config-root-relative source groups referenced with @group:<name>",
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
         },
         "includes": {
           "description": "files/directories to include searching for tasks. Can be local paths or git repository URLs using git:: prefix (e.g., git::https://github.com/org/repo.git//path?ref=branch)",
@@ -2281,6 +2376,62 @@
         "lockfile": {
           "description": "Use a single lockfile at the monorepo root for descendant config roots. true opts in now, false keeps lockfiles next to subproject configs, and unset keeps the current behavior until the scheduled default flip.",
           "type": "boolean"
+        },
+        "task_defaults": {
+          "description": "Experimental task defaults applied by task name across inferred and explicit workspace projects",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/task_template"
+          }
+        },
+        "projects": {
+          "description": "Experimental explicit additions, removals, and overrides applied to provider-inferred workspace projects",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "unevaluatedProperties": false,
+            "properties": {
+              "remove": {
+                "description": "Remove this project and every dependency edge connected to it",
+                "type": "boolean"
+              },
+              "root": {
+                "description": "Add the project at this workspace-relative root or replace its inferred root",
+                "type": "string"
+              },
+              "metadata": {
+                "description": "Replace provider-inferred project metadata",
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "depends": {
+                "description": "Replace the complete provider-inferred dependency set",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "depends_add": {
+                "description": "Add dependency edges after an optional depends replacement",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "depends_remove": {
+                "description": "Remove dependency edges after an optional depends replacement",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              }
+            }
+          }
         }
       }
     },
@@ -2736,6 +2887,18 @@
       "unevaluatedProperties": false,
       "description": "Prepare provider configuration"
     },
+    "task_watch": {
+      "description": "options used by `mise watch` for this task",
+      "type": "object",
+      "unevaluatedProperties": false,
+      "properties": {
+        "no_vcs_ignore": {
+          "default": false,
+          "description": "do not load VCS ignore files such as `.gitignore` when watching this task",
+          "type": "boolean"
+        }
+      }
+    },
     "task_props": {
       "description": "common task properties",
       "properties": {
@@ -2855,15 +3018,15 @@
         "outputs": {
           "oneOf": [
             {
-              "description": "files created by this task",
+              "description": "files created by this task (entries starting with `!` are excluded; use `\\!` to escape a literal `!` prefix)",
               "items": {
-                "description": "glob pattern or path to files created by this task",
+                "description": "glob pattern or path to files created by this task (entries starting with `!` are excluded)",
                 "type": "string"
               },
               "type": "array"
             },
             {
-              "description": "glob pattern or path to files created by this task",
+              "description": "glob pattern or path to files created by this task (entries starting with `!` are excluded)",
               "type": "string"
             },
             {
@@ -2879,6 +3042,32 @@
               "type": "object"
             }
           ]
+        },
+        "cache": {
+          "description": "experimental local artifact cache for declared task outputs",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "store and restore task outputs from the local mise cache",
+              "type": "boolean"
+            },
+            "env": {
+              "description": "ambient environment variable names whose values affect the cache key",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command_inputs": {
+              "description": "commands whose stdout and stderr affect the cache key",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
         },
         "output": {
           "description": "output style for this task (prefix, interleave, keep-order, replacing, timed, quiet, silent). Independent of the quiet/silent verbosity fields.",
@@ -2972,6 +3161,9 @@
             }
           ]
         },
+        "watch": {
+          "$ref": "#/$defs/task_watch"
+        },
         "shell": {
           "description": "specify a shell command to run the script with",
           "type": "string"
@@ -3032,6 +3224,13 @@
         },
         "allow_env": {
           "description": "allow specific env vars through",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pass_through_env": {
+          "description": "experimental ambient env vars preserved under environment denial without affecting the task cache key",
           "items": {
             "type": "string"
           },
@@ -3472,6 +3671,13 @@
                     "type": "string"
                   }
                 ]
+              },
+              "exclude": {
+                "type": "array",
+                "description": "glob patterns to skip when the mode walks a source directory (symlink-each, or copy with a directory source); a pattern without \"/\" matches any path component, one with \"/\" is anchored to the source root",
+                "items": {
+                  "type": "string"
+                }
               },
               "block": {
                 "type": "string",

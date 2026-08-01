@@ -5,9 +5,11 @@ use crate::task::{Task, dep_has_usage_ref, parse_usage_values_from_task};
 use crate::{config::Config, task::task_list::resolve_depends};
 use itertools::Itertools;
 use petgraph::Direction;
-use petgraph::graph::DiGraph;
+use petgraph::algo::kosaraju_scc;
+use petgraph::graph::{DiGraph, NodeIndex};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::Arc,
 };
 use tokio::sync::mpsc;
@@ -15,13 +17,81 @@ use tokio::sync::mpsc;
 /// Unique key for a task instance, including name, args, and env vars
 pub type TaskKey = (String, Vec<String>, Vec<(String, String)>);
 
+pub struct TaskCycleError {
+    paths: Vec<Vec<String>>,
+    keys: Vec<Vec<TaskKey>>,
+}
+
+impl TaskCycleError {
+    pub fn path(&self) -> &[String] {
+        self.paths.first().map(Vec::as_slice).unwrap_or_default()
+    }
+
+    pub fn paths(&self) -> &[Vec<String>] {
+        &self.paths
+    }
+
+    pub(crate) fn keys(&self) -> &[Vec<TaskKey>] {
+        &self.keys
+    }
+}
+
+impl fmt::Debug for TaskCycleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskCycleError")
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for TaskCycleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "circular dependency detected: {}",
+            self.path().iter().join(" -> ")
+        )
+    }
+}
+
+impl std::error::Error for TaskCycleError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// State contributed by a task's completed direct dependencies.
+pub struct TaskDependencyState {
+    /// Stable artifact identities to include in the task's cache key.
+    pub cache_keys: Vec<String>,
+    /// Whether any dependency executed or restored outputs.
+    pub any_did_work: bool,
+    /// Whether any dependency did work without publishing a stable artifact identity.
+    pub any_unkeyed_did_work: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+/// Completed task state that can be propagated into a nested task graph.
+pub struct TaskCompletionState {
+    completed: HashSet<TaskKey>,
+    did_work: HashSet<TaskKey>,
+    cache_keys: HashMap<TaskKey, String>,
+}
+
+impl TaskCompletionState {
+    /// Merge state returned by a completed nested task graph.
+    pub fn merge(&mut self, other: Self) {
+        self.completed.extend(other.completed);
+        self.did_work.extend(other.did_work);
+        self.cache_keys.extend(other.cache_keys);
+    }
+}
+
 #[derive(Debug)]
 pub struct Deps {
     pub graph: DiGraph<Task, ()>,
     sent: HashSet<TaskKey>, // tasks that have already started so should not run again
     removed: HashSet<TaskKey>, // tasks that have already finished to track if we are in an infinite loop
     executed: HashSet<TaskKey>, // tasks that actually began executing (not just scheduled)
-    ran: HashSet<TaskKey>, // tasks that actually ran their commands (not skipped due to fresh sources)
+    did_work: HashSet<TaskKey>, // tasks that executed or restored outputs (not freshness-skipped)
+    cache_keys: HashMap<TaskKey, String>, // stable artifact identities published by completed tasks
     dep_edges: HashMap<TaskKey, HashSet<TaskKey>>, // maps each task to its direct dependency task keys
     post_dep_parents: HashMap<TaskKey, HashSet<TaskKey>>, // maps each post-dep to its parent tasks
     tx: mpsc::UnboundedSender<Option<Task>>,
@@ -48,6 +118,21 @@ pub fn task_key(task: &Task) -> TaskKey {
 /// manages a dependency graph of tasks so `mise run` knows what to run next
 impl Deps {
     pub async fn new(config: &Arc<Config>, tasks: Vec<Task>) -> eyre::Result<Self> {
+        Self::new_with_cycle_limit(config, tasks, Some(1)).await
+    }
+
+    pub(crate) async fn new_for_validation(
+        config: &Arc<Config>,
+        tasks: Vec<Task>,
+    ) -> eyre::Result<Self> {
+        Self::new_with_cycle_limit(config, tasks, None).await
+    }
+
+    async fn new_with_cycle_limit(
+        config: &Arc<Config>,
+        tasks: Vec<Task>,
+        cycle_limit: Option<usize>,
+    ) -> eyre::Result<Self> {
         let mut graph = DiGraph::new();
         let mut indexes = HashMap::new();
         let mut stack = vec![];
@@ -125,18 +210,37 @@ impl Deps {
             }
             seen.insert(a);
         }
+        let cycles = find_cycles(&graph, cycle_limit);
+        if !cycles.is_empty() {
+            let paths = cycles
+                .iter()
+                .map(|cycle| {
+                    cycle
+                        .iter()
+                        .map(|&idx| task_cycle_label(&graph[idx]))
+                        .collect()
+                })
+                .collect();
+            let keys = cycles
+                .iter()
+                .map(|cycle| cycle.iter().map(|&idx| task_key(&graph[idx])).collect())
+                .collect();
+            return Err(eyre::Report::new(TaskCycleError { paths, keys }));
+        }
         let (tx, _) = mpsc::unbounded_channel();
         let sent = HashSet::new();
         let removed = HashSet::new();
         let executed = HashSet::new();
-        let ran = HashSet::new();
+        let did_work = HashSet::new();
+        let cache_keys = HashMap::new();
         Ok(Self {
             graph,
             tx,
             sent,
             removed,
             executed,
-            ran,
+            did_work,
+            cache_keys,
             dep_edges,
             post_dep_parents,
         })
@@ -148,13 +252,15 @@ impl Deps {
     pub async fn new_pruned(
         config: &Arc<Config>,
         tasks: Vec<Task>,
-        completed: &HashSet<TaskKey>,
+        completed: &TaskCompletionState,
     ) -> eyre::Result<Self> {
         let mut deps = Self::new(config, tasks).await?;
+        deps.did_work.extend(completed.did_work.iter().cloned());
+        deps.cache_keys.extend(completed.cache_keys.clone());
         let mut to_remove = vec![];
         for idx in deps.graph.node_indices() {
             let key = task_key(&deps.graph[idx]);
-            if completed.contains(&key) {
+            if completed.completed.contains(&key) {
                 to_remove.push(idx);
             }
         }
@@ -211,12 +317,13 @@ impl Deps {
         self.graph.node_count() == 0
     }
 
-    /// Snapshot of task keys that have completed (removed from the graph).
-    /// Used by `new_pruned` so sub-graphs skip tasks the parent already ran.
-    /// Only includes confirmed-complete tasks, not in-flight ones, to
-    /// preserve dependency ordering in the sub-graph.
-    pub fn handled_task_keys(&self) -> HashSet<TaskKey> {
-        self.removed.clone()
+    /// Snapshot completed task state for nested task sub-graphs.
+    pub fn completion_state(&self) -> TaskCompletionState {
+        TaskCompletionState {
+            completed: self.removed.clone(),
+            did_work: self.did_work.clone(),
+            cache_keys: self.cache_keys.clone(),
+        }
     }
 
     /// Check if a post-dep task should actually run: it must be a post-dependency
@@ -237,18 +344,46 @@ impl Deps {
         self.executed.insert(task_key(task));
     }
 
-    /// Mark a task as having actually run its commands (not skipped due to fresh sources).
-    /// Used to invalidate dependent tasks' source freshness checks.
-    pub fn mark_ran(&mut self, task: &Task) {
-        self.ran.insert(task_key(task));
+    /// Clear the execution marker when cancellation prevents a scheduled task
+    /// from reaching process startup.
+    pub fn unmark_executed(&mut self, task: &Task) {
+        self.executed.remove(&task_key(task));
     }
 
-    /// Check if any direct dependency of the given task actually ran (not skipped).
-    pub fn any_dep_ran(&self, task: &Task) -> bool {
+    /// Mark a task as having executed or restored outputs.
+    /// Used to invalidate dependent tasks' source freshness checks.
+    pub fn mark_did_work(&mut self, task: &Task) {
+        self.did_work.insert(task_key(task));
+    }
+
+    /// Record a stable artifact identity produced or reused by a completed task.
+    pub fn mark_cache_key(&mut self, task: &Task, cache_key: String) {
+        self.cache_keys.insert(task_key(task), cache_key);
+    }
+
+    /// Return the completed dependency state needed for freshness and artifact caching.
+    pub fn dependency_state(&self, task: &Task) -> TaskDependencyState {
         let key = task_key(task);
-        self.dep_edges
+        let deps = self
+            .dep_edges
             .get(&key)
-            .is_some_and(|deps| deps.iter().any(|dep_key| self.ran.contains(dep_key)))
+            .into_iter()
+            .flatten()
+            .chain(self.post_dep_parents.get(&key).into_iter().flatten())
+            .collect::<HashSet<_>>();
+        let mut cache_keys = deps
+            .iter()
+            .filter_map(|dep_key| self.cache_keys.get(dep_key).cloned())
+            .collect::<Vec<_>>();
+        cache_keys.sort();
+        cache_keys.dedup();
+        TaskDependencyState {
+            cache_keys,
+            any_did_work: deps.iter().any(|dep_key| self.did_work.contains(dep_key)),
+            any_unkeyed_did_work: deps.iter().any(|dep_key| {
+                self.did_work.contains(dep_key) && !self.cache_keys.contains_key(dep_key)
+            }),
+        }
     }
 
     /// Remove multiple tasks from the graph in a batch, emitting leaves only once at the end.
@@ -331,4 +466,313 @@ fn leaves(graph: &DiGraph<Task, ()>) -> Vec<Task> {
         .externals(Direction::Outgoing)
         .map(|idx| graph[idx].clone())
         .collect()
+}
+
+pub(crate) fn task_cycle_label(task: &Task) -> String {
+    let label = if task.args.is_empty() {
+        task.name.clone()
+    } else {
+        format!("{} {}", task.name, task.args.join(" "))
+    };
+    let env_keys = task
+        .env
+        .0
+        .iter()
+        .filter_map(|directive| match directive {
+            EnvDirective::Val(key, _, _) => Some(key),
+            _ => None,
+        })
+        .sorted()
+        .unique()
+        .join(", ");
+    if env_keys.is_empty() {
+        label
+    } else {
+        format!("{label} [env: {env_keys}]")
+    }
+}
+
+fn find_cycles(graph: &DiGraph<Task, ()>, limit: Option<usize>) -> Vec<Vec<NodeIndex>> {
+    let mut cycles = Vec::new();
+    for mut component in kosaraju_scc(graph) {
+        component.sort_by_key(|node| node.index());
+        let component: HashSet<_> = component.into_iter().collect();
+        if component.len() == 1 {
+            let node = *component.iter().next().unwrap();
+            if graph.find_edge(node, node).is_some() {
+                cycles.push(vec![node, node]);
+            }
+            if limit.is_some_and(|limit| cycles.len() >= limit) {
+                return cycles;
+            }
+            continue;
+        }
+
+        let mut starts = component.iter().copied().collect_vec();
+        starts.sort_by_key(|node| node.index());
+        for start in starts {
+            let mut path = vec![start];
+            let mut in_path = HashSet::from([start]);
+            let mut stack = vec![(
+                start,
+                graph
+                    .neighbors_directed(start, Direction::Outgoing)
+                    .filter(|node| component.contains(node))
+                    .sorted_by_key(|node| node.index())
+                    .collect_vec(),
+                0,
+            )];
+
+            while !stack.is_empty() {
+                let dependency = {
+                    let (_, dependencies, next) = stack.last_mut().unwrap();
+                    if *next < dependencies.len() {
+                        let dependency = dependencies[*next];
+                        *next += 1;
+                        Some(dependency)
+                    } else {
+                        None
+                    }
+                };
+
+                let Some(dependency) = dependency else {
+                    let (node, _, _) = stack.pop().unwrap();
+                    path.pop();
+                    in_path.remove(&node);
+                    continue;
+                };
+                if dependency == start {
+                    let mut cycle = path.clone();
+                    cycle.push(start);
+                    cycles.push(cycle);
+                    if limit.is_some_and(|limit| cycles.len() >= limit) {
+                        return cycles;
+                    }
+                } else if dependency.index() >= start.index() && in_path.insert(dependency) {
+                    path.push(dependency);
+                    stack.push((
+                        dependency,
+                        graph
+                            .neighbors_directed(dependency, Direction::Outgoing)
+                            .filter(|node| component.contains(node))
+                            .sorted_by_key(|node| node.index())
+                            .collect_vec(),
+                        0,
+                    ));
+                }
+            }
+        }
+    }
+    cycles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(name: &str) -> Task {
+        Task {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn deps_with_relationships(
+        dep_edges: HashMap<TaskKey, HashSet<TaskKey>>,
+        post_dep_parents: HashMap<TaskKey, HashSet<TaskKey>>,
+    ) -> Deps {
+        let (tx, _) = mpsc::unbounded_channel();
+        Deps {
+            graph: DiGraph::new(),
+            sent: HashSet::new(),
+            removed: HashSet::new(),
+            executed: HashSet::new(),
+            did_work: HashSet::new(),
+            cache_keys: HashMap::new(),
+            dep_edges,
+            post_dep_parents,
+            tx,
+        }
+    }
+
+    #[test]
+    fn unmark_executed_disables_post_dependency_cleanup() {
+        let parent = task("parent");
+        let cleanup = task("cleanup");
+        let mut deps = deps_with_relationships(
+            HashMap::new(),
+            HashMap::from([(task_key(&cleanup), HashSet::from([task_key(&parent)]))]),
+        );
+
+        deps.mark_executed(&parent);
+        assert!(deps.is_runnable_post_dep(&cleanup));
+
+        deps.unmark_executed(&parent);
+        assert!(!deps.is_runnable_post_dep(&cleanup));
+    }
+
+    #[test]
+    fn dependency_state_tracks_direct_artifact_identity_and_unkeyed_work() {
+        let a = task("a");
+        let b = task("b");
+        let c = task("c");
+        let dep_edges = HashMap::from([
+            (task_key(&b), HashSet::from([task_key(&a)])),
+            (task_key(&c), HashSet::from([task_key(&b)])),
+        ]);
+        let mut deps = deps_with_relationships(dep_edges, HashMap::new());
+
+        deps.mark_did_work(&b);
+        assert_eq!(
+            deps.dependency_state(&c),
+            TaskDependencyState {
+                cache_keys: vec![],
+                any_did_work: true,
+                any_unkeyed_did_work: true,
+            }
+        );
+
+        deps.mark_cache_key(&b, "b-key".to_string());
+        assert_eq!(
+            deps.dependency_state(&c),
+            TaskDependencyState {
+                cache_keys: vec!["b-key".to_string()],
+                any_did_work: true,
+                any_unkeyed_did_work: false,
+            }
+        );
+    }
+
+    #[test]
+    fn dependency_state_includes_post_dependency_parents() {
+        let parent = task("parent");
+        let post = task("post");
+        let post_dep_parents =
+            HashMap::from([(task_key(&post), HashSet::from([task_key(&parent)]))]);
+        let mut deps = deps_with_relationships(HashMap::new(), post_dep_parents);
+
+        deps.mark_did_work(&parent);
+        deps.mark_cache_key(&parent, "parent-key".to_string());
+
+        assert_eq!(
+            deps.dependency_state(&post),
+            TaskDependencyState {
+                cache_keys: vec!["parent-key".to_string()],
+                any_did_work: true,
+                any_unkeyed_did_work: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn new_pruned_preserves_completed_artifact_state() {
+        let completed_task = task("completed");
+        let key = task_key(&completed_task);
+        let completion_state = TaskCompletionState {
+            completed: HashSet::from([key.clone()]),
+            did_work: HashSet::from([key.clone()]),
+            cache_keys: HashMap::from([(key.clone(), "completed-key".to_string())]),
+        };
+        let config = Config::get().await.unwrap();
+
+        let deps = Deps::new_pruned(&config, vec![completed_task], &completion_state)
+            .await
+            .unwrap();
+        let propagated = deps.completion_state();
+
+        assert!(deps.is_empty());
+        assert!(propagated.did_work.contains(&key));
+        assert_eq!(
+            propagated.cache_keys.get(&key).map(String::as_str),
+            Some("completed-key")
+        );
+    }
+
+    #[test]
+    fn finds_cycle_path() {
+        let mut graph = DiGraph::new();
+        let a = graph.add_node(task("a"));
+        let b = graph.add_node(task("b"));
+        let c = graph.add_node(task("c"));
+        graph.update_edge(a, b, ());
+        graph.update_edge(b, c, ());
+        graph.update_edge(c, a, ());
+
+        let cycle = find_cycles(&graph, Some(1)).pop().unwrap();
+        let labels = cycle
+            .iter()
+            .map(|&idx| task_cycle_label(&graph[idx]))
+            .collect_vec();
+        assert_eq!(labels, ["a", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn accepts_acyclic_graph() {
+        let mut graph = DiGraph::new();
+        let a = graph.add_node(task("a"));
+        let b = graph.add_node(task("b"));
+        graph.update_edge(b, a, ());
+
+        assert!(find_cycles(&graph, None).is_empty());
+    }
+
+    #[test]
+    fn accepts_deep_acyclic_graph() {
+        let mut graph = DiGraph::new();
+        let nodes = (0..10_000)
+            .map(|i| graph.add_node(task(&format!("task-{i}"))))
+            .collect_vec();
+        for pair in nodes.windows(2) {
+            graph.update_edge(pair[0], pair[1], ());
+        }
+
+        assert!(find_cycles(&graph, None).is_empty());
+    }
+
+    #[test]
+    fn finds_overlapping_cycles() {
+        let mut graph = DiGraph::new();
+        let root = graph.add_node(task("root"));
+        let left = graph.add_node(task("left"));
+        let right = graph.add_node(task("right"));
+        graph.update_edge(root, left, ());
+        graph.update_edge(left, root, ());
+        graph.update_edge(root, right, ());
+        graph.update_edge(right, root, ());
+
+        let cycles = find_cycles(&graph, None)
+            .into_iter()
+            .map(|cycle| {
+                cycle
+                    .iter()
+                    .map(|&idx| task_cycle_label(&graph[idx]))
+                    .collect_vec()
+            })
+            .collect_vec();
+
+        assert_eq!(
+            cycles,
+            [["root", "left", "root"], ["root", "right", "root"]]
+        );
+    }
+
+    #[test]
+    fn cycle_label_disambiguates_environment_variants_without_values() {
+        let mut task = task("build");
+        task.args = vec!["linux".to_string()];
+        task.env.0 = vec![
+            EnvDirective::Val(
+                "TOKEN".to_string(),
+                "secret".to_string(),
+                Default::default(),
+            ),
+            EnvDirective::Val(
+                "TARGET".to_string(),
+                "linux".to_string(),
+                Default::default(),
+            ),
+        ];
+
+        assert_eq!(task_cycle_label(&task), "build linux [env: TARGET, TOKEN]");
+    }
 }

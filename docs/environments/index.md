@@ -151,6 +151,14 @@ API_TOKEN = "token_123"
 PASSWORD = "my_password"
 ```
 
+Set `redact = false` on an individual variable to exclude it from matching `redactions` patterns,
+including patterns inherited from a global config:
+
+```toml
+[env]
+TEST_TOKEN = { value = "not-sensitive", redact = false }
+```
+
 ### Viewing Redacted Environment Variables
 
 The `mise env` command provides flags to work with redacted variables:
@@ -360,7 +368,7 @@ The `env._.file` directive supports:
 - Multiple files as an array of strings and objects
 - Using relative or absolute paths
 - Using `dotenv`, `json`, `yaml`, or `toml` file formats
-- The `redact` and `tools` options
+- The `redact`, `tools`, and `expand` options
 
 ```toml
 [env]
@@ -377,6 +385,20 @@ _.file = '.env.toml'
 # Load env from the dotenv file after tools have defined environment variables
 _.file = { path = ".env", tools = true }
 ```
+
+Shell-style expansion in structured JSON, YAML, and TOML files is disabled by default so values
+containing literal `$` characters are preserved. Set `expand = true` to allow values in a file to
+reference variables defined earlier in the same file, an earlier file, or an earlier `[env]` block:
+
+```toml
+[env]
+BASE = "/opt/project"
+_.file = { path = ".env.json", expand = true }
+```
+
+The `env_shell_expand` setting remains the global switch and can disable expansion even when a file
+sets `expand = true`. Dotenv files retain dotenvy's normal same-file expansion behavior regardless;
+for dotenv files, `expand = true` additionally enables references to previously loaded values.
 
 ```toml
 [env]

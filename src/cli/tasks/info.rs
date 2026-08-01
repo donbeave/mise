@@ -32,6 +32,9 @@ impl TasksInfo {
         let tasks = if task_name.starts_with("//") {
             let ctx = crate::task::TaskLoadContext::from_pattern(&task_name);
             config.tasks_with_context(Some(&ctx)).await?
+        } else if crate::task::is_workspace_project_task(&task_name) {
+            let ctx = crate::task::TaskLoadContext::all();
+            config.tasks_with_context(Some(&ctx)).await?
         } else {
             config.tasks().await?
         };
@@ -107,6 +110,9 @@ impl TasksInfo {
         if !outputs.is_empty() {
             info::inline_section("Outputs", outputs.join(", "))?;
         }
+        if task.cache.as_ref().is_some_and(|cache| cache.enabled) {
+            info::inline_section("Cache", "enabled")?;
+        }
         if let Some(file) = &task.file {
             info::inline_section("File", display_path(file))?;
         }
@@ -160,6 +166,7 @@ impl TasksInfo {
             "interactive": task.interactive,
             "sources": task.sources,
             "outputs": task.outputs,
+            "cache": task.cache.clone().unwrap_or_default(),
             "shell": task.shell,
             "quiet": task.quiet,
             "silent": task.silent,

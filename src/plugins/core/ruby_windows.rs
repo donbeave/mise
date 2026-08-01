@@ -187,10 +187,6 @@ impl Backend for RubyPlugin {
         Ok(versions)
     }
 
-    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(vec![".ruby-version".into(), "Gemfile".into()])
-    }
-
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let v = match path.file_name() {
             Some(name) if name == "Gemfile" => parse_gemfile(&file::read_to_string(path)?),
@@ -275,13 +271,8 @@ fn parse_gemfile(body: &str) -> String {
     v
 }
 
-#[allow(clippy::if_same_then_else)]
 fn arch() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "x64"
-    } else {
-        "x64"
-    }
+    "x64"
 }
 
 #[cfg(test)]

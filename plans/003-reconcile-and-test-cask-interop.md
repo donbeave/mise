@@ -1,5 +1,8 @@
 # Plan 003: Reconcile exact metadata during apply and test real Homebrew lifecycle
 
+> **ARCHIVED — NON-EXECUTABLE.** Plan 012 selected mise-only ownership. Retained
+> only as historical research; instructions below do not authorize work.
+
 **2026-07-23 supersession note**: Plan 012 now owns native handoff feasibility
 and its disposable Homebrew lifecycle matrix. Run this plan only after the
 selected ownership direction and Plan 008 recovery behavior are finalized.

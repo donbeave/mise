@@ -77,10 +77,24 @@ pub static XDG_DATA_HOME: Lazy<PathBuf> =
 pub static XDG_DATA_HOME: Lazy<PathBuf> = Lazy::new(|| {
     var_path("XDG_DATA_HOME")
         .or(var_path("LOCALAPPDATA"))
-        .unwrap_or_else(|| HOME.join("AppData/Local"))
+        .unwrap_or_else(|| HOME.join("AppData").join("Local"))
 });
 pub static XDG_STATE_HOME: Lazy<PathBuf> =
     Lazy::new(|| var_path("XDG_STATE_HOME").unwrap_or_else(|| HOME.join(".local").join("state")));
+
+/// `%LOCALAPPDATA%`. What the `adrg/xdg` Go package resolves `XDG_CONFIG_HOME` to on Windows,
+/// so it is where CLIs built on it — `glab` among them — keep their config.
+///
+/// Roaming `%APPDATA%` deliberately has no counterpart here. Its only consumer is the `gh`
+/// lookup, which has to reproduce go-gh's literal `os.Getenv("AppData")` test — including
+/// falling through to `~/.config/gh` when the variable is unset — so a synthesized default
+/// would make mise look somewhere gh never would.
+///
+/// An empty `%LOCALAPPDATA%` falls back rather than resolving to an empty path — see
+/// [`var_path`] — which is also what `adrg/xdg` does (`dir != "" && filepath.IsAbs(dir)`).
+#[cfg(windows)]
+pub static LOCAL_APPDATA: Lazy<PathBuf> =
+    Lazy::new(|| var_path("LOCALAPPDATA").unwrap_or_else(|| HOME.join("AppData").join("Local")));
 
 /// control display of "friendly" errors - defaults to release mode behavior unless overridden
 pub static MISE_FRIENDLY_ERROR: Lazy<bool> = Lazy::new(|| {
@@ -524,6 +538,14 @@ pub static __MISE_ZSH_PRECMD_RUN: Lazy<bool> = Lazy::new(|| !var_is_false("__MIS
 pub static LINUX_DISTRO: Lazy<Option<String>> = Lazy::new(linux_distro);
 pub static PREFER_OFFLINE: Lazy<AtomicBool> =
     Lazy::new(|| prefer_offline(&ARGS.read().unwrap()).into());
+/// Commands whose explicit purpose is to enumerate remote versions/tags. Under
+/// `prefer_offline`, remote-version lookups are otherwise capped to a single
+/// ~3s attempt with no retries so fast/interactive commands (shims, activation)
+/// never stall. These commands opt out of that cap so they honor the full
+/// configured `fetch_remote_versions_timeout` even when `prefer_offline` is set
+/// (https://github.com/jdx/mise/discussions/11185).
+pub static REMOTE_FETCH_COMMAND: Lazy<AtomicBool> =
+    Lazy::new(|| remote_fetch_command(&ARGS.read().unwrap()).into());
 pub static OFFLINE: Lazy<bool> = Lazy::new(|| offline(&ARGS.read().unwrap()));
 pub static WARN_ON_MISSING_REQUIRED_ENV: Lazy<bool> =
     Lazy::new(|| warn_on_missing_required_env(&ARGS.read().unwrap()));
@@ -654,8 +676,19 @@ pub fn in_home_dir() -> bool {
     current_dir().is_ok_and(|d| d == *HOME)
 }
 
+/// The value of `key` as a path, or `None` when it is unset **or empty**.
+///
+/// An empty value is not a directory. Without this it would yield an empty `PathBuf`, and every
+/// caller joins onto the result — producing a *relative* path that gets resolved against the
+/// current working directory. `XDG_CONFIG_HOME=` would make `MISE_CONFIG_DIR` the relative
+/// `mise`, and a forge CLI lookup read `gh/hosts.yml` out of whatever directory mise happened to
+/// be run from. Treating empty as unset is also what the tools mise mirrors here do: go-gh
+/// (`os.Getenv(x) != ""`) and `adrg/xdg` (`dir != "" && filepath.IsAbs(dir)`) both fall through.
 pub fn var_path(key: &str) -> Option<PathBuf> {
-    var_os(key).map(PathBuf::from).map(replace_path)
+    var_os(key)
+        .map(PathBuf::from)
+        .map(replace_path)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// this returns the environment as if __MISE_DIFF was reversed.
@@ -719,28 +752,60 @@ fn prefer_offline(args: &[String]) -> bool {
         return true;
     }
 
-    // Otherwise fall back to the original command-based logic
-    args.iter()
-        .take_while(|a| *a != "--")
-        .filter(|a| !a.starts_with('-') || *a == "--prefer-offline")
-        .nth(1)
-        .map(|a| {
-            [
-                "--prefer-offline",
-                "activate",
-                "current",
-                "direnv",
-                "env",
-                "exec",
-                "hook-env",
-                "ls",
-                "where",
-                "which",
-                "x",
-            ]
-            .contains(&a.as_str())
-        })
+    let settings_args_end = first_non_global_arg_idx(args).unwrap_or(args.len());
+    if args[..settings_args_end]
+        .iter()
+        .any(|arg| arg == "--prefer-offline")
+    {
+        return true;
+    }
+
+    prefer_offline_command(args)
+}
+
+/// Commands that should not fetch remote versions.
+const PREFER_OFFLINE_COMMANDS: &[&str] = &[
+    "activate", "current", "direnv", "env", "exec", "hook-env", "ls", "where", "which", "x",
+];
+
+/// Commands whose whole purpose is to enumerate remote versions. See
+/// [`REMOTE_FETCH_COMMAND`].
+const REMOTE_FETCH_COMMANDS: &[&str] = &[
+    "lock",
+    "ls-remote",
+    "list-all",
+    "list-remote",
+    "outdated",
+    "upgrade",
+    "up",
+];
+
+fn first_non_global_arg_idx(args: &[String]) -> Option<usize> {
+    // Uses the cached global-flag list rather than building a fresh clap tree.
+    // This runs from `Lazy` statics during startup, so on essentially every
+    // invocation; building the tree here cost ~6.3M instructions per run.
+    crate::cli::first_non_global_arg_idx_cached(args)
+}
+
+/// Whether the subcommand at `command_idx` is one of `names`.
+fn is_command(args: &[String], command_idx: Option<usize>, names: &[&str]) -> bool {
+    command_idx
+        .and_then(|idx| args.get(idx))
+        .map(|a| names.contains(&a.as_str()))
         .unwrap_or_default()
+}
+
+fn prefer_offline_command(args: &[String]) -> bool {
+    is_command(
+        args,
+        first_non_global_arg_idx(args),
+        PREFER_OFFLINE_COMMANDS,
+    )
+}
+
+/// See [`REMOTE_FETCH_COMMAND`].
+fn remote_fetch_command(args: &[String]) -> bool {
+    is_command(args, first_non_global_arg_idx(args), REMOTE_FETCH_COMMANDS)
 }
 
 /// returns true if missing required env vars should produce warnings instead of errors
@@ -864,7 +929,7 @@ fn filename(path: &str) -> &str {
 fn get_token(keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| var(key).ok())
-        .and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
+        .filter(|v| !v.trim().is_empty())
 }
 
 pub fn is_activated() -> bool {
@@ -916,12 +981,8 @@ pub fn args_safe() -> Vec<String> {
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     trace!("cd {}", display_path(path));
-    unsafe {
-        std::env::set_current_dir(path).wrap_err_with(|| {
-            format!("failed to set current directory to {}", display_path(path))
-        })?;
-        path_absolutize::update_cwd();
-    }
+    std::env::set_current_dir(path)
+        .wrap_err_with(|| format!("failed to set current directory to {}", display_path(path)))?;
     Ok(())
 }
 
@@ -961,6 +1022,54 @@ mod tests {
         remove_var("MISE_TEST_PATH");
     }
 
+    /// An empty value is not a directory. Callers all join onto the result, so returning
+    /// `Some("")` would hand them a relative path resolved against the cwd — e.g. an empty
+    /// `XDG_CONFIG_HOME` turning `MISE_CONFIG_DIR` into the relative `mise`.
+    #[tokio::test]
+    async fn test_var_path_treats_empty_as_unset() {
+        let _config = Config::get().await.unwrap();
+        set_var("MISE_TEST_EMPTY_PATH", "");
+        assert_eq!(var_path("MISE_TEST_EMPTY_PATH"), None);
+        remove_var("MISE_TEST_EMPTY_PATH");
+    }
+
+    /// vars_safe() must skip pairs whose key or value is not valid UTF-8 rather
+    /// than panicking the way std::env::vars() does (#5370).
+    #[cfg(unix)]
+    #[test]
+    fn test_vars_safe_skips_invalid_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // 0xff can never appear in valid UTF-8.
+        let bad_value_key = "MISE_TEST_VARS_SAFE_BAD_VALUE";
+        let bad_key = OsString::from_vec(b"MISE_TEST_VARS_SAFE_BAD_KEY_\xff".to_vec());
+        let good_key = "MISE_TEST_VARS_SAFE_GOOD";
+
+        // the guard restores the previous environment on drop, so even a failing
+        // assertion below cannot leak a non-UTF-8 var into the test process
+        let mut guard = crate::test::EnvVarGuard::new();
+        guard
+            .set(bad_value_key, OsString::from_vec(vec![0xff]))
+            .set(&bad_key, "ok")
+            .set(good_key, "1");
+
+        // Both malformed vars really are in the process environment...
+        assert!(vars_os().any(|(k, _)| k == bad_value_key));
+        assert!(vars_os().any(|(k, _)| k == bad_key));
+        // ...and vars_safe() returns without panicking.
+        let safe: Vec<(String, String)> = vars_safe().collect();
+
+        assert!(!safe.iter().any(|(k, _)| k == bad_value_key));
+        assert!(
+            !safe
+                .iter()
+                .any(|(k, _)| k.starts_with("MISE_TEST_VARS_SAFE_BAD_KEY_"))
+        );
+        // Valid neighbours are still returned.
+        assert!(safe.iter().any(|(k, v)| k == good_key && v == "1"));
+    }
+
     #[test]
     fn test_auto_env_default_for_version() {
         let v = |s: &str| versions::Versioning::new(s).unwrap();
@@ -969,6 +1078,61 @@ mod tests {
         assert!(!auto_env_default_for_version(&v("2027.5.9")));
         assert!(auto_env_default_for_version(&v("2027.6.0")));
         assert!(auto_env_default_for_version(&v("2028.1.0")));
+    }
+
+    #[test]
+    fn test_remote_fetch_command_skips_global_option_values() {
+        let args = |args: &[&str]| {
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(remote_fetch_command(&args(&[
+            "mise", "--cd", "/tmp", "lock"
+        ])));
+        assert!(remote_fetch_command(&args(&[
+            "mise",
+            "--profile",
+            "development",
+            "ls-remote",
+        ])));
+        assert!(remote_fetch_command(&args(&[
+            "mise",
+            "--cd=/tmp",
+            "--profile=development",
+            "outdated",
+        ])));
+    }
+
+    #[test]
+    fn test_prefer_offline_command_skips_global_option_values() {
+        let args = |args: &[&str]| {
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(prefer_offline_command(&args(&[
+            "mise", "--cd", "/tmp", "activate"
+        ])));
+        assert!(prefer_offline_command(&args(&[
+            "mise",
+            "--profile",
+            "development",
+            "hook-env",
+        ])));
+        assert!(prefer_offline_command(&args(&["mise", "-C/tmp", "env",])));
+        assert!(!prefer_offline_command(&args(&[
+            "mise", "--cd", "/tmp", "lock"
+        ])));
+        assert!(prefer_offline(&args(&[
+            "mise",
+            "--cd",
+            "/tmp",
+            "--prefer-offline",
+            "lock",
+        ])));
     }
 
     #[cfg(unix)]

@@ -1,5 +1,9 @@
 # Plan 005: Replace contradictory Homebrew findings with one decision record
 
+> **COMPLETED — DO NOT RE-EXECUTE.** Current decision is recorded in
+> `docs/dev/brew-cask-decision-record.md`. Historical instructions below are
+> retained only as evidence.
+
 **2026-07-23 supersession note**: Correct unsafe user-facing claims immediately
 in Plan 010; do not wait for the full research program. Use this plan later to
 collapse historical alternatives after Plan 012's handoff gate and any narrowed

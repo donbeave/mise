@@ -642,14 +642,6 @@ impl Backend for NodePlugin {
         Ok(aliases)
     }
 
-    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(vec![
-            ".node-version".into(),
-            ".nvmrc".into(),
-            "package.json".into(),
-        ])
-    }
-
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let contents = file::read_to_string(path)?;
         let body = normalize_idiomatic_contents(&contents);
@@ -1179,7 +1171,7 @@ mod tests {
 
     impl NodeEnvResetGuard {
         fn clear() -> Self {
-            let vars = std::env::vars()
+            let vars = env::vars_safe()
                 .filter(|(key, _)| key.starts_with("NODE_"))
                 .collect::<BTreeMap<_, _>>();
             for key in vars.keys() {
@@ -1191,7 +1183,7 @@ mod tests {
 
     impl Drop for NodeEnvResetGuard {
         fn drop(&mut self) {
-            for key in std::env::vars()
+            for key in env::vars_safe()
                 .map(|(key, _)| key)
                 .filter(|key| key.starts_with("NODE_"))
                 .collect::<Vec<_>>()

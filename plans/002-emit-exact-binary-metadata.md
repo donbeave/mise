@@ -1,5 +1,9 @@
 # Plan 002: Emit exact transactional Homebrew metadata for eligible binary casks
 
+> **ARCHIVED — NON-EXECUTABLE.** Plan 012 rejected synthetic Homebrew metadata
+> and every handoff class. Retained only as historical research. Do not
+> implement any instruction below without a new explicit operator decision.
+
 **2026-07-23 supersession note**: This is no longer a production-direction
 plan. Execute only after Plans 011-013 and an explicit operator decision to
 maintain a default-off private-format experiment. Prefer a proven native

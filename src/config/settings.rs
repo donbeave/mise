@@ -99,6 +99,7 @@ pub enum NpmPackageManager {
     Auto,
     Npm,
     Aube,
+    AubeCli,
     Bun,
     Pnpm,
 }
@@ -913,7 +914,7 @@ impl Settings {
 
     pub fn fetch_remote_versions_timeout(&self) -> Duration {
         let timeout = self.configured_fetch_remote_versions_timeout();
-        if self.prefer_offline() {
+        if self.bound_remote_version_lookups() {
             timeout.min(Duration::from_secs(3))
         } else {
             timeout
@@ -922,6 +923,19 @@ impl Settings {
 
     pub fn configured_fetch_remote_versions_timeout(&self) -> Duration {
         duration::parse_duration(&self.fetch_remote_versions_timeout).unwrap()
+    }
+
+    /// Whether remote-version lookups should use the aggressive fast-path budget
+    /// (a single ~3s attempt with no retries). This is on under `prefer_offline`
+    /// so shims and shell activation never stall — but NOT for commands whose
+    /// whole job is to enumerate remote versions/tags (`mise lock`, `ls-remote`,
+    /// `outdated`, `upgrade`), which must honor the full configured
+    /// `fetch_remote_versions_timeout` and retry budget even when
+    /// `prefer_offline` is set.
+    ///
+    /// See <https://github.com/jdx/mise/discussions/11185>.
+    pub fn bound_remote_version_lookups(&self) -> bool {
+        self.prefer_offline() && !env::REMOTE_FETCH_COMMAND.load(Ordering::Relaxed)
     }
 
     /// duration that remote version cache is kept for
@@ -949,7 +963,7 @@ impl Settings {
     /// back to cached/local behavior. In particular, shims must not multiply a
     /// stalled resolver timeout by the configured retry count.
     pub fn http_retries(&self) -> i64 {
-        if self.prefer_offline() {
+        if self.bound_remote_version_lookups() {
             0
         } else {
             self.http_retries
@@ -1028,7 +1042,9 @@ impl Settings {
                 Self::UNIX_DEFAULT_INLINE_SHELL_ARGS,
             )
         };
-        split_default_shell_or_fallback(sa, fallback)
+        let mut shell = split_default_shell_or_fallback(sa, fallback)?;
+        self.maybe_no_profile(&mut shell);
+        Ok(shell)
     }
 
     pub fn default_file_shell(&self) -> Result<Vec<String>> {
@@ -1043,7 +1059,17 @@ impl Settings {
                 Self::UNIX_DEFAULT_FILE_SHELL_ARGS,
             )
         };
-        split_default_shell_or_fallback(sa, fallback)
+        let mut shell = split_default_shell_or_fallback(sa, fallback)?;
+        self.maybe_no_profile(&mut shell);
+        Ok(shell)
+    }
+
+    /// Inject `-NoProfile` into a PowerShell shell command when
+    /// `windows_powershell_no_profile` is enabled. No-op for other shells.
+    pub fn maybe_no_profile(&self, shell: &mut Vec<String>) {
+        if self.windows_powershell_no_profile {
+            crate::path::inject_powershell_no_profile(shell);
+        }
     }
 
     pub fn os(&self) -> &str {
@@ -1352,6 +1378,21 @@ mod tests {
         .clone()
     }
 
+    fn default_shell_args_settings_table() -> toml::Table {
+        toml::from_str::<toml::Value>(
+            r#"
+            unix_default_file_shell_args = "malicious-unix-file-shell"
+            unix_default_inline_shell_args = "malicious-unix-inline-shell"
+            windows_default_file_shell_args = "malicious-windows-file-shell"
+            windows_default_inline_shell_args = "malicious-windows-inline-shell"
+            "#,
+        )
+        .unwrap()
+        .as_table()
+        .unwrap()
+        .clone()
+    }
+
     fn settings_partial_from_table(settings: toml::Table) -> SettingsPartial {
         let mut root = toml::Table::new();
         root.insert("settings".to_string(), toml::Value::Table(settings));
@@ -1428,6 +1469,44 @@ mod tests {
         assert_eq!(
             partial.forgejo.credential_command.as_deref(),
             Some("echo forgejo-token")
+        );
+    }
+
+    #[test]
+    fn test_local_config_strips_default_shell_args() {
+        let path = Path::new("/tmp/.mise.toml");
+        let mut settings = default_shell_args_settings_table();
+        strip_local_only_settings(&mut settings, path, false);
+        let partial = settings_partial_from_table(settings);
+
+        assert_eq!(partial.unix_default_file_shell_args, None);
+        assert_eq!(partial.unix_default_inline_shell_args, None);
+        assert_eq!(partial.windows_default_file_shell_args, None);
+        assert_eq!(partial.windows_default_inline_shell_args, None);
+    }
+
+    #[test]
+    fn test_global_config_preserves_default_shell_args() {
+        let path = Path::new("/tmp/global-config.toml");
+        let mut settings = default_shell_args_settings_table();
+        strip_local_only_settings(&mut settings, path, true);
+        let partial = settings_partial_from_table(settings);
+
+        assert_eq!(
+            partial.unix_default_file_shell_args.as_deref(),
+            Some("malicious-unix-file-shell")
+        );
+        assert_eq!(
+            partial.unix_default_inline_shell_args.as_deref(),
+            Some("malicious-unix-inline-shell")
+        );
+        assert_eq!(
+            partial.windows_default_file_shell_args.as_deref(),
+            Some("malicious-windows-file-shell")
+        );
+        assert_eq!(
+            partial.windows_default_inline_shell_args.as_deref(),
+            Some("malicious-windows-inline-shell")
         );
     }
 

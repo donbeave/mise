@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 
 use async_trait::async_trait;
 use eyre::{WrapErr, bail, eyre};
@@ -13,7 +16,7 @@ use super::source;
 use crate::cmd::CmdLineRunner;
 use crate::file::{self, ExtractOptions, ExtractionFormat};
 use crate::hash;
-use crate::http::HTTP_FETCH;
+use crate::http::{HTTP, HTTP_FETCH};
 use crate::result::Result;
 use crate::system::packages::{
     InstallOpts, PackageRequest, PackageState, PackageStatus, SystemPackageManager,
@@ -83,6 +86,16 @@ struct BinaryArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandWrapperArtifact {
+    name: String,
+    target: Option<String>,
+    content: Option<String>,
+    executable: Option<String>,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PkgArtifact {
     source: String,
 }
@@ -102,13 +115,58 @@ struct GeneratedCompletionArtifact {
     shells: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlightStep {
+    Move {
+        source: FlightPath,
+        target: FlightPath,
+        source_glob: bool,
+    },
+    Remove {
+        paths: Vec<FlightPath>,
+        recursive: bool,
+    },
+    Run {
+        command: FlightPath,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        sudo: bool,
+        guards: Vec<FlightGuard>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlightPathBase {
+    StagedPath,
+    AppDir,
+    HomebrewPrefix,
+    Absolute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FlightPath {
+    base: FlightPathBase,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlightGuard {
+    OnMacos,
+    OnLinux,
+    IfExists(FlightPath),
+    UnlessExists(FlightPath),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CaskArtifacts {
     apps: Vec<AppArtifact>,
     binaries: Vec<BinaryArtifact>,
+    command_wrappers: Vec<CommandWrapperArtifact>,
     pkgs: Vec<PkgArtifact>,
     fonts: Vec<FontArtifact>,
     generated_completions: Vec<GeneratedCompletionArtifact>,
+    preflight_steps: Vec<FlightStep>,
+    postflight_steps: Vec<FlightStep>,
     pkg_ids: Vec<String>,
 }
 
@@ -305,6 +363,19 @@ fn validate_mutation_boundaries(ids: &CaskIds, artifacts: &CaskArtifacts) -> Res
             })?;
         reject_symlink_components(&root, target.parent().unwrap_or(&target))?;
     }
+    for wrapper in &artifacts.command_wrappers {
+        let target = wrapper.target_path()?;
+        let root = allowed_binary_target_roots()
+            .into_iter()
+            .find(|root| target.starts_with(root))
+            .ok_or_else(|| {
+                eyre!(
+                    "brew-cask: command wrapper target '{}' has no allowed root",
+                    target.display()
+                )
+            })?;
+        reject_symlink_components(&root, target.parent().unwrap_or(&target))?;
+    }
     let fonts_root = crate::dirs::HOME.join("Library").join("Fonts");
     for font in &artifacts.fonts {
         let target = font_target_path(font)?;
@@ -330,6 +401,10 @@ fn validate_artifact_paths(artifacts: &CaskArtifacts) -> Result<()> {
             validate_relative_artifact_source("binary source", &binary.source)?;
         }
         binary.target_path()?;
+    }
+    for wrapper in &artifacts.command_wrappers {
+        SafePathComponent::parse("command wrapper name", &wrapper.name)?;
+        wrapper.target_path()?;
     }
     for pkg in &artifacts.pkgs {
         validate_relative_artifact_source("pkg source", &pkg.source)?;
@@ -807,6 +882,9 @@ impl BrewCaskManager {
             for binary in &artifacts.binaries {
                 miseprintln!("link binary {}", binary.target_name()?);
             }
+            for wrapper in &artifacts.command_wrappers {
+                miseprintln!("link command wrapper {}", wrapper.target_name()?);
+            }
             for pkg in &artifacts.pkgs {
                 miseprintln!("install pkg {}", pkg.source);
             }
@@ -831,6 +909,15 @@ impl BrewCaskManager {
         completed.formula_dependencies = cask.depends_on.formula.clone();
         // Establish durable intent before the first installation mutation.
         write_action_journal(&ids, &completed)?;
+        if let Some(action) = execute_flight_steps(
+            &cask,
+            &artifacts.preflight_steps,
+            &stage,
+            &appdir,
+            "preflight_steps",
+        )? {
+            record_completed_action(&ids, &mut completed, action)?;
+        }
         if let Some(action) =
             execute_lifecycle_hook(&cask, &stage, &appdir, "preflight", pr).await?
         {
@@ -848,6 +935,19 @@ impl BrewCaskManager {
             let action = stage_font(&stage, &tmp_caskroom, &caskroom, font)?;
             record_completed_action(&ids, &mut completed, action)?;
         }
+        for wrapper in &artifacts.command_wrappers {
+            let action = stage_command_wrapper(&tmp_caskroom, &caskroom, &appdir, &cask, wrapper)?;
+            record_completed_action(&ids, &mut completed, action)?;
+        }
+        if let Some(action) = execute_flight_steps(
+            &cask,
+            &artifacts.postflight_steps,
+            &tmp_caskroom,
+            &appdir,
+            "postflight_steps",
+        )? {
+            record_completed_action(&ids, &mut completed, action)?;
+        }
         if let Some(action) =
             execute_lifecycle_hook(&cask, &tmp_caskroom, &appdir, "postflight", pr).await?
         {
@@ -860,23 +960,69 @@ impl BrewCaskManager {
         // Durable journal outside Homebrew-controlled Caskroom/metadata dirs.
         // Crash before final receipt ⇒ Pending with journal, not healthy install.
         write_action_journal(&ids, &completed)?;
-        file::remove_all(&caskroom)?;
-        file::rename(&tmp_caskroom, &caskroom)?;
-        for binary in &artifacts.binaries {
-            let action = link_binary(&caskroom, binary)?;
-            record_completed_action(&ids, &mut completed, action)?;
-        }
+        let current_binaries = binary_targets(&artifacts)?;
+        let current_fonts = font_target_paths(&artifacts)?;
+        let mut current_targets = current_binaries.clone();
+        current_targets.extend(current_fonts.iter().cloned());
         for completion in &artifacts.generated_completions {
-            for action in generate_completions(completion, &artifacts.binaries)? {
-                record_completed_action(&ids, &mut completed, action)?;
+            for shell in &completion.shells {
+                current_targets.push(generated_completion_target(completion, shell)?);
             }
         }
-        remove_obsolete_binary_links(&cask, &previous_binaries, &binary_targets(&artifacts)?)?;
-        for font in &artifacts.fonts {
-            let action = link_font(&caskroom, font)?;
-            record_completed_action(&ids, &mut completed, action)?;
+        let mut link_transaction = ArtifactLinkTransaction::begin(current_targets)?;
+        let caskroom_backup = caskroom_backup_dir(&ids);
+        file::remove_all(&caskroom_backup)?;
+        let had_previous = caskroom.symlink_metadata().is_ok();
+        if had_previous {
+            file::rename(&caskroom, &caskroom_backup)?;
         }
-        remove_obsolete_fonts(&cask, &previous_fonts, &font_target_paths(&artifacts)?)?;
+        if let Err(err) = file::rename(&tmp_caskroom, &caskroom) {
+            if had_previous {
+                file::rename(&caskroom_backup, &caskroom)?;
+            }
+            link_transaction.rollback()?;
+            return Err(err);
+        }
+        let activation = (|| -> Result<()> {
+            for binary in &artifacts.binaries {
+                let action = link_binary(&caskroom, binary)?;
+                record_completed_action(&ids, &mut completed, action)?;
+            }
+            for wrapper in &artifacts.command_wrappers {
+                let action = link_command_wrapper(&caskroom, wrapper)?;
+                record_completed_action(&ids, &mut completed, action)?;
+            }
+            for completion in &artifacts.generated_completions {
+                for action in generate_completions(completion, &artifacts.binaries)? {
+                    record_completed_action(&ids, &mut completed, action)?;
+                }
+            }
+            for font in &artifacts.fonts {
+                let action = link_font(&caskroom, font)?;
+                record_completed_action(&ids, &mut completed, action)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = activation {
+            let caskroom_rollback = (|| -> Result<()> {
+                file::remove_all(&caskroom)?;
+                if had_previous {
+                    file::rename(&caskroom_backup, &caskroom)?;
+                }
+                Ok(())
+            })();
+            let link_rollback = link_transaction.rollback();
+            if let Err(rollback_err) = caskroom_rollback.and(link_rollback) {
+                return Err(err.wrap_err(format!(
+                    "failed to restore previous cask after activation failed: {rollback_err:#}"
+                )));
+            }
+            return Err(err);
+        }
+        link_transaction.commit()?;
+        file::remove_all(&caskroom_backup)?;
+        remove_obsolete_binary_links(&cask, &previous_binaries, &current_binaries)?;
+        remove_obsolete_fonts(&cask, &previous_fonts, &current_fonts)?;
         remove_stale_versions(&caskroom_token, &ids.version)?;
         // Final mise receipt only after required activation succeeds.
         // Never publish synthetic Homebrew `.metadata` — mise-owned pours stay
@@ -970,6 +1116,20 @@ impl BinaryArtifact {
 
     fn target_path(&self) -> Result<PathBuf> {
         binary_target_path(&self.target_name()?)
+    }
+}
+
+impl CommandWrapperArtifact {
+    fn target_name(&self) -> Result<String> {
+        Ok(self.target.clone().unwrap_or_else(|| self.name.clone()))
+    }
+
+    fn target_path(&self) -> Result<PathBuf> {
+        binary_target_path(&self.target_name()?)
+    }
+
+    fn caskroom_path(&self, caskroom: &Path) -> PathBuf {
+        caskroom.join(".homebrew-command-wrappers").join(&self.name)
     }
 }
 
@@ -1167,7 +1327,7 @@ async fn fetch_archive(
         ids.version.as_str()
     ));
     if !archive.exists() {
-        HTTP_FETCH.download_file(&cask.url, &archive, pr).await?;
+        HTTP.download_file(&cask.url, &archive, pr).await?;
         // Strip macOS quarantine so it doesn't propagate into extracted/copied artifacts.
         let _ = std::process::Command::new("xattr")
             .args(["-d", "com.apple.quarantine"])
@@ -1278,6 +1438,7 @@ async fn execute_lifecycle_hook(
         ("MISE_BREW_CASK_APPDIR", appdir.display().to_string()),
         ("MISE_BREW_PREFIX", prefix::prefix().display().to_string()),
         ("MISE_BREW_CASK_HOOK", hook.to_string()),
+        ("MISE_BREW_CASK_SUDO", sudo::subprocess_mode().to_string()),
     ]);
     let runner = match pr {
         Some(pr) => runner.with_pr(pr),
@@ -1362,8 +1523,7 @@ async fn fetch_cask_rb(cask: &Cask, pr: Option<&dyn SingleReport>) -> Result<Pat
     validate_sha256("ruby source", sha256)?;
     let cache_dir = crate::dirs::CACHE.join("system-brew").join("cask-source");
     file::create_dir_all(&cache_dir)?;
-    let cache_key = hash::hash_to_str(&sha256);
-    let short_sha = &cache_key[..12];
+    let short_sha = &sha256[..12];
     let dest = cache_dir.join(format!("{}-{short_sha}.rb", cask.token));
     if dest.exists() && hash::ensure_checksum(&dest, sha256, None, "sha256").is_ok() {
         return Ok(dest);
@@ -1424,25 +1584,7 @@ fn install_app(
     ));
     file::remove_all(&tmp_target)?;
     ditto(&caskroom_app, &tmp_target)?;
-    // Atomic swap: rename existing target aside before putting the new one in place so that
-    // a failure during rename leaves the old app intact rather than leaving nothing.
-    let old_target = target.with_extension(format!(
-        "mise-old-{}",
-        crate::hash::hash_to_str(&target.display().to_string())
-    ));
-    file::remove_all(&old_target)?;
-    let replaced = target.exists();
-    if replaced {
-        file::rename(&target, &old_target)?;
-    }
-    if let Err(e) = file::rename(&tmp_target, &target) {
-        // Restore the old app if the swap failed.
-        if old_target.exists() {
-            let _ = file::rename(&old_target, &target);
-        }
-        return Err(e);
-    }
-    file::remove_all(&old_target)?;
+    swap_app(&target, &tmp_target)?;
     // Remove macOS quarantine attribute so Gatekeeper doesn't block the app.
     let _ = std::process::Command::new("xattr")
         .args(["-r", "-d", "com.apple.quarantine"])
@@ -1461,6 +1603,158 @@ fn install_app(
         target_fingerprint: None,
         identifiers: Vec::new(),
     })
+}
+
+/// Atomically replace an app, restoring the previous bundle if activation fails.
+fn swap_app(target: &Path, tmp_target: &Path) -> Result<()> {
+    // Atomic swap: rename existing target aside before putting the new one in place so that
+    // a failure during rename leaves the old app intact rather than leaving nothing.
+    let old_target = target.with_extension(format!(
+        "mise-old-{}",
+        crate::hash::hash_to_str(&target.display().to_string())
+    ));
+    remove_app(&old_target)?;
+    if target.exists() {
+        file::rename(target, &old_target)?;
+    }
+    if let Err(e) = file::rename(tmp_target, target) {
+        // Restore the old app if the swap failed.
+        if old_target.exists() {
+            let _ = file::rename(&old_target, target);
+        }
+        return Err(e);
+    }
+    // The replacement is already live. A cleanup failure must not report the
+    // install as failed or prevent install_app from removing quarantine.
+    if let Err(err) = remove_app(&old_target) {
+        warn!(
+            "brew-cask: failed to remove old app backup {}: {err:#}",
+            old_target.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove an app bundle, repairing protected contents before escalating ownership.
+fn remove_app(path: &Path) -> Result<()> {
+    match file::remove_all(path) {
+        Ok(()) => return Ok(()),
+        Err(err) if !is_permission_denied(&err) => return Err(err),
+        Err(_) => {}
+    }
+
+    repair_app_permissions(path);
+    match file::remove_all(path) {
+        Ok(()) => return Ok(()),
+        Err(err) if !is_permission_denied(&err) => return Err(err),
+        Err(_) => {}
+    }
+
+    let user = nix::unistd::User::from_uid(nix::unistd::geteuid())?
+        .map(|user| user.name)
+        .ok_or_else(|| eyre!("brew-cask: could not determine current user"))?;
+    // Match Homebrew's final ownership-recovery step. sudo::run applies the
+    // system_packages.sudo setting and refuses to prompt without a TTY.
+    sudo::run(
+        "chown",
+        &[
+            "-R".to_string(),
+            "--".to_string(),
+            user,
+            path.display().to_string(),
+        ],
+        &[],
+    )?;
+    repair_app_permissions(path);
+    file::remove_all(path)
+}
+
+/// Clear flags, restore owner permissions, and remove ACLs from an app bundle.
+fn repair_app_permissions(path: &Path) {
+    let run = |program: &str, args: &[&str]| {
+        let _ = std::process::Command::new(program)
+            .args(args)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    run("/usr/bin/chflags", &["-R", "--", "000"]);
+    run("/bin/chmod", &["-R", "--", "u+rwx"]);
+    run("/bin/chmod", &["-R", "-N"]);
+}
+
+/// Return whether an eyre chain originated from an I/O permission error.
+fn is_permission_denied(err: &eyre::Report) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+fn with_sudo_fallback(result: Result<()>, program: &str, args: &[String]) -> Result<()> {
+    match result {
+        Err(err) if is_permission_denied(&err) => sudo::run(program, args, &[]),
+        other => other,
+    }
+}
+
+fn create_dir_all_elevating(dir: &Path) -> Result<()> {
+    with_sudo_fallback(
+        file::create_dir_all(dir),
+        "mkdir",
+        &["-p".into(), "--".into(), dir.display().to_string()],
+    )
+}
+
+fn make_symlink_elevating(source: &Path, link: &Path) -> Result<()> {
+    with_sudo_fallback(
+        file::make_symlink(source, link).map(|_| ()),
+        "ln",
+        &[
+            "-s".into(),
+            "-f".into(),
+            "-h".into(),
+            "--".into(),
+            source.display().to_string(),
+            link.display().to_string(),
+        ],
+    )
+}
+
+fn rename_elevating(from: &Path, to: &Path) -> Result<()> {
+    with_sudo_fallback(
+        file::rename(from, to),
+        "mv",
+        &[
+            "-f".into(),
+            "--".into(),
+            from.display().to_string(),
+            to.display().to_string(),
+        ],
+    )
+}
+
+fn remove_artifact_target_elevating(path: &Path) -> Result<()> {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return Ok(());
+    };
+    let (result, args) = if metadata.file_type().is_symlink() {
+        (
+            file::remove_file(path),
+            vec!["-f".into(), "--".into(), path.display().to_string()],
+        )
+    } else {
+        (
+            file::remove_all(path),
+            vec![
+                "-r".into(),
+                "-f".into(),
+                "--".into(),
+                path.display().to_string(),
+            ],
+        )
+    };
+    with_sudo_fallback(result, "rm", &args)
 }
 
 /// Copy a directory using macOS `ditto`, which preserves resource forks, extended attributes,
@@ -1684,6 +1978,299 @@ fn font_target_path(font: &FontArtifact) -> Result<PathBuf> {
         .join(name_path))
 }
 
+fn execute_flight_steps(
+    cask: &Cask,
+    steps: &[FlightStep],
+    staged_path: &Path,
+    appdir: &Path,
+    kind: &str,
+) -> Result<Option<CompletedCaskAction>> {
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    for step in steps {
+        execute_flight_step(cask, step, staged_path, appdir).wrap_err_with(|| {
+            format!("brew-cask:{}: failed to run structured {kind}", cask.token)
+        })?;
+    }
+    Ok(Some(CompletedCaskAction {
+        id: format!("structured-hook:{kind}"),
+        kind: CaskActionKind::Hook,
+        operation: CaskActionOperation::Hook,
+        source: None,
+        target: None,
+        phase: CaskActionPhase::CompletedNonRollbackable,
+        mise_created: true,
+        target_fingerprint: None,
+        identifiers: Vec::new(),
+    }))
+}
+
+fn execute_flight_step(
+    cask: &Cask,
+    step: &FlightStep,
+    staged_path: &Path,
+    appdir: &Path,
+) -> Result<()> {
+    match step {
+        FlightStep::Move {
+            source,
+            target,
+            source_glob,
+        } => {
+            let sources = flight_sources(staged_path, source, *source_glob)?;
+            let target = resolve_flight_path(staged_path, target)?;
+            if sources.len() > 1 && !target.is_dir() {
+                bail!(
+                    "brew-cask: structured move with multiple sources requires a directory target"
+                );
+            }
+            for source in sources {
+                let target = if target.is_dir() {
+                    target.join(source.file_name().ok_or_else(|| {
+                        eyre!(
+                            "brew-cask: structured move source '{}' has no file name",
+                            source.display()
+                        )
+                    })?)
+                } else {
+                    target.clone()
+                };
+                if let Some(parent) = target.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    file::create_dir_all(parent)?;
+                }
+                file::remove_all(&target)?;
+                file::rename(&source, &target)?;
+            }
+        }
+        FlightStep::Remove { paths, recursive } => {
+            for path in paths {
+                for path in flight_paths(staged_path, path)? {
+                    if *recursive {
+                        file::remove_all(&path)?;
+                    } else if path.symlink_metadata().is_ok() {
+                        file::remove_file_or_dir(&path)?;
+                    }
+                }
+            }
+        }
+        FlightStep::Run {
+            command,
+            args,
+            env,
+            sudo,
+            guards,
+        } => {
+            if !guards
+                .iter()
+                .map(|guard| flight_guard_matches(guard, staged_path, appdir))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|matches| matches)
+            {
+                return Ok(());
+            }
+            let command = resolve_flight_path_with_context(command, staged_path, appdir)?;
+            let command = expand_cask_template(
+                &command.to_string_lossy(),
+                staged_path,
+                appdir,
+                Some(&cask.version),
+            );
+            let args = args
+                .iter()
+                .map(|arg| expand_cask_template(arg, staged_path, appdir, Some(&cask.version)))
+                .collect::<Vec<_>>();
+            let env = env
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        expand_cask_template(value, staged_path, appdir, Some(&cask.version)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if *sudo {
+                sudo::run(&command, &args, &env)?;
+            } else {
+                let mut runner = CmdLineRunner::new(&command);
+                for arg in &args {
+                    runner = runner.arg(arg);
+                }
+                for (key, value) in &env {
+                    runner = runner.env(key, value);
+                }
+                runner.raw(true).execute()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flight_guard_matches(guard: &FlightGuard, staged_path: &Path, appdir: &Path) -> Result<bool> {
+    match guard {
+        FlightGuard::OnMacos => Ok(cfg!(target_os = "macos")),
+        FlightGuard::OnLinux => Ok(cfg!(target_os = "linux")),
+        FlightGuard::IfExists(path) => {
+            Ok(resolve_flight_path_with_context(path, staged_path, appdir)?.exists())
+        }
+        FlightGuard::UnlessExists(path) => {
+            Ok(!resolve_flight_path_with_context(path, staged_path, appdir)?.exists())
+        }
+    }
+}
+
+fn flight_sources(
+    staged_path: &Path,
+    source: &FlightPath,
+    source_glob: bool,
+) -> Result<Vec<PathBuf>> {
+    if !source_glob {
+        let source = resolve_flight_path(staged_path, source)?;
+        if !source.exists() {
+            bail!(
+                "brew-cask: structured move source '{}' was not found",
+                source.display()
+            );
+        }
+        return Ok(vec![source]);
+    }
+    let sources = expand_staged_glob(staged_path, &source.path)?;
+    if sources.is_empty() {
+        bail!(
+            "brew-cask: structured move source '{}' was not found",
+            source.path
+        );
+    }
+    Ok(sources)
+}
+
+fn flight_paths(staged_path: &Path, path: &FlightPath) -> Result<Vec<PathBuf>> {
+    if !is_flight_glob(&path.path) {
+        return Ok(vec![resolve_flight_path(staged_path, path)?]);
+    }
+    expand_staged_glob(staged_path, &path.path)
+}
+
+fn expand_staged_glob(staged_path: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let mut matches = Vec::new();
+    let escaped_root = glob::Pattern::escape(staged_path.to_string_lossy().as_ref());
+    for pattern in expand_braces(pattern) {
+        validate_flight_relative_path(&pattern)?;
+        let rooted_pattern = Path::new(&escaped_root)
+            .join(Path::new(&pattern))
+            .to_string_lossy()
+            .to_string();
+        for path in glob::glob_with(
+            &rooted_pattern,
+            glob::MatchOptions {
+                require_literal_separator: true,
+                ..Default::default()
+            },
+        )
+        .wrap_err_with(|| format!("brew-cask: invalid structured flight glob '{pattern}'"))?
+        {
+            let path = path?;
+            if !path.starts_with(staged_path) {
+                bail!(
+                    "brew-cask: structured flight glob '{}' matched outside staged path",
+                    pattern
+                );
+            }
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn is_flight_glob(path: &str) -> bool {
+    path.chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+fn resolve_flight_path(staged_path: &Path, path: &FlightPath) -> Result<PathBuf> {
+    if path.base != FlightPathBase::StagedPath {
+        bail!("brew-cask: structured file operation must use staged_path");
+    }
+    validate_flight_relative_path(&path.path)?;
+    Ok(staged_path.join(&path.path))
+}
+
+fn resolve_flight_path_with_context(
+    path: &FlightPath,
+    staged_path: &Path,
+    appdir: &Path,
+) -> Result<PathBuf> {
+    let expanded = expand_cask_template(&path.path, staged_path, appdir, None);
+    Ok(match path.base {
+        FlightPathBase::StagedPath => staged_path.join(expanded),
+        FlightPathBase::AppDir => appdir.join(expanded),
+        FlightPathBase::HomebrewPrefix => prefix::prefix().join(expanded),
+        FlightPathBase::Absolute => PathBuf::from(expanded),
+    })
+}
+
+fn expand_cask_template(
+    value: &str,
+    staged_path: &Path,
+    appdir: &Path,
+    version: Option<&str>,
+) -> String {
+    let prefix = prefix::prefix();
+    let mut value = value
+        .replace("$HOMEBREW_PREFIX", &prefix.to_string_lossy())
+        .replace("$APPDIR", &appdir.to_string_lossy())
+        .replace("$HOME", &crate::dirs::HOME.to_string_lossy())
+        .replace("{{HOMEBREW_PREFIX}}", &prefix.to_string_lossy())
+        .replace("{{staged_path}}", &staged_path.to_string_lossy())
+        .replace("{{appdir}}", &appdir.to_string_lossy());
+    if let Some(version) = version {
+        value = value.replace("{{version}}", version);
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        value = crate::dirs::HOME.join(rest).to_string_lossy().to_string();
+    }
+    value
+}
+
+fn validate_flight_relative_path(path: &str) -> Result<()> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!(
+            "brew-cask: invalid structured flight path '{}'",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(start) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(end_offset) = pattern[start + 1..].find('}') else {
+        return vec![pattern.to_string()];
+    };
+    let end = start + 1 + end_offset;
+    let prefix = &pattern[..start];
+    let suffix = &pattern[end + 1..];
+    let mut expanded = Vec::new();
+    for alternative in pattern[start + 1..end].split(',') {
+        for suffix in expand_braces(suffix) {
+            expanded.push(format!("{prefix}{alternative}{suffix}"));
+        }
+    }
+    expanded
+}
+
 fn stage_binary(
     stage: &Path,
     caskroom: &Path,
@@ -1726,6 +2313,80 @@ fn stage_binary(
         target_fingerprint: None,
         identifiers: Vec::new(),
     })
+}
+
+fn stage_command_wrapper(
+    caskroom: &Path,
+    retained_caskroom: &Path,
+    appdir: &Path,
+    cask: &Cask,
+    wrapper: &CommandWrapperArtifact,
+) -> Result<CompletedCaskAction> {
+    let target = wrapper.caskroom_path(caskroom);
+    file::remove_all(&target)?;
+    if let Some(parent) = target.parent() {
+        file::create_dir_all(parent)?;
+    }
+    let content = match (&wrapper.content, &wrapper.executable) {
+        (Some(content), None) => expand_command_wrapper_content(content, appdir),
+        (None, Some(executable)) => {
+            let executable =
+                expand_command_wrapper_value(executable, retained_caskroom, appdir, cask);
+            let args = wrapper
+                .args
+                .iter()
+                .map(|arg| expand_command_wrapper_value(arg, retained_caskroom, appdir, cask))
+                .map(|arg| shell_escape::unix::escape(Cow::Owned(arg)).into_owned())
+                .collect::<Vec<_>>();
+            let env = wrapper
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    let value =
+                        expand_command_wrapper_value(value, retained_caskroom, appdir, cask);
+                    format!("{key}={}", shell_escape::unix::escape(Cow::Owned(value)))
+                })
+                .collect::<Vec<_>>();
+            let mut command = env;
+            command.push("exec".to_string());
+            command.push(shell_escape::unix::escape(Cow::Owned(executable)).into_owned());
+            command.extend(args);
+            command.push("\"$@\"".to_string());
+            format!("#!/bin/bash\n{}\n", command.join(" "))
+        }
+        _ => bail!(
+            "brew-cask: command_wrapper '{}' must set exactly one of content or executable",
+            wrapper.name
+        ),
+    };
+    file::write(&target, content)?;
+    file::make_executable(&target)?;
+    Ok(CompletedCaskAction {
+        id: format!("command-wrapper-stage:{}", wrapper.name),
+        kind: CaskActionKind::Binary,
+        operation: CaskActionOperation::Copy,
+        source: None,
+        target: Some(wrapper.caskroom_path(retained_caskroom)),
+        phase: CaskActionPhase::Completed,
+        mise_created: true,
+        target_fingerprint: None,
+        identifiers: Vec::new(),
+    })
+}
+
+fn expand_command_wrapper_content(value: &str, appdir: &Path) -> String {
+    value
+        .replace("$HOMEBREW_PREFIX", &prefix::prefix().to_string_lossy())
+        .replace("$APPDIR", &appdir.to_string_lossy())
+}
+
+fn expand_command_wrapper_value(
+    value: &str,
+    retained_caskroom: &Path,
+    appdir: &Path,
+    cask: &Cask,
+) -> String {
+    expand_cask_template(value, retained_caskroom, appdir, Some(&cask.version))
 }
 
 fn find_binary_source(
@@ -1814,14 +2475,43 @@ fn link_binary(caskroom: &Path, binary: &BinaryArtifact) -> Result<CompletedCask
     }
     let target = binary.target_path()?;
     if let Some(parent) = target.parent() {
-        file::create_dir_all(parent)?;
+        create_dir_all_elevating(parent)?;
     }
-    file::make_symlink(&caskroom_binary, &target)?;
+    make_symlink_elevating(&caskroom_binary, &target)?;
     Ok(CompletedCaskAction {
         id: format!("binary:{}", binary.target_name()?),
         kind: CaskActionKind::Binary,
         operation: CaskActionOperation::Symlink,
         source: Some(caskroom_binary),
+        target: Some(target),
+        phase: CaskActionPhase::Completed,
+        mise_created: true,
+        target_fingerprint: None,
+        identifiers: Vec::new(),
+    })
+}
+
+fn link_command_wrapper(
+    caskroom: &Path,
+    wrapper: &CommandWrapperArtifact,
+) -> Result<CompletedCaskAction> {
+    let source = wrapper.caskroom_path(caskroom);
+    if !source.is_file() {
+        bail!(
+            "brew-cask: command wrapper '{}' was not staged",
+            wrapper.name
+        );
+    }
+    let target = wrapper.target_path()?;
+    if let Some(parent) = target.parent() {
+        create_dir_all_elevating(parent)?;
+    }
+    make_symlink_elevating(&source, &target)?;
+    Ok(CompletedCaskAction {
+        id: format!("command-wrapper:{}", wrapper.name),
+        kind: CaskActionKind::Binary,
+        operation: CaskActionOperation::Symlink,
+        source: Some(source),
         target: Some(target),
         phase: CaskActionPhase::Completed,
         mise_created: true,
@@ -1859,6 +2549,14 @@ fn cask_artifacts(cask: &Cask) -> Result<CaskArtifacts> {
     let mut artifacts = CaskArtifacts::default();
     for artifact in &cask.artifacts {
         let artifact_type = artifact_type(artifact);
+        if let Some(steps) = parse_flight_steps(cask, artifact, "preflight_steps")? {
+            artifacts.preflight_steps.extend(steps);
+            continue;
+        }
+        if let Some(steps) = parse_flight_steps(cask, artifact, "postflight_steps")? {
+            artifacts.postflight_steps.extend(steps);
+            continue;
+        }
         if let Some(completion) = parse_shell_completion_artifact(artifact, &artifact_type) {
             artifacts.binaries.push(completion);
             continue;
@@ -1879,6 +2577,10 @@ fn cask_artifacts(cask: &Cask) -> Result<CaskArtifacts> {
             artifacts.binaries.push(binary);
             continue;
         }
+        if let Some(wrapper) = parse_command_wrapper_artifact(artifact)? {
+            artifacts.command_wrappers.push(wrapper);
+            continue;
+        }
         if let Some(pkg) = parse_pkg_artifact(artifact)? {
             artifacts.pkgs.push(pkg);
             continue;
@@ -1895,6 +2597,7 @@ fn cask_artifacts(cask: &Cask) -> Result<CaskArtifacts> {
     }
     if artifacts.apps.is_empty()
         && artifacts.binaries.is_empty()
+        && artifacts.command_wrappers.is_empty()
         && artifacts.pkgs.is_empty()
         && artifacts.fonts.is_empty()
     {
@@ -1960,6 +2663,106 @@ fn parse_binary_artifact(value: &Value) -> Option<BinaryArtifact> {
         }
         _ => None,
     }
+}
+
+fn parse_command_wrapper_artifact(value: &Value) -> Result<Option<CommandWrapperArtifact>> {
+    let Some(wrapper) = value.as_object().and_then(|o| o.get("command_wrapper")) else {
+        return Ok(None);
+    };
+    let values = wrapper
+        .as_array()
+        .ok_or_else(|| eyre!("brew-cask: command_wrapper metadata must be an array"))?;
+    let name = values
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("brew-cask: command_wrapper requires a command name"))?;
+    SafePathComponent::parse("command wrapper name", name)?;
+    let options = values
+        .get(1)
+        .and_then(Value::as_object)
+        .ok_or_else(|| eyre!("brew-cask: command_wrapper requires options"))?;
+    let mut unsupported = options
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "content" | "executable" | "args" | "env"))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    if !unsupported.is_empty() {
+        bail!(
+            "brew-cask: command_wrapper has unsupported option {}",
+            unsupported.join(", ")
+        );
+    }
+    let content = options
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let executable = options
+        .get("executable")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match (content.is_some(), executable.is_some()) {
+        (false, false) => bail!("brew-cask: command_wrapper requires content or executable"),
+        (true, true) => {
+            bail!("brew-cask: command_wrapper requires content or executable, not both")
+        }
+        _ => {}
+    }
+    let args = options
+        .get("args")
+        .map(|args| {
+            args.as_array()
+                .ok_or_else(|| eyre!("brew-cask: command_wrapper args must be an array"))?
+                .iter()
+                .map(|arg| {
+                    arg.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| eyre!("brew-cask: command_wrapper args must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let env = options
+        .get("env")
+        .map(|env| {
+            env.as_object()
+                .ok_or_else(|| eyre!("brew-cask: command_wrapper env must be an object"))?
+                .iter()
+                .map(|(key, value)| {
+                    if !is_shell_env_name(key) {
+                        bail!("brew-cask: invalid command_wrapper environment name '{key}'");
+                    }
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_string()))
+                        .ok_or_else(|| {
+                            eyre!("brew-cask: command_wrapper environment values must be strings")
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if content.is_some() && (!args.is_empty() || !env.is_empty()) {
+        bail!("brew-cask: command_wrapper args and env require executable");
+    }
+    Ok(Some(CommandWrapperArtifact {
+        name: name.to_string(),
+        target: artifact_target(value, values),
+        content,
+        executable,
+        args,
+        env,
+    }))
+}
+
+fn is_shell_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn parse_shell_completion_artifact(value: &Value, kind: &str) -> Option<BinaryArtifact> {
@@ -2066,6 +2869,390 @@ fn parse_generated_completion_artifact(
         shell_parameter_format,
         shells,
     }))
+}
+
+fn parse_flight_steps(cask: &Cask, value: &Value, kind: &str) -> Result<Option<Vec<FlightStep>>> {
+    let Some(metadata) = value.as_object().and_then(|o| o.get(kind)) else {
+        return Ok(None);
+    };
+    let groups = metadata.as_array().ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} metadata format",
+            cask.token
+        )
+    })?;
+    let mut steps = Vec::new();
+    for group in groups {
+        let group = group.as_object().ok_or_else(|| {
+            eyre!(
+                "brew-cask:{}: unsupported {kind} metadata format",
+                cask.token
+            )
+        })?;
+        reject_unsupported_flight_fields(cask, kind, "step group", group, &["steps"])?;
+        let group_steps = group
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                eyre!(
+                    "brew-cask:{}: unsupported {kind} metadata format",
+                    cask.token
+                )
+            })?;
+        for step in group_steps {
+            steps.push(parse_flight_step(cask, kind, step)?);
+        }
+    }
+    Ok(Some(steps))
+}
+
+fn parse_flight_step(cask: &Cask, kind: &str, value: &Value) -> Result<FlightStep> {
+    let object = value.as_object().ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} step metadata format",
+            cask.token
+        )
+    })?;
+    let step_type = object.get("type").and_then(Value::as_str).ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} step metadata format",
+            cask.token
+        )
+    })?;
+    match step_type {
+        "move" => {
+            reject_unsupported_flight_fields(
+                cask,
+                kind,
+                "move step",
+                object,
+                &["type", "source", "target", "source_glob"],
+            )?;
+            Ok(FlightStep::Move {
+                source: parse_flight_path(cask, kind, "source", object.get("source"))?,
+                target: parse_flight_path(cask, kind, "target", object.get("target"))?,
+                source_glob: object
+                    .get("source_glob")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        "remove" => {
+            reject_unsupported_flight_fields(
+                cask,
+                kind,
+                "remove step",
+                object,
+                &["type", "paths", "recursive"],
+            )?;
+            let paths = object
+                .get("paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    eyre!(
+                        "brew-cask:{}: unsupported {kind} remove step metadata format",
+                        cask.token
+                    )
+                })?
+                .iter()
+                .map(|path| parse_flight_path(cask, kind, "paths", Some(path)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FlightStep::Remove {
+                paths,
+                recursive: object
+                    .get("recursive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        "run" => {
+            reject_unsupported_flight_fields(
+                cask,
+                kind,
+                "run step",
+                object,
+                &["type", "command", "args", "env", "sudo", "guards"],
+            )?;
+            let args = object
+                .get("args")
+                .map(|args| {
+                    args.as_array()
+                        .ok_or_else(|| {
+                            eyre!(
+                                "brew-cask:{}: unsupported {kind} run args metadata format",
+                                cask.token
+                            )
+                        })?
+                        .iter()
+                        .map(|arg| {
+                            arg.as_str().map(str::to_string).ok_or_else(|| {
+                                eyre!(
+                                    "brew-cask:{}: unsupported {kind} run argument metadata format",
+                                    cask.token
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let env = object
+                .get("env")
+                .map(|env| {
+                    env.as_object()
+                        .ok_or_else(|| {
+                            eyre!(
+                                "brew-cask:{}: unsupported {kind} run env metadata format",
+                                cask.token
+                            )
+                        })?
+                        .iter()
+                        .map(|(key, value)| {
+                            if !is_shell_env_name(key) {
+                                bail!("brew-cask: invalid {kind} run environment name '{key}'");
+                            }
+                            value
+                                .as_str()
+                                .map(|value| (key.clone(), value.to_string()))
+                                .ok_or_else(|| {
+                                    eyre!(
+                                        "brew-cask:{}: unsupported {kind} run env value metadata format",
+                                        cask.token
+                                    )
+                                })
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let guards = object
+                .get("guards")
+                .map(|guards| {
+                    guards
+                        .as_array()
+                        .ok_or_else(|| {
+                            eyre!(
+                                "brew-cask:{}: unsupported {kind} run guards metadata format",
+                                cask.token
+                            )
+                        })?
+                        .iter()
+                        .map(|guard| parse_flight_guard(cask, kind, guard))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(FlightStep::Run {
+                command: parse_run_command(cask, kind, object.get("command"))?,
+                args,
+                env,
+                sudo: object.get("sudo").and_then(Value::as_bool).unwrap_or(false),
+                guards,
+            })
+        }
+        _ => bail!(
+            "brew-cask:{}: unsupported {kind} step type {}",
+            cask.token,
+            step_type
+        ),
+    }
+}
+
+fn parse_run_command(cask: &Cask, kind: &str, value: Option<&Value>) -> Result<FlightPath> {
+    let object = value.and_then(Value::as_object).ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} run command metadata format",
+            cask.token
+        )
+    })?;
+    reject_unsupported_flight_fields(cask, kind, "run command", object, &["base", "path"])?;
+    let path = object.get("path").and_then(Value::as_str).ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} run command path",
+            cask.token
+        )
+    })?;
+    let base = match object.get("base").and_then(Value::as_str) {
+        Some("staged_path") => FlightPathBase::StagedPath,
+        Some("appdir") => FlightPathBase::AppDir,
+        Some("homebrew_prefix") => FlightPathBase::HomebrewPrefix,
+        Some(base) => bail!(
+            "brew-cask:{}: unsupported {kind} run command base {}",
+            cask.token,
+            base
+        ),
+        None => FlightPathBase::Absolute,
+    };
+    let path_value = Path::new(path);
+    let invalid_absolute_path = base == FlightPathBase::Absolute
+        && !path_value.is_absolute()
+        && path_value.components().count() > 1;
+    let invalid_based_path = matches!(
+        base,
+        FlightPathBase::StagedPath | FlightPathBase::AppDir | FlightPathBase::HomebrewPrefix
+    ) && (path_value.is_absolute()
+        || path_value
+            .components()
+            .any(|component| matches!(component, Component::ParentDir)));
+    if invalid_absolute_path || invalid_based_path {
+        bail!(
+            "brew-cask:{}: invalid {kind} run command path {}",
+            cask.token,
+            path
+        );
+    }
+    Ok(FlightPath {
+        base,
+        path: path.to_string(),
+    })
+}
+
+fn parse_flight_guard(cask: &Cask, kind: &str, value: &Value) -> Result<FlightGuard> {
+    let object = value.as_object().ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} run guard metadata format",
+            cask.token
+        )
+    })?;
+    reject_unsupported_flight_fields(
+        cask,
+        kind,
+        "run guard",
+        object,
+        &["condition", "value", "base", "path", "id"],
+    )?;
+    match object.get("condition").and_then(Value::as_str) {
+        Some("on") => match object.get("value").and_then(Value::as_str) {
+            Some("macos") => Ok(FlightGuard::OnMacos),
+            Some("linux") => Ok(FlightGuard::OnLinux),
+            Some(value) => bail!(
+                "brew-cask:{}: unsupported {kind} run guard platform {}",
+                cask.token,
+                value
+            ),
+            None => bail!(
+                "brew-cask:{}: unsupported {kind} run guard platform",
+                cask.token
+            ),
+        },
+        Some(condition @ ("if_exists" | "unless_exists")) => {
+            let path = parse_context_flight_path(cask, kind, "run guard", object)?;
+            if condition == "if_exists" {
+                Ok(FlightGuard::IfExists(path))
+            } else {
+                Ok(FlightGuard::UnlessExists(path))
+            }
+        }
+        Some(condition) => bail!(
+            "brew-cask:{}: unsupported {kind} run guard condition {}",
+            cask.token,
+            condition
+        ),
+        None => bail!(
+            "brew-cask:{}: unsupported {kind} run guard condition",
+            cask.token
+        ),
+    }
+}
+
+fn parse_context_flight_path(
+    cask: &Cask,
+    kind: &str,
+    field: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<FlightPath> {
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("brew-cask:{}: unsupported {kind} {field} path", cask.token))?;
+    let base = match object.get("base").and_then(Value::as_str) {
+        Some("staged_path") => FlightPathBase::StagedPath,
+        Some("appdir") => FlightPathBase::AppDir,
+        Some("homebrew_prefix") => FlightPathBase::HomebrewPrefix,
+        Some(base) => bail!(
+            "brew-cask:{}: unsupported {kind} {field} base {}",
+            cask.token,
+            base
+        ),
+        None => FlightPathBase::Absolute,
+    };
+    let path_value = Path::new(path);
+    if base != FlightPathBase::Absolute
+        && (path_value.is_absolute()
+            || path_value
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)))
+    {
+        bail!(
+            "brew-cask:{}: invalid {kind} {field} path {path}",
+            cask.token
+        );
+    }
+    Ok(FlightPath {
+        base,
+        path: path.to_string(),
+    })
+}
+
+fn reject_unsupported_flight_fields(
+    cask: &Cask,
+    kind: &str,
+    context: &str,
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<()> {
+    let mut unsupported = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    if !unsupported.is_empty() {
+        bail!(
+            "brew-cask:{}: unsupported {kind} {context} field {}",
+            cask.token,
+            unsupported.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn parse_flight_path(
+    cask: &Cask,
+    kind: &str,
+    field: &str,
+    value: Option<&Value>,
+) -> Result<FlightPath> {
+    let object = value.and_then(Value::as_object).ok_or_else(|| {
+        eyre!(
+            "brew-cask:{}: unsupported {kind} {field} metadata format",
+            cask.token
+        )
+    })?;
+    let base = match object.get("base").and_then(Value::as_str) {
+        Some("staged_path") => FlightPathBase::StagedPath,
+        Some(base) => bail!(
+            "brew-cask:{}: unsupported {kind} {field} base {}",
+            cask.token,
+            base
+        ),
+        None => bail!("brew-cask:{}: unsupported {kind} {field} base", cask.token),
+    };
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("brew-cask:{}: unsupported {kind} {field} path", cask.token))?;
+    if validate_flight_relative_path(path).is_err() {
+        bail!(
+            "brew-cask:{}: invalid {kind} {field} path {}",
+            cask.token,
+            path
+        )
+    }
+    Ok(FlightPath {
+        base,
+        path: path.to_string(),
+    })
 }
 
 fn parse_pkg_artifact(value: &Value) -> Result<Option<PkgArtifact>> {
@@ -2541,11 +3728,19 @@ fn pkg_ids_installed(pkg_ids: &[String]) -> Result<bool> {
 }
 
 fn binary_targets(artifacts: &CaskArtifacts) -> Result<Vec<PathBuf>> {
-    artifacts
+    let mut targets = artifacts
         .binaries
         .iter()
         .map(BinaryArtifact::target_path)
-        .collect::<Result<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()?;
+    targets.extend(
+        artifacts
+            .command_wrappers
+            .iter()
+            .map(CommandWrapperArtifact::target_path)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(targets)
 }
 
 fn previous_binary_targets(cask: &Cask) -> Result<Vec<PathBuf>> {
@@ -2668,6 +3863,11 @@ fn installed_cask_version(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Opti
                     return Ok(None);
                 }
             }
+            for wrapper in &artifacts.command_wrappers {
+                if !wrapper.target_path()?.exists() {
+                    return Ok(None);
+                }
+            }
             if !artifacts.pkgs.is_empty() && !pkg_ids_installed(&artifacts.pkg_ids)? {
                 return Ok(None);
             }
@@ -2737,6 +3937,97 @@ fn caskroom_version_dir(token: &SafePathComponent, version: &SafePathComponent) 
 fn caskroom_tmp_dir(ids: &CaskIds) -> PathBuf {
     let key = format!("{}-{}", ids.token.as_str(), ids.version.as_str());
     caskroom_token_dir(&ids.token).join(format!(".mise-tmp-{}", hash::hash_to_str(&key)))
+}
+
+fn caskroom_backup_dir(ids: &CaskIds) -> PathBuf {
+    let key = format!("{}-{}", ids.token.as_str(), ids.version.as_str());
+    caskroom_token_dir(&ids.token).join(format!(".mise-backup-{}", hash::hash_to_str(&key)))
+}
+
+#[derive(Debug)]
+struct ArtifactLinkBackup {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ArtifactLinkTransaction {
+    backups: Vec<ArtifactLinkBackup>,
+}
+
+impl ArtifactLinkTransaction {
+    fn begin(mut targets: Vec<PathBuf>) -> Result<Self> {
+        targets.sort();
+        targets.dedup();
+        let mut transaction = Self {
+            backups: Vec::with_capacity(targets.len()),
+        };
+        for target in targets {
+            let entry = (|| -> Result<ArtifactLinkBackup> {
+                let backup = if target.symlink_metadata().is_ok() {
+                    let parent = target
+                        .parent()
+                        .ok_or_else(|| eyre!("brew-cask: artifact target has no parent"))?;
+                    let backup = parent.join(format!(
+                        ".mise-link-backup-{}",
+                        hash::hash_to_str(&target.display().to_string())
+                    ));
+                    remove_artifact_target_elevating(&backup)?;
+                    rename_elevating(&target, &backup)?;
+                    Some(backup)
+                } else {
+                    None
+                };
+                Ok(ArtifactLinkBackup { target, backup })
+            })();
+            match entry {
+                Ok(entry) => transaction.backups.push(entry),
+                Err(err) => {
+                    if let Err(rollback_err) = transaction.rollback() {
+                        return Err(err.wrap_err(format!(
+                            "failed to restore artifact targets after backup failed: {rollback_err:#}"
+                        )));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(transaction)
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        let mut first_error = None;
+        for entry in self.backups.iter().rev() {
+            match remove_artifact_target_elevating(&entry.target) {
+                Ok(()) => {
+                    if let Some(backup) = &entry.backup
+                        && let Err(err) = rename_elevating(backup, &entry.target)
+                    {
+                        first_error.get_or_insert(err);
+                    }
+                }
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            self.backups.clear();
+            Ok(())
+        }
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        for entry in &self.backups {
+            if let Some(backup) = &entry.backup {
+                remove_artifact_target_elevating(backup)?;
+            }
+        }
+        self.backups.clear();
+        Ok(())
+    }
 }
 
 fn remove_stale_versions(token_dir: &Path, current_version: &SafePathComponent) -> Result<()> {
@@ -4189,6 +5480,45 @@ end
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn upgrades_app_with_protected_existing_contents() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let target = tmp.path().join("Docker.app");
+        let protected_dir = target.join("Contents/Resources");
+        file::create_dir_all(&protected_dir)?;
+        crate::file::write(protected_dir.join("docker"), "old")?;
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone deny delete_child"])
+            .arg(&protected_dir)
+            .status()?;
+        assert!(status.success());
+
+        let tmp_target = tmp.path().join("Docker.mise-tmp-test");
+        file::create_dir_all(&tmp_target)?;
+        crate::file::write(tmp_target.join("version"), "new")?;
+
+        let result = swap_app(&target, &tmp_target);
+
+        // Remove the ACL so tempfile can clean up even when the repro fails.
+        let old_target = target.with_extension(format!(
+            "mise-old-{}",
+            crate::hash::hash_to_str(&target.display().to_string())
+        ));
+        if old_target.exists() {
+            let status = std::process::Command::new("chmod")
+                .arg("-RN")
+                .arg(&old_target)
+                .status()?;
+            assert!(status.success());
+        }
+
+        result?;
+        assert_eq!(crate::file::read_to_string(target.join("version"))?, "new");
+        assert!(!old_target.exists());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn remove_obsolete_binary_links_removes_only_caskroom_symlinks() -> Result<()> {
@@ -5010,6 +6340,147 @@ end
         let linked = link_binary(&caskroom, &binary)?;
         assert_eq!(linked.operation, CaskActionOperation::Symlink);
         assert_eq!(linked.target, Some(binary.target_path()?));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_command_wrapper_and_structured_flight_steps() -> Result<()> {
+        let mut cask = test_cask("example", "1.0.0");
+        cask.artifacts = vec![
+            serde_json::json!({
+                "command_wrapper": ["example", {
+                    "executable": "$APPDIR/Example.app/Contents/MacOS/example",
+                    "args": ["--wrapped"],
+                    "env": {"EXAMPLE_MODE": "wrapped"}
+                }]
+            }),
+            serde_json::json!({
+                "preflight_steps": [{"steps": [{
+                    "type": "move",
+                    "source": {"base": "staged_path", "path": "old"},
+                    "target": {"base": "staged_path", "path": "new"}
+                }]}]
+            }),
+            serde_json::json!({
+                "postflight_steps": [{"steps": [{
+                    "type": "run",
+                    "command": {"path": "/usr/bin/true"},
+                    "guards": [{"condition": "on", "value": "macos"}]
+                }]}]
+            }),
+        ];
+        let artifacts = cask_artifacts(&cask)?;
+        assert_eq!(artifacts.command_wrappers.len(), 1);
+        assert!(matches!(
+            artifacts.preflight_steps[0],
+            FlightStep::Move { .. }
+        ));
+        assert!(matches!(
+            artifacts.postflight_steps[0],
+            FlightStep::Run { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn structured_flight_paths_reject_traversal() {
+        let cask = test_cask("example", "1.0.0");
+        let value = serde_json::json!({
+            "base": "staged_path",
+            "path": "../escape"
+        });
+        let err = parse_flight_path(&cask, "preflight_steps", "source", Some(&value))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid preflight_steps source path"));
+    }
+
+    #[test]
+    fn structured_move_and_remove_stay_in_stage() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        file::create_dir_all(tmp.path().join("source"))?;
+        file::write(tmp.path().join("source/file"), "payload")?;
+        let cask = test_cask("example", "1.0.0");
+        let appdir = tmp.path().join("Applications");
+        execute_flight_step(
+            &cask,
+            &FlightStep::Move {
+                source: FlightPath {
+                    base: FlightPathBase::StagedPath,
+                    path: "source/file".into(),
+                },
+                target: FlightPath {
+                    base: FlightPathBase::StagedPath,
+                    path: "moved".into(),
+                },
+                source_glob: false,
+            },
+            tmp.path(),
+            &appdir,
+        )?;
+        assert_eq!(file::read_to_string(tmp.path().join("moved"))?, "payload");
+        execute_flight_step(
+            &cask,
+            &FlightStep::Remove {
+                paths: vec![FlightPath {
+                    base: FlightPathBase::StagedPath,
+                    path: "moved".into(),
+                }],
+                recursive: false,
+            },
+            tmp.path(),
+            &appdir,
+        )?;
+        assert!(!tmp.path().join("moved").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_wrapper_stage_and_link_emit_completed_actions() -> Result<()> {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("example", "1.0.0");
+        let ids = test_ids(&cask.token, &cask.version);
+        let staged = caskroom_tmp_dir(&ids);
+        let retained = caskroom_version_dir(&ids.token, &ids.version);
+        file::create_dir_all(&staged)?;
+        let wrapper = CommandWrapperArtifact {
+            name: "example".into(),
+            target: None,
+            content: Some("#!/bin/sh\nexit 0\n".into()),
+            executable: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let staged_action = stage_command_wrapper(
+            &staged,
+            &retained,
+            Path::new("/Applications"),
+            &cask,
+            &wrapper,
+        )?;
+        assert_eq!(staged_action.operation, CaskActionOperation::Copy);
+        file::create_dir_all(retained.parent().expect("token dir"))?;
+        file::rename(&staged, &retained)?;
+        let linked_action = link_command_wrapper(&retained, &wrapper)?;
+        assert_eq!(linked_action.operation, CaskActionOperation::Symlink);
+        assert_eq!(linked_action.target, Some(wrapper.target_path()?));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_link_transaction_restores_previous_target() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let target = tmp.path().join("bin/example");
+        file::create_dir_all(target.parent().expect("bin dir"))?;
+        file::write(&target, "previous")?;
+        let mut transaction = ArtifactLinkTransaction::begin(vec![target.clone()])?;
+        file::write(&target, "replacement")?;
+        transaction.rollback()?;
+        assert_eq!(file::read_to_string(target)?, "previous");
         Ok(())
     }
 }

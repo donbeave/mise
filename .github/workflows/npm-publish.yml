@@ -35,7 +35,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Download release artifacts
         env:
@@ -75,7 +75,7 @@ jobs:
         # auth into ~/.npmrc — aube reads the same file when it PUTs the
         # tarball, so this step is still needed even though npm itself is not
         # the publish client.
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24.x"
           registry-url: "https://registry.npmjs.org"

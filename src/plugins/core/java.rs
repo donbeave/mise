@@ -529,10 +529,6 @@ impl Backend for JavaPlugin {
         })
     }
 
-    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(vec![".java-version".into(), ".sdkmanrc".into()])
-    }
-
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let contents = file::read_to_string(path)?;
         if path.file_name() == Some(".sdkmanrc".as_ref()) {
@@ -559,7 +555,7 @@ impl Backend for JavaPlugin {
                 "tem" => "temurin",
                 _ => vendor, // either same vendor name or unsupported
             };
-            let mut version = version.split(['+', '-'].as_ref()).collect::<Vec<&str>>()[0];
+            let mut version = version.split(['+', '-']).collect::<Vec<&str>>()[0];
             // if vendor is zulu, we can only match the major version
             if vendor == "zulu" {
                 version = version.split_once('.').unwrap_or_default().0;

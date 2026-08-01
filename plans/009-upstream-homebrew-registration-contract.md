@@ -249,16 +249,16 @@ boundary; no external side effect occurred without authorization.
 
 ## Done criteria
 
-- [ ] Current upstream has been searched and evidence pinned to a commit.
-- [ ] Every requested capability maps to a reproducible Plan 012 failure.
-- [ ] The proposal contains no operation beyond the minimum coherent fix.
-- [ ] Ownership, locking, linearization, retry, migration, and security are
+- [x] Current upstream has been searched and evidence pinned to a commit.
+- [x] Every requested capability maps to a reproducible Plan 012 failure.
+- [x] The proposal contains no operation beyond the minimum coherent fix.
+- [x] Ownership, locking, linearization, retry, migration, and security are
       explicit for every selected operation.
-- [ ] Every original G1-G7 goal has an honest supported/conditional/impossible
+- [x] Every original G1-G7 goal has an honest supported/conditional/impossible
       result under both accepted and declined outcomes.
-- [ ] Local maintainer decision is recorded.
-- [ ] No upstream contact occurred without explicit authorization.
-- [ ] `rtk git diff --check` emits no output.
+- [x] Local maintainer decision is recorded.
+- [x] No upstream contact occurred without explicit authorization.
+- [x] `rtk git diff --check` emits no output.
 
 ## STOP conditions
 

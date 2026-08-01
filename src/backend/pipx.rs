@@ -20,7 +20,7 @@ use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset, Tool
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use async_trait::async_trait;
-use eyre::{Result, eyre};
+use eyre::{Result, bail, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use jiff::Timestamp;
@@ -29,7 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fmt::Debug, sync::Arc};
 use versions::Versioning;
@@ -284,24 +286,69 @@ impl Backend for PIPXBackend {
         let options = PipxOptions::new(&request_options);
 
         // Check if pipx is available (unless uvx is being used)
-        let uv_program = if Settings::get().pipx.uvx != Some(false) && !options.uvx_disabled() {
-            self.dependency_path_for_install(&ctx.config, Some(&ctx.ts), "uv")
+        //
+        // Asks for a *spawnable* uv, because this both picks the branch and supplies the
+        // program `uvx_cmd` hands to `CmdLineRunner`. A `uv.ps1` or a shebang-only `uv`
+        // satisfies the plain lookup, so mise would commit to the uv branch and then fail
+        // at process creation; treating it as absent falls through to pipx, which either
+        // works or reports the install instructions below. The branch only changes in the
+        // case where the branch it would have taken cannot run.
+        let uvx_allowed = Settings::get().pipx.uvx != Some(false) && !options.uvx_disabled();
+        let uv_program = if uvx_allowed {
+            self.spawnable_dependency(&ctx.config, Some(&ctx.ts), "uv")
                 .await
         } else {
             None
         };
 
         if uv_program.is_none() {
-            self.warn_if_dependency_missing(
-                &ctx.config,
-                "pipx",
-                &["pipx"],
-                "To use pipx packages with mise, you need to install pipx first:\n\
-                  mise use pipx@latest\n\n\
-                Alternatively, you can use uv/uvx by installing uv:\n\
-                  mise use uv@latest",
-            )
-            .await;
+            // Only offer uv as an alternative when this package can actually use it.
+            // Packages that set `uvx = false` (or a `pipx.uvx = false` setting) always go
+            // through pipx, so pointing at uv there just sends people down a dead end.
+            let instructions = if uvx_allowed {
+                "To use pipx packages with mise, you need to install pipx first:\n  \
+                   mise use pipx@latest\n\n\
+                 Alternatively, you can use uv/uvx by installing uv:\n  \
+                   mise use uv@latest"
+                    .to_string()
+            } else {
+                let reason = if options.uvx_disabled() {
+                    "this package sets `uvx = false`"
+                } else {
+                    "uvx is disabled by the `pipx.uvx` setting"
+                };
+                format!(
+                    "This package is installed with pipx because {reason}, so uv/uvx cannot be \
+                     used for it.\n\nInstall pipx first:\n  mise use pipx@latest"
+                )
+            };
+            self.warn_if_dependency_missing(&ctx.config, "pipx", &["pipx"], &instructions)
+                .await;
+
+            // Fail with the instructions above rather than letting `pipx install` die with a
+            // bare "No such file or directory (os error 2)". Skipped when a configured tool
+            // provides pipx, since mise installs that first — same rule as the warning.
+            //
+            // The gate asks `spawnable_dependency`, the same question `spawn_program` asks
+            // below, so it cannot pass on evidence the spawn will then reject. On Windows a
+            // `pipx.ps1` or a shebang-only `pipx.pyz` satisfies the plain lookup but cannot
+            // be launched, and it used to reach `pipx install` and die with
+            // "program not found" instead of these instructions.
+            let pipx_configured = match self.dependency_toolset(&ctx.config).await {
+                Ok(ts) => ts.versions.keys().any(|ba| ba.short == "pipx"),
+                Err(_) => false,
+            };
+            if !pipx_configured
+                && self
+                    .spawnable_dependency(&ctx.config, Some(&ctx.ts), "pipx")
+                    .await
+                    .is_none()
+            {
+                bail!(
+                    "pipx is required to install {} but was not found.\n\n{instructions}",
+                    self.ba()
+                );
+            }
         }
 
         let pipx_request = self
@@ -578,7 +625,11 @@ impl PIPXBackend {
         ts: &Toolset,
         pr: &'a dyn SingleReport,
     ) -> Result<CmdLineRunner<'a>> {
-        let mut cmd = CmdLineRunner::new("pipx");
+        // Resolved rather than a bare "pipx": on Windows std only appends `.exe`, so a
+        // pipx that exists only as `pipx.cmd` — how scoop and `pip install pipx` leave it —
+        // cleared mise's dependency check and then died at the spawn (discussion #5333).
+        // Same question the `bail!` gate in `install_version_` asks, so the two agree.
+        let mut cmd = CmdLineRunner::new(b.spawn_program(config, Some(ts), "pipx").await);
         for arg in args {
             cmd = cmd.arg(arg);
         }

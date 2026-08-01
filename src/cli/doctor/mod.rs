@@ -1,6 +1,6 @@
 mod path;
 
-use crate::{exit, plugins::PluginEnum};
+use crate::plugins::PluginEnum;
 use std::collections::HashSet;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -252,7 +252,7 @@ impl Doctor {
         println!("{out}");
 
         if !self.errors.is_empty() {
-            exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }
@@ -343,7 +343,7 @@ impl Doctor {
                 let num = style::nred(format!("{}.", i + 1));
                 miseprintln!("{num} {}\n", info::indent_by(check, "   ").trim_start());
             }
-            exit(1);
+            return Err(crate::request_exit(1));
         }
 
         Ok(())
@@ -426,7 +426,7 @@ impl Doctor {
                 && !plugin.is_installed()
             {
                 self.errors
-                    .push(format!("plugin {} is not installed", &plugin.name()));
+                    .push(format!("plugin {} is not installed", plugin.name()));
                 continue;
             }
         }
@@ -823,7 +823,7 @@ impl Doctor {
 
             if is_core && matches!(plugin_type, Some(PluginType::Asdf | PluginType::Vfox)) {
                 self.warnings
-                    .push(format!("plugin {} overrides a core plugin", &plugin.id()));
+                    .push(format!("plugin {} overrides a core plugin", plugin.id()));
             }
         }
     }
@@ -1101,7 +1101,13 @@ async fn render_env_files(config: &Arc<Config>) -> eyre::Result<String> {
 fn render_backends() -> String {
     BackendType::iter()
         .filter(|b| b != &BackendType::Unknown)
-        .map(|b| b.to_string())
+        .map(|b| {
+            if backend::is_disabled_backend_type(&b) {
+                format!("{b} {}", style::ndim("(disabled)"))
+            } else {
+                b.to_string()
+            }
+        })
         .join("\n")
 }
 

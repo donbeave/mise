@@ -1,4 +1,4 @@
-FROM ubuntu:resolute-20260627@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
+FROM ubuntu:resolute-20260707@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
 
 LABEL maintainer="jdx"
 LABEL org.opencontainers.image.source=https://github.com/jdx/mise
@@ -25,7 +25,6 @@ apt-get update && apt-get install -y --no-install-recommends \
     curl \
     default-jdk-headless \
     direnv \
-    fd-find \
     fish \
     git \
     jq \
@@ -54,8 +53,6 @@ apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     zlib1g-dev \
     zsh
-
-ln -sf /usr/bin/fdfind /usr/bin/fd
 
 # Install Node.js to /opt/node (not /usr/bin) so test_backend_missing_deps
 # can verify missing-npm behavior with its restricted PATH=/usr/bin:/bin

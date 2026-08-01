@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = [
   "crates/vfox",
   "crates/aqua-registry",
@@ -9,7 +10,7 @@ members = [
 
 [package]
 name = "mise"
-version = "2026.7.11"
+version = "2026.7.18"
 edition = "2024"
 description = "Dev tools, env vars, and tasks in one CLI"
 authors = ["Jeff Dickey (@jdx)"]
@@ -58,17 +59,18 @@ path = "src/main.rs"
 [profile.serious]
 inherits = "release"
 lto = true
+panic = "abort"
 
 [profile.dev.package.backtrace]
 opt-level = 3
 
 [dependencies]
-age = { version = "0.11", features = ["ssh"] }
+age = { version = "0.12", features = ["ssh"] }
 aho-corasick = "1"
-aube-registry = { version = "1.32", default-features = false, features = [
+aube-registry = { version = "1.37", default-features = false, features = [
   "rustls",
 ] }
-aube = { version = "1.32", default-features = false, features = ["rustls"] }
+aube = { version = "1.37", default-features = false, features = ["rustls"] }
 async-backtrace = "0.2"
 async-trait = "0.1"
 aws-config = { version = "1.5", default-features = false, features = [
@@ -121,7 +123,7 @@ heck = "0.5"
 hex = "0.4"
 indenter = "0.3"
 indexmap = { version = "2", features = ["serde"] }
-clx = "2"
+clx = "3"
 indoc = "2"
 itertools = "0.15"
 jdx-tar = "1.1.0"
@@ -137,7 +139,7 @@ nucleo-matcher = "0.3"
 num_cpus = "1"
 once_cell = "1"
 openssl = { version = "0.10", optional = true }
-path-absolutize = { version = "3", features = ["unsafe_cache"] }
+path-absolutize = "4"
 petgraph = "0.8"
 pgp = "0.20"
 phf = "0.14"
@@ -175,10 +177,12 @@ rops = { version = "0.1", default-features = false, features = [
   "toml",
   "age",
 ] }
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
 serde_yaml = "0.9"
+semver = "1"
 sevenz-rust2 = "0.20"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -212,10 +216,12 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = { version = "1.0", features = ["parse", "preserve_order"] }
 toml_edit = { version = "0.25", features = ["parse"] }
-ubi = { version = "0.9", default-features = false }
+# 1.28.0 requires Rust 1.97, newer than mise's MSRV.
+tree-sitter-iter = "=1.27.0"
+ubi = { version = "0.10", default-features = false }
 url = "2"
 urlencoding = "2"
-usage-lib = { version = "3", features = ["clap", "docs"] }
+usage-lib = { version = "4", features = ["clap", "docs"] }
 versions = { version = "7", features = ["serde"] }
 vfox = { path = "crates/vfox", default-features = false }
 aqua-registry = { path = "crates/aqua-registry" }
@@ -235,7 +241,6 @@ self_update = { version = "0.44", optional = true, default-features = false, fea
   "compression-flate2",
   "signatures",
   "reqwest",
-  "rustls",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -248,7 +253,6 @@ self_update = { version = "0.44", optional = true, default-features = false, fea
   "compression-zip-deflate",
   "signatures",
   "reqwest",
-  "rustls",
 ] }
 zipsign-api = "0.2"
 winapi = { version = "0.3.9", features = ["consoleapi", "minwindef"] }
@@ -284,6 +288,7 @@ native-tls = [
   "ubi/native-tls",
   "vfox/native-tls",
   "xx/native-tls",
+  "self_update?/default-tls",
 ]
 rustls = [
   "gix/blocking-http-transport-reqwest-rust-tls",
@@ -294,6 +299,7 @@ rustls = [
   "ubi/rustls-tls",
   "vfox/rustls",
   "xx/rustls",
+  "self_update?/rustls",
 ]
 rustls-native-roots = [
   "gix/blocking-http-transport-reqwest-rust-tls",
@@ -301,9 +307,10 @@ rustls-native-roots = [
   "rattler/rustls",
   "rattler_repodata_gateway/rustls",
   "mise-sigstore/rustls",
-  "ubi/rustls-tls-native-roots",
+  "ubi/rustls-tls",
   "vfox/rustls-native-roots",
   "xx/rustls-native-roots",
+  "self_update?/rustls",
 ]
 
 [package.metadata.binstall]
@@ -320,7 +327,14 @@ pkg-url = "{ repo }/releases/download/v{ version }/mise-v{version}-linux-x64{ ar
 pkg-url = "{ repo }/releases/download/v{ version }/mise-v{version}-linux-armv7{ archive-suffix }"
 
 [package.metadata.cargo-machete]
-ignored = ["aws-lc-rs", "built", "cfg_aliases", "openssl", "phf_codegen"]
+ignored = [
+  "aws-lc-rs",
+  "built",
+  "cfg_aliases",
+  "openssl",
+  "phf_codegen",
+  "tree-sitter-iter",
+]
 
 [package.metadata.release]
 pre-release-replacements = [
@@ -332,9 +346,6 @@ pre-release-replacements = [
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(coverage,coverage_nightly)',
 ] }
-
-[lints.clippy]
-borrowed_box = "allow"
 
 [profile.dev]
 debug = 1

@@ -1,5 +1,9 @@
 # Plan 008: Give every cask ownership state a safe recovery path
 
+> **ARCHIVED — NON-EXECUTABLE.** No implementation or execution is authorized.
+> Historical rationale below is superseded by Plan 012 and the mise-only
+> ownership contract.
+
 **2026-07-23 supersession note**: Base diagnosis on Plan 013's recorded facts
 and Plan 012's handoff phases. Add a healthy, explicit withdrawal path from
 `Externalized` ownership; recovery is not only repair of broken synthetic

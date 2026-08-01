@@ -2,6 +2,7 @@
 # `mise self-update`
 
 - **Usage**: `mise self-update [FLAGS] [VERSION]`
+- **Effect**: modifies state
 - **Source code**: [`src/cli/self_update.rs`](https://github.com/jdx/mise/blob/main/src/cli/self_update.rs)
 
 Updates mise itself.
@@ -10,7 +11,9 @@ Uses the GitHub Releases API to find the latest release and binary.
 By default, this will also update any installed plugins.
 Uses mise's GitHub token resolution chain for authenticated requests.
 
-This command is not available if mise is installed via a package manager.
+Packagers can disable this command so that mise is updated through the
+package manager instead. See
+<https://mise.en.dev/contributing.html#packaging-and-self-update-instructions>
 
 ## Arguments
 

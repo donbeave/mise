@@ -1,5 +1,4 @@
 #![allow(unknown_lints)]
-#![allow(clippy::literal_string_with_formatting_args)]
 use std::fmt::Display;
 
 use indoc::formatdoc;
@@ -71,7 +70,7 @@ impl Shell for Zsh {
               # zsh/parameter module via dlopen, which can deadlock under
               # Rosetta in login shells (https://github.com/jdx/mise/discussions/11187)
               local -a keys=(${{(o)${{(f)"$(typeset +m 'MISE_*' 2>/dev/null)"}}##* }})
-              if (( $#keys > 0 )); then
+              if (( ${{#keys}} > 0 )); then
                 typeset -p "${{keys[@]}}" 2>/dev/null
               fi
             }}

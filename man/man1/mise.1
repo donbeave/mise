@@ -144,18 +144,30 @@ List all the active runtime bin paths
 .TP
 \fBbootstrap\fR
 Set up a machine for the current config in one command
+.RS
+\fIAliases: \fRbs
+.RE
 .TP
 \fBbootstrap dotfiles\fR
 Manage dotfiles from `[dotfiles]`
 .TP
+\fBbootstrap dotfiles add\fR
+Add or update dotfiles in `[dotfiles]`
+.TP
 \fBbootstrap dotfiles apply\fR
 Apply dotfiles from `[dotfiles]`
+.TP
+\fBbootstrap dotfiles edit\fR
+Edit a managed dotfile source
 .TP
 \fBbootstrap dotfiles status\fR
 Show the status of dotfiles from `[dotfiles]`
 .RS
 \fIAliases: \fRls
 .RE
+.TP
+\fBbootstrap dotfiles unapply\fR
+Remove dotfiles applied from `[dotfiles]`
 .TP
 \fBbootstrap linux\fR
 Manage Linux bootstrap config from `[bootstrap.linux]`
@@ -311,24 +323,6 @@ Set the value of a setting in a mise.toml file
 .TP
 \fBdeactivate\fR
 Disable mise for current shell session
-.TP
-\fBdotfiles\fR
-Manage dotfiles from `[dotfiles]`
-.TP
-\fBdotfiles add\fR
-Add or update dotfiles in `[dotfiles]`
-.TP
-\fBdotfiles apply\fR
-Apply dotfiles from `[dotfiles]`
-.TP
-\fBdotfiles edit\fR
-Edit a managed dotfile source
-.TP
-\fBdotfiles status\fR
-Show the status of dotfiles from `[dotfiles]`
-.RS
-\fIAliases: \fRls
-.RE
 .TP
 \fBdoctor\fR
 Check mise installation for possible problems
@@ -614,6 +608,9 @@ Display a tree visualization of a dependency graph
 .TP
 \fBtasks edit\fR
 Edit a task with $EDITOR
+.TP
+\fBtasks graph\fR
+[experimental] Inspect the workspace project graph
 .TP
 \fBtasks info\fR
 Get information about a task
@@ -917,6 +914,49 @@ Can be passed multiple times or as a comma\-separated list.
 .TP
 \fB\-\-update\fR
 Refresh package manager metadata and update configured repos
+.SH "MISE BOOTSTRAP DOTFILES ADD"
+Add or update dotfiles in `[dotfiles]`
+
+If the target is already managed, this updates its source from the live
+target. Otherwise it creates a `[dotfiles]` entry and seeds the source
+under `dotfiles.root` unless `\-\-source` is provided.
+.PP
+\fBUsage:\fR mise bootstrap dotfiles add [OPTIONS] <TARGET> ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-f, \-\-force\fR
+Overwrite existing sources without prompting
+.TP
+\fB\-g, \-\-global\fR
+Write to the global config
+.TP
+\fB\-l, \-\-local\fR
+Write to the local config instead of the global config
+.TP
+\fB\-m, \-\-mode\fR \fI<MODE>\fR
+Dotfile mode to write
+.TP
+\fB\-n, \-\-dry\-run\fR
+Print the config/source updates without writing anything
+.TP
+\fB\-\-no\-apply\fR
+Add the entry without applying it
+.TP
+\fB\-p, \-\-path\fR \fI<PATH>\fR
+Write to this config file or directory
+.TP
+\fB\-s, \-\-source\fR \fI<PATH>\fR
+Source path to use for a single target
+.TP
+\fB\-y, \-\-yes\fR
+Skip the confirmation prompt
+\fBArguments:\fR
+.PP
+.TP
+\fB<TARGET>\fR
+Targets to add or update
 .SH "MISE BOOTSTRAP DOTFILES APPLY"
 Apply dotfiles from `[dotfiles]`
 
@@ -943,6 +983,30 @@ Skip the confirmation prompt
 .TP
 \fB<TARGET>\fR
 Only apply these targets
+.SH "MISE BOOTSTRAP DOTFILES EDIT"
+Edit a managed dotfile source
+.PP
+\fBUsage:\fR mise bootstrap dotfiles edit [OPTIONS] <TARGET>
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-\-apply\fR
+Apply this target after the editor exits
+.TP
+\fB\-m, \-\-mode\fR \fI<MODE>\fR
+Dotfile mode to use if the target is not yet managed
+.TP
+\fB\-s, \-\-source\fR \fI<PATH>\fR
+Source path to use if the target is not yet managed
+.TP
+\fB\-y, \-\-yes\fR
+Skip the confirmation prompt when adding an unmanaged target
+\fBArguments:\fR
+.PP
+.TP
+\fB<TARGET>\fR
+Target to edit
 .SH "MISE BOOTSTRAP DOTFILES STATUS"
 Show the status of dotfiles from `[dotfiles]`
 .PP
@@ -962,6 +1026,31 @@ state (missing, source missing, differs)
 .TP
 \fB<TARGET>\fR
 Only show these targets
+.SH "MISE BOOTSTRAP DOTFILES UNAPPLY"
+Remove dotfiles applied from `[dotfiles]`
+
+Removes configured whole\-file entries and edits while preserving files
+mise cannot identify as managed. Modified copies, templates, and plain\-line
+edits require `\-\-force`.
+.PP
+\fBUsage:\fR mise bootstrap dotfiles unapply [OPTIONS] [<TARGET>] ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-f, \-\-force\fR
+Remove modified or otherwise ambiguous managed files and lines
+.TP
+\fB\-n, \-\-dry\-run\fR
+Print the actions that would run without writing anything
+.TP
+\fB\-y, \-\-yes\fR
+Skip the confirmation prompt
+\fBArguments:\fR
+.PP
+.TP
+\fB<TARGET>\fR
+Only unapply these targets
 .SH "MISE BOOTSTRAP LINUX SYSTEMD-UNITS APPLY"
 \fBUsage:\fR mise bootstrap linux systemd\-units apply [OPTIONS]
 .PP
@@ -1511,115 +1600,6 @@ The path of the config to display
 .TP
 \fB<VALUE>\fR
 The value to set the key to (optional if provided as KEY=VALUE)
-.SH "MISE DOTFILES ADD"
-Add or update dotfiles in `[dotfiles]`
-
-If the target is already managed, this updates its source from the live
-target. Otherwise it creates a `[dotfiles]` entry and seeds the source
-under `dotfiles.root` unless `\-\-source` is provided.
-.PP
-\fBUsage:\fR mise dotfiles add [OPTIONS] <TARGET> ...
-.PP
-\fBOptions:\fR
-.PP
-.TP
-\fB\-f, \-\-force\fR
-Overwrite existing sources without prompting
-.TP
-\fB\-g, \-\-global\fR
-Write to the global config
-.TP
-\fB\-l, \-\-local\fR
-Write to the local config instead of the global config
-.TP
-\fB\-m, \-\-mode\fR \fI<MODE>\fR
-Dotfile mode to write
-.TP
-\fB\-n, \-\-dry\-run\fR
-Print the config/source updates without writing anything
-.TP
-\fB\-p, \-\-path\fR \fI<PATH>\fR
-Write to this config file or directory
-.TP
-\fB\-s, \-\-source\fR \fI<PATH>\fR
-Source path to use for a single target
-.TP
-\fB\-y, \-\-yes\fR
-Skip the confirmation prompt
-\fBArguments:\fR
-.PP
-.TP
-\fB<TARGET>\fR
-Targets to add or update
-.SH "MISE DOTFILES APPLY"
-Apply dotfiles from `[dotfiles]`
-
-Applies configured whole\-file entries and edits that aren't in their
-desired state. Whole\-file entries may symlink, copy, or render templates.
-Edit entries manage a marker\-delimited block or a single line in a file
-mise doesn't otherwise own.
-.PP
-\fBUsage:\fR mise dotfiles apply [OPTIONS] [<TARGET>] ...
-.PP
-\fBOptions:\fR
-.PP
-.TP
-\fB\-f, \-\-force\fR
-Overwrite existing files that conflict with whole\-file dotfile entries
-.TP
-\fB\-n, \-\-dry\-run\fR
-Print the actions that would run without writing anything
-.TP
-\fB\-y, \-\-yes\fR
-Skip the confirmation prompt
-\fBArguments:\fR
-.PP
-.TP
-\fB<TARGET>\fR
-Only apply these targets
-.SH "MISE DOTFILES EDIT"
-Edit a managed dotfile source
-.PP
-\fBUsage:\fR mise dotfiles edit [OPTIONS] <TARGET>
-.PP
-\fBOptions:\fR
-.PP
-.TP
-\fB\-\-apply\fR
-Apply this target after the editor exits
-.TP
-\fB\-m, \-\-mode\fR \fI<MODE>\fR
-Dotfile mode to use if the target is not yet managed
-.TP
-\fB\-s, \-\-source\fR \fI<PATH>\fR
-Source path to use if the target is not yet managed
-.TP
-\fB\-y, \-\-yes\fR
-Skip the confirmation prompt when adding an unmanaged target
-\fBArguments:\fR
-.PP
-.TP
-\fB<TARGET>\fR
-Target to edit
-.SH "MISE DOTFILES STATUS"
-Show the status of dotfiles from `[dotfiles]`
-.PP
-\fBUsage:\fR mise dotfiles status [OPTIONS] [<TARGET>] ...
-.PP
-\fBOptions:\fR
-.PP
-.TP
-\fB\-J, \-\-json\fR
-Output in JSON format
-.TP
-\fB\-\-missing\fR
-Exit with code 1 if any configured dotfiles are not in their desired
-state (missing, source missing, differs)
-\fBArguments:\fR
-.PP
-.TP
-\fB<TARGET>\fR
-Only show these targets
 .SH "MISE DOCTOR"
 Check mise installation for possible problems
 .PP
@@ -1916,6 +1896,7 @@ inserts the documentation into an existing file
 This will look for a special comment, `<!\-\- mise\-tasks \-\->`, and replace it with the generated documentation.
 It will replace everything between the comment and the next comment, `<!\-\- /mise\-tasks \-\->` so it can be
 run multiple times on the same file to update the documentation.
+The file must already contain both comments; mise errors instead of modifying the file if they are missing.
 .TP
 \fB\-I, \-\-index\fR
 write only an index of tasks, intended for use with `\-\-multi`
@@ -3144,6 +3125,18 @@ Skip installing tools before running tasks
 Can also be set persistently with the `task.run_auto_install` setting
 or `MISE_TASK_RUN_AUTO_INSTALL=false` env var
 .TP
+\fB\-\-task\-cache\fR \fI<TASK_CACHE>\fR
+Set task output cache access for this run
+
+\- `read\-write` \- Read cached results and write new results
+\- `read\-only` \- Read cached results without writing new results
+\- `write\-only` \- Write new results without reading cached results
+\- `off` \- Disable task output caching
+\- `local\-only` \- Read and write only the local cache; currently equivalent to `read\-write`
+.RS
+\fIDefault: \fRread\-write
+.RE
+.TP
 \fB\-\-timeout\fR \fI<TIMEOUT>\fR
 Timeout for the task to complete
 e.g.: 30s, 5m
@@ -3188,7 +3181,9 @@ Uses the GitHub Releases API to find the latest release and binary.
 By default, this will also update any installed plugins.
 Uses mise's GitHub token resolution chain for authenticated requests.
 
-This command is not available if mise is installed via a package manager.
+Packagers can disable this command so that mise is updated through the
+package manager instead. See
+https://mise.en.dev/contributing.html#packaging\-and\-self\-update\-instructions
 .PP
 \fBUsage:\fR mise self\-update [OPTIONS] [<VERSION>]
 .PP
@@ -3681,6 +3676,9 @@ Display a tree visualization of a dependency graph
 \fBOptions:\fR
 .PP
 .TP
+\fB\-\-compact\fR
+Collapse repeated dependencies after their first occurrence
+.TP
 \fB\-\-dot\fR
 Display dependencies in DOT format
 .TP
@@ -3710,6 +3708,22 @@ Display the path to the task instead of editing it
 .TP
 \fB<TASK>\fR
 Task to edit
+.SH "MISE TASKS GRAPH"
+[experimental] Inspect the workspace project graph
+.PP
+\fBUsage:\fR mise tasks graph [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-J, \-\-json\fR
+Output the project graph as JSON
+.TP
+\fB\-\-explain\fR
+Explain provider attribution for inferred projects and tasks
+.TP
+\fB\-\-no\-header\fR
+Do not print table headers
 .SH "MISE TASKS INFO"
 Get information about a task
 .PP
@@ -3905,6 +3919,18 @@ Skip installing tools before running tasks
 
 Can also be set persistently with the `task.run_auto_install` setting
 or `MISE_TASK_RUN_AUTO_INSTALL=false` env var
+.TP
+\fB\-\-task\-cache\fR \fI<TASK_CACHE>\fR
+Set task output cache access for this run
+
+\- `read\-write` \- Read cached results and write new results
+\- `read\-only` \- Read cached results without writing new results
+\- `write\-only` \- Write new results without reading cached results
+\- `off` \- Disable task output caching
+\- `local\-only` \- Read and write only the local cache; currently equivalent to `read\-write`
+.RS
+\fIDefault: \fRread\-write
+.RE
 .TP
 \fB\-\-timeout\fR \fI<TIMEOUT>\fR
 Timeout for the task to complete
@@ -4810,14 +4836,11 @@ Use key=value syntax. Multiple variables can be set by repeating the option.
 \fB\-\-wrap\-process\fR \fI<MODE>\fR
 Configure how the process is wrapped
 
-By default, Watchexec will run the command in a process group in Unix, and in a Job Object in Windows.
+By default, Watchexec will run the command in a session on macOS, in a process group on other Unix platforms, and in a Job Object in Windows.
 
 Some Unix programs prefer running in a session, while others do not work in a process group.
 
 Use 'group' to use a process group, 'session' to use a process session, and 'none' to run the command directly. On Windows, either of 'group' or 'session' will use a Job Object.
-.RS
-\fIDefault: \fRgroup
-.RE
 .TP
 \fB\-N, \-\-notify\fR
 Alert when commands start and end

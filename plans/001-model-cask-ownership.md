@@ -1,20 +1,10 @@
 # Plan 001: Make cask ownership explicit and prevent implicit Homebrew takeover
 
-**2026-07-23 supersession note**: Do not execute this plan before Plans 011,
-012, and 013. Revise its state model to keep payload owner, Homebrew marker
-owner, mutation authority, convergence/health, handoff phase, and contract
-version as separate dimensions. Native Homebrew handoff ends in
-`Externalized`; it must not be folded into synthetic-metadata convergence.
-
-> **Executor instructions**: Follow this plan step by step. Run every
-> verification command and confirm the expected result before moving on. Stop
-> on any condition listed under "STOP conditions"; do not improvise. When done,
-> update this plan's row in `plans/README.md`.
->
-> **Drift check (run first)**:
-> `git diff --stat 866916893..HEAD -- src/system/packages/brew/cask.rs src/cli/system/driver.rs`
-> If either file changed, compare the excerpts below with live code. Mismatch is
-> a STOP condition.
+> **COMPLETED — FINAL CONTRACT; DO NOT RE-EXECUTE.** Direct pours are
+> mise-owned and publish only `.mise-cask.toml`. Homebrew-authored metadata is
+> foreign lifecycle authority and blocks mise mutation. No synthetic metadata,
+> dual ownership, automatic takeover, or production `--adopt` handoff ships.
+> Follow `docs/dev/brew-cask-decision-record.md` and Plan 012 for current work.
 
 ## Status
 

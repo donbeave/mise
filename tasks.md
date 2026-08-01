@@ -1,9 +1,3 @@
-## `aqua-tester`
-
-- **Usage**: `aqua-tester`
-
-Test Aqua configuration with fish shell
-
 ## `build`
 
 - **Usage**: `build`
@@ -75,42 +69,6 @@ Install documentation dependencies
 
 Fetch GPG keys for signing or verification
 
-## `filetask`
-
-This is a test build script
-
-
-- **Usage**: `filetask [-f --force] [-u --user <user>] [file] [arg_with_default]`
-- **Aliases**: `ft`
-
-### Arguments
-
-#### `[file]`
-
-The file to write
-
-**Default:** `file.txt`
-
-#### `[arg_with_default]`
-
-An arg with a default
-
-**Default:** `mydefault`
-
-### Flags
-
-#### `-f --force`
-
-Overwrite existing &lt;file>
-
-#### `-u --user <user>`
-
-User to run as
-
-## `filetask.bat`
-
-- **Usage**: `filetask.bat`
-
 ## `flamegraph`
 
 - **Usage**: `flamegraph`
@@ -144,17 +102,19 @@ Automatically fix lint issues
 
 Lint HK files
 
+## `perf`
+
+- **Usage**: `perf`
+
+## `perf:record`
+
+- **Usage**: `perf:record`
+
 ## `pre-commit`
 
 - **Usage**: `pre-commit`
 
 Run pre-commit hooks
-
-## `release`
-
-- **Usage**: `release`
-
-Release the project
 
 ## `release-plz`
 
@@ -186,6 +146,14 @@ Generate shell completions
 
 Render help documentation
 
+## `render:llms`
+
+- Depends: render:usage, render:help
+
+- **Usage**: `render:llms`
+
+Generate docs/public/llms.txt (docs index for AI agents)
+
 ## `render:mangen`
 
 - Depends: render:usage
@@ -215,12 +183,6 @@ Generate usage documentation
 - **Usage**: `show-output-on-failure`
 
 Show output on failure for documentation generation
-
-## `signal-test`
-
-- **Usage**: `signal-test`
-
-Test signal handling in Node.js
 
 ## `snapshots`
 
@@ -298,9 +260,3 @@ Run tests with shuffling enabled
 - **Usage**: `test:unit`
 
 run unit tests
-
-## `update-descriptions`
-
-- **Usage**: `update-descriptions`
-
-Update all task descriptions in the project

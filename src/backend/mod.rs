@@ -28,7 +28,9 @@ use crate::path_env::PathEnv;
 use crate::platform::Platform;
 use crate::plugins::core::CORE_PLUGINS;
 use crate::plugins::{PEP440_PRERELEASE_REGEX, PluginType, VERSION_REGEX};
-use crate::registry::{REGISTRY, full_to_url, normalize_remote, tool_enabled};
+use crate::registry::{
+    REGISTRY, RegistryIdiomaticFile, full_to_url, normalize_remote, tool_enabled,
+};
 use crate::runtime_symlinks::is_runtime_symlink;
 use crate::semver::semver_triplet;
 use crate::tera::{contains_template_syntax, get_tera, render_str};
@@ -42,10 +44,10 @@ use crate::{
     cache::{CacheManager, CacheManagerBuilder},
     plugins::PluginEnum,
 };
-use crate::{dirs, env, file, hash, lock_file, versions_host};
+use crate::{dirs, env, file, hash, versions_host};
 use async_trait::async_trait;
 use backend_type::BackendType;
-use eyre::{Result, bail, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use platform_target::PlatformTarget;
@@ -56,6 +58,7 @@ use versions::Versioning;
 pub mod aqua;
 pub mod asdf;
 pub mod asset_matcher;
+pub mod aube_host;
 pub mod backend_type;
 pub mod cargo;
 pub mod conda;
@@ -87,6 +90,43 @@ pub type IdiomaticVersion = (String, Option<ToolVersionOptions>);
 pub type VersionCacheManager = CacheManager<Vec<VersionInfo>>;
 
 pub(crate) const MISE_BINS_DIR: &str = ".mise-bins";
+
+/// Why a backend's remote version listing failed.
+///
+/// Backends that degrade a failed fetch into an empty list (so a flaky network
+/// doesn't hard-fail every command) record the cause here. `no versions found`
+/// errors then cite the real reason instead of blaming whatever filter happened
+/// to be applied to the empty list.
+///
+/// Keyed by `BackendArg::full()`, the same key `get_remote_version_cache` uses,
+/// so two backends that share a short name but differ in backend or in
+/// listing-relevant tool options (`foo` vs `foo[api_url=...]`) can't inherit
+/// each other's failures.
+///
+/// An entry is never removed: it makes `list_remote_versions_with_refresh`
+/// stop fetching for that key, so no later fetch can succeed and contradict it.
+/// That is only sound while every recorder returns an empty list alongside the
+/// record — a backend that recorded a failure but still returned some versions
+/// would suppress its own later listings.
+static VERSION_LISTING_FAILURES: Lazy<std::sync::Mutex<HashMap<String, String>>> =
+    Lazy::new(Default::default);
+
+/// Remember that listing remote versions for `ba` failed.
+pub fn record_version_listing_failure(ba: &BackendArg, err: &eyre::Report) {
+    VERSION_LISTING_FAILURES
+        .lock()
+        .unwrap()
+        .insert(ba.full(), format!("{err:#}"));
+}
+
+/// The cause of the failed remote version listing for `ba`, if one was recorded.
+pub fn version_listing_failure(ba: &BackendArg) -> Option<String> {
+    VERSION_LISTING_FAILURES
+        .lock()
+        .unwrap()
+        .get(&ba.full())
+        .cloned()
+}
 
 pub(crate) fn backend_arg_matches_registry_backend(ba: &BackendArg) -> bool {
     let full = ba.full_without_opts();
@@ -132,16 +172,21 @@ pub(crate) async fn semver_version_from_toolsets_or_path(
     {
         return Some(version);
     }
-    semver_version_from_path(backend, config, tool).await
+    semver_version_from_path(backend, config, ts, tool).await
 }
 
+/// `ts` is threaded through only so the probe can resolve `tool` the same way the install
+/// spawns it — a bare name would be looked up by `Command::new`, which on Windows appends
+/// only `.exe` and so misses the `.cmd` shim the install itself would have used.
 async fn semver_version_from_path(
     backend: &dyn Backend,
     config: &Arc<Config>,
+    ts: &Toolset,
     tool: &str,
 ) -> Option<String> {
     let env = backend.dependency_env(config).await.ok()?;
-    let output = cmd!(tool, "--version").full_env(env).read().ok()?;
+    let program = backend.spawn_program(config, Some(ts), tool).await;
+    let output = cmd!(program, "--version").full_env(env).read().ok()?;
     parse_cli_version_output(&output)
 }
 
@@ -523,6 +568,38 @@ pub(crate) fn normalize_idiomatic_contents(contents: &str) -> String {
         .join("\n")
 }
 
+fn parse_registry_idiomatic_file(
+    path: &Path,
+    spec: &RegistryIdiomaticFile,
+) -> Result<Option<Vec<String>>> {
+    if !spec.has_parser() {
+        return Ok(None);
+    }
+    let contents = file::read_to_string(path)?;
+    version_list::parse_version_list(
+        &contents,
+        spec.version_regex,
+        spec.version_json_path,
+        spec.version_expr,
+    )
+    .map(Some)
+}
+
+fn parse_matching_registry_idiomatic_file(
+    path: &Path,
+    specs: &[RegistryIdiomaticFile],
+) -> Result<Option<Vec<String>>> {
+    match specs
+        .iter()
+        .filter(|spec| path.ends_with(spec.path))
+        .max_by_key(|spec| Path::new(spec.path).components().count())
+        .filter(|spec| spec.has_parser())
+    {
+        Some(spec) => parse_registry_idiomatic_file(path, spec),
+        None => Ok(None),
+    }
+}
+
 fn executable_names(bin: &str) -> Vec<String> {
     let mut names = vec![bin.to_string()];
     if cfg!(target_os = "windows") && Path::new(bin).extension().is_none() {
@@ -544,6 +621,94 @@ fn which_non_pristine_executable(bin: &str) -> Option<PathBuf> {
     executable_names(bin)
         .into_iter()
         .find_map(file::which_non_pristine)
+}
+
+/// True when the OS will accept `path` as the program argument of a spawn.
+///
+/// [`file::can_execute_directly`] is *pure extension inspection* on Windows — it never
+/// touches the filesystem, so it answers true for a `foo.exe` that is not there. The
+/// `is_file()` guard supplies the existence check that [`file::is_executable`] performs
+/// inline; without it a lookup built on this would hand back paths to missing files.
+///
+/// The guard is `cfg!(windows)`-gated deliberately. On unix `can_execute_directly`
+/// delegates to `is_executable`, which stats already — and which answers true for a
+/// mode-0755 *directory*. Adding `is_file()` unconditionally would silently narrow every
+/// unix lookup below it, so unix keeps today's answer exactly.
+fn is_spawnable(path: &Path) -> bool {
+    if cfg!(windows) && !path.is_file() {
+        return false;
+    }
+    file::can_execute_directly(path)
+}
+
+/// Resolve `bin` inside `dirs`, in the order the OS itself resolves: directory-major,
+/// extension-minor.
+///
+/// `spawnable` picks the predicate, and the distinction is the whole point:
+///
+/// * `false` — the historical "looks executable" test. On Windows that deliberately
+///   accepts a shebang-only script and a `.ps1`, because it answers *"does this tool
+///   provide this bin"* for `mise which`, shims, auto-install and tool-stubs. Not to be
+///   narrowed.
+/// * `true` — [`is_spawnable`], i.e. *"can the OS launch this"*. Crucially it keeps
+///   searching **past** a candidate it rejects, so `None` means "nothing spawnable
+///   exists" rather than "the first thing I looked at was not spawnable".
+///
+/// Directory-major only matters on Windows, where [`executable_names`] yields several
+/// candidates per directory. It is the order `CreateProcess`+`PATHEXT`, `cmd.exe` and the
+/// `which` crate all use, and the order [`Backend::which`] has always used. It diverges
+/// from [`which_non_pristine_executable`], which is *name-major* — the bare name is tried
+/// across the whole PATH before any extension — and that one is left alone. Only
+/// directory-major resolves the case this exists for: mise's own node install ships a
+/// shebang `npm` and an `npm.cmd` side by side in one directory, with no `npm.exe`.
+///
+/// On unix `executable_names` returns exactly one name, so both orders are the same
+/// traversal and this degenerates to `file::_which` with a different predicate.
+fn which_in_dirs<I>(dirs: I, bin: &str, spawnable: bool) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let names = executable_names(bin);
+    dirs.into_iter().find_map(|dir| {
+        names.iter().map(|name| dir.join(name)).find(|candidate| {
+            if spawnable {
+                is_spawnable(candidate)
+            } else {
+                candidate.exists() && file::is_executable(candidate)
+            }
+        })
+    })
+}
+
+/// PATH-side counterpart of [`which_non_pristine_executable`], narrowed to what the OS can
+/// actually spawn.
+///
+/// Non-pristine to match that function, which is what [`Backend::dependency_which`] uses.
+/// The "a mise-managed tool beats a system one" contract that
+/// `e2e/backend/test_pipx_direct_dependencies` asserts comes from consulting the toolset
+/// first in [`Backend::spawnable_dependency`], not from the PATH flavor, so it is kept.
+///
+/// mise's shim directories are skipped on Windows. A shim re-enters mise, and once a
+/// resolved absolute path is handed to `Command::new` the child PATH no longer gets a
+/// vote, so a shim that the child PATH would have shadowed must not win —
+/// [`file::which_no_shims`] exists for the same reason. Windows-gated so the unix answer
+/// stays identical to `which_non_pristine_executable`'s.
+///
+/// The skip is not free for callers that treat `None` as fatal. Through
+/// [`Backend::spawn_program`] a miss falls back to the bare name, i.e. today's code path.
+/// Through [`Backend::spawnable_dependency`] it is a gate, so a tool reachable *only* via a
+/// mise shim — installed by mise yet declared in no active config, so the dependency
+/// toolset does not have it either — now reports its install instructions instead of
+/// re-entering mise through the shim. That trade is deliberate: the alternative is
+/// spawning our own shim from inside an install, and the instructions are correct advice
+/// for a tool that is installed but unconfigured.
+fn which_non_pristine_spawnable(bin: &str) -> Option<PathBuf> {
+    let skip_shims = cfg!(windows);
+    let dirs = env::PATH_NON_PRISTINE
+        .iter()
+        .filter(|p| !skip_shims || !file::is_mise_shims_dir(p))
+        .cloned();
+    which_in_dirs(dirs, bin, true)
 }
 
 pub(crate) async fn configured_toolset_or_path_which(
@@ -613,6 +778,251 @@ mod tests {
         assert_eq!(
             normalize_idiomatic_contents("# full line comment\n3.14.2 # inline comment\n   \n\n"),
             "3.14.2"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_in_dirs_skips_shebang_script_for_node_npm_layout() {
+        // The exact on-disk shape of installs\node\<version>: a bare `npm` that is a
+        // `#!/usr/bin/env bash` script, an `npm.cmd`, an `npm.ps1`, and no `npm.exe`. On
+        // Windows the node plugin puts that directory itself on PATH.
+        //
+        // The paired assertion is the point. The permissive predicate answers with the
+        // bash script, because `executable_names` puts the bare name first and
+        // `file::is_executable` accepts a shebang — and that is precisely why
+        // `NPM_PROGRAM = "npm.cmd"` had to be hardcoded. The spawnable predicate walks
+        // past it to `npm.cmd`, which is what makes the hardcode removable.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("npm"), "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        fs::write(dir.path().join("npm.cmd"), "@echo off\n").unwrap();
+        fs::write(dir.path().join("npm.ps1"), "exit 0\n").unwrap();
+        fs::write(dir.path().join("node.exe"), "MZ").unwrap();
+
+        let dirs = || vec![dir.path().to_path_buf()];
+        assert_eq!(
+            which_in_dirs(dirs(), "npm", false),
+            Some(dir.path().join("npm")),
+            "the permissive predicate still answers with the shebang script"
+        );
+        assert_eq!(
+            which_in_dirs(dirs(), "npm", true),
+            Some(dir.path().join("npm.cmd")),
+            "the spawnable predicate has to walk past it to npm.cmd"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_in_dirs_rejects_interpreter_only_extensions() {
+        // A .ps1 needs `pwsh -File` and a .vbs needs wscript/cscript, so neither can be
+        // handed to Command::new — but both extensions are in the default
+        // windows_executable_extensions list, so the permissive predicate accepts them.
+        //
+        // Casing is deliberately not exercised here: `which_in_dirs` builds its candidates
+        // from `executable_names`, whose entries are always lowercase, so the guard would
+        // never see an uppercase extension through this path however the file is named on a
+        // case-insensitive filesystem. See
+        // `is_spawnable_rejects_interpreter_only_extensions_case_insensitively`.
+        for name in ["pipx.ps1", "pipx.vbs"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(name), "exit 42\n").unwrap();
+            let dirs = || vec![dir.path().to_path_buf()];
+            assert!(
+                which_in_dirs(dirs(), "pipx", false).is_some(),
+                "{name} must still satisfy the permissive predicate"
+            );
+            assert_eq!(
+                which_in_dirs(dirs(), "pipx", true),
+                None,
+                "{name} cannot be spawned directly"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_in_dirs_prefers_exe_over_cmd_within_a_directory() {
+        // `executable_names` orders by the settings list, where `exe` precedes `cmd`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tool.cmd"), "@echo off\n").unwrap();
+        fs::write(dir.path().join("tool.exe"), "MZ").unwrap();
+        assert_eq!(
+            which_in_dirs(vec![dir.path().to_path_buf()], "tool", true),
+            Some(dir.path().join("tool.exe"))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_in_dirs_is_directory_major() {
+        // Pins the ordering decision. `which_non_pristine_executable` is name-major and
+        // would answer dir_b/tool.exe here, because it tries every directory for one name
+        // before moving to the next name. This resolver is directory-major, like
+        // CreateProcess+PATHEXT and like Backend::which, so the earlier directory wins even
+        // though its candidate has a later extension.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        fs::write(dir_a.path().join("tool.cmd"), "@echo off\n").unwrap();
+        fs::write(dir_b.path().join("tool.exe"), "MZ").unwrap();
+        assert_eq!(
+            which_in_dirs(
+                vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+                "tool",
+                true
+            ),
+            Some(dir_a.path().join("tool.cmd"))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn is_spawnable_rejects_interpreter_only_extensions_case_insensitively() {
+        // The casing guard inside `can_execute_directly`, exercised where it is actually
+        // reachable: with a path read off disk rather than one built from
+        // `executable_names`. `task::task_executor` hands it exactly such a path when
+        // deciding whether a file task can be executed directly, so an uppercase `.PS1`
+        // there must be rejected — Windows extensions are case-insensitive while the guard
+        // compares strings.
+        //
+        // The paired `is_executable` assertion is the point: these files do look executable
+        // (their extensions are in windows_executable_extensions), which is why the spawn
+        // side needs a predicate of its own.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.ps1", "b.PS1", "c.vbs", "d.VBS"] {
+            let path = dir.path().join(name);
+            fs::write(&path, "exit 0\n").unwrap();
+            assert!(!is_spawnable(&path), "{name} must not be spawnable");
+            assert!(
+                file::is_executable(&path),
+                "{name} should still satisfy the permissive predicate"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_in_dirs_ignores_missing_candidates() {
+        // Guards the is_file() composition in `is_spawnable`. `can_execute_directly` is
+        // pure extension inspection on Windows, so without that guard the `tool.exe`
+        // candidate answers true for a file that was never created. Removing the guard
+        // breaks this test and the node-layout one above, both by returning a path to a
+        // file that does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            which_in_dirs(vec![dir.path().to_path_buf()], "tool", true),
+            None
+        );
+        assert_eq!(
+            which_in_dirs(vec![dir.path().to_path_buf()], "tool", false),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_spawnable_matches_is_executable_on_unix() {
+        // "unix stays byte-identical" as a checked claim rather than a comment. The
+        // directory case is the sharp one: `is_executable` answers true for a mode-0755
+        // directory, so an ungated is_file() in `is_spawnable` would silently narrow every
+        // unix lookup built on it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("plain");
+        fs::write(&plain, "not executable\n").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        let subdir = dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        assert!(is_spawnable(&tool));
+        assert!(!is_spawnable(&plain));
+        assert_eq!(
+            is_spawnable(&subdir),
+            file::is_executable(&subdir),
+            "a mode-0755 directory must be answered the same either way"
+        );
+        assert_eq!(
+            which_in_dirs(vec![dir.path().to_path_buf()], "tool", true),
+            which_in_dirs(vec![dir.path().to_path_buf()], "tool", false),
+            "both predicates agree on unix"
+        );
+    }
+
+    #[test]
+    fn test_parse_registry_idiomatic_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool.json");
+        fs::write(
+            &path,
+            r#"{"releases":[{"channel":"beta","version":"2.0.0"},{"channel":"stable","version":"1.2.3"}]}"#,
+        )
+        .unwrap();
+        let spec = RegistryIdiomaticFile {
+            path: "tool.json",
+            version_regex: None,
+            version_json_path: Some(".releases[?channel=stable].version"),
+            version_expr: None,
+        };
+
+        assert_eq!(
+            parse_registry_idiomatic_file(&path, &spec).unwrap(),
+            Some(vec!["1.2.3".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_matching_registry_idiomatic_file_uses_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subdir/tool.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"version":"1.2.3"}"#).unwrap();
+        let specs = [RegistryIdiomaticFile {
+            path: "subdir/tool.json",
+            version_regex: None,
+            version_json_path: Some(".version"),
+            version_expr: None,
+        }];
+
+        assert_eq!(
+            parse_matching_registry_idiomatic_file(&path, &specs).unwrap(),
+            Some(vec!["1.2.3".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_matching_registry_idiomatic_file_overrides_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, r#"{"tool":{"version":"4.5.6"}}"#).unwrap();
+        let specs = [RegistryIdiomaticFile {
+            path: "package.json",
+            version_regex: None,
+            version_json_path: Some(".tool.version"),
+            version_expr: None,
+        }];
+
+        assert_eq!(
+            parse_matching_registry_idiomatic_file(&path, &specs).unwrap(),
+            Some(vec!["4.5.6".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_registry_idiomatic_file_without_parser_uses_backend_fallback() {
+        let spec = RegistryIdiomaticFile {
+            path: ".tool-version",
+            version_regex: None,
+            version_json_path: None,
+            version_expr: None,
+        };
+
+        assert_eq!(
+            parse_registry_idiomatic_file(Path::new("does-not-need-to-exist"), &spec).unwrap(),
+            None
         );
     }
 
@@ -1197,6 +1607,19 @@ pub trait Backend: Debug + Send + Sync {
         true
     }
 
+    /// Whether this backend's artifact-identity options describe the machine
+    /// that wrote a lock entry rather than the tool request.
+    ///
+    /// Swift's Linux artifacts differ per distro, so its options record which
+    /// distro an entry describes. An entry written before those options existed
+    /// can't be attributed to a distro, and guessing the local one would apply
+    /// a foreign artifact's checksum to a different tarball. Backends that
+    /// return true keep such an entry's version pin but ignore its
+    /// checksum/URL, and are excluded from legacy option rekeying.
+    fn lockfile_options_are_host_specific(&self) -> bool {
+        false
+    }
+
     async fn description(&self) -> Option<String> {
         None
     }
@@ -1249,6 +1672,15 @@ pub trait Backend: Debug + Send + Sync {
     /// its cache is keyed by the registry/default listing.
     fn remote_version_listing_tool_option_keys(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Opaque context that affects this backend's remote version listing.
+    ///
+    /// Backends should return a digest rather than raw values. A non-empty
+    /// context partitions the remote-version cache and disables the shared
+    /// versions host, whose response cannot account for local context.
+    async fn remote_version_cache_context(&self, _config: &Arc<Config>) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// dependencies which wait for install but do not warn, like cargo-binstall
@@ -1329,7 +1761,11 @@ pub trait Backend: Debug + Send + Sync {
         config: &Arc<Config>,
         refresh: bool,
     ) -> eyre::Result<Vec<VersionInfo>> {
-        let remote_versions = self.get_remote_version_cache();
+        let cache_context = self.remote_version_cache_context(config).await?;
+        let remote_versions = match cache_context.as_deref() {
+            Some(context) => self.get_remote_version_cache_with_context(Some(context)),
+            None => self.get_remote_version_cache(),
+        };
         let mut remote_versions = remote_versions.lock().await;
         let ba = self.ba().clone();
         let id = self.id();
@@ -1373,6 +1809,12 @@ pub trait Backend: Debug + Send + Sync {
             trace!(
                 "Skipping versions host for {} because {} backend has a direct source",
                 ba.short, backend_type
+            );
+            false
+        } else if cache_context.is_some() {
+            trace!(
+                "Skipping versions host for {} because local context affects remote version listing",
+                ba.short,
             );
             false
         } else if has_local_version_listing_override {
@@ -1489,12 +1931,28 @@ pub trait Backend: Debug + Send + Sync {
             if versions.is_empty()
                 && self.get_type() != BackendType::Http
                 && self.unresolved_latest_version().is_none()
+                // A backend that just recorded a fetch failure already warned
+                // with the actual cause; "No versions found" on top of it reads
+                // like a second, unrelated problem.
+                && version_listing_failure(&ba).is_none()
             {
-                warn!("No versions found for {id}");
+                // warn_once: a single command resolves the same tool from
+                // several call sites, and repeating this for each one buries
+                // the actual error (usually a network failure) in spam.
+                warn_once!("No versions found for {id}");
             }
             Ok(versions)
         };
-        let versions = if refresh {
+        // An empty list is deliberately not written to the disk cache below, so
+        // nothing memoizes a failed listing. Without this short-circuit a single
+        // command re-runs the whole failing fetch — HTTP retries and backoff
+        // included — once per call site that resolves this tool. This applies to
+        // `refresh` too: the record is process-local, so honoring it discards no
+        // cached data that `--refresh` is meant to bypass.
+        let versions = if version_listing_failure(&ba).is_some() {
+            trace!("Skipping remote version listing for {id} after an earlier failure");
+            vec![]
+        } else if refresh {
             remote_versions.refresh_async(fetch).await?
         } else {
             remote_versions.get_or_try_init_async(fetch).await?.clone()
@@ -1971,11 +2429,13 @@ pub trait Backend: Debug + Send + Sync {
 
     /// Check if a rolling version has changed (by comparing checksums)
     /// Returns true if the version should be updated
-    async fn is_rolling_version_outdated(&self, config: &Arc<Config>, version: &str) -> bool {
+    async fn is_rolling_version_outdated(&self, config: &Arc<Config>, tv: &ToolVersion) -> bool {
         use crate::toolset::install_state;
 
+        let version = tv.request.version();
+
         // Get the latest version info
-        let version_info = match self.get_version_info(config, version).await {
+        let version_info = match self.get_version_info(config, &version).await {
             Some(v) if v.rolling => v,
             _ => return false, // Not rolling or not found
         };
@@ -1990,7 +2450,7 @@ pub trait Backend: Debug + Send + Sync {
         };
 
         // Compare with stored checksum
-        let stored_checksum = install_state::read_checksum(&self.ba().short, version);
+        let stored_checksum = install_state::read_checksum(&tv.install_path());
         match stored_checksum {
             Some(stored) if stored == latest_checksum => {
                 trace!("Rolling version {} checksum unchanged", version);
@@ -2031,7 +2491,7 @@ pub trait Backend: Debug + Send + Sync {
     async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
         let mut filenames = self._idiomatic_filenames().await?;
         if let Some(rt) = REGISTRY.get(self.id()) {
-            filenames.extend(rt.idiomatic_files.iter().map(|s| s.to_string()));
+            filenames.extend(rt.idiomatic_files.iter().map(|f| f.path.to_string()));
         }
         filenames = filenames.into_iter().unique().collect();
         Ok(filenames)
@@ -2049,6 +2509,14 @@ pub trait Backend: Debug + Send + Sync {
     /// every backend needing to implement `package.json` support. For other files, it
     /// delegates to `_parse_idiomatic_file`.
     async fn parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
+        if let Some(versions) = REGISTRY
+            .get(self.id())
+            .map(|rt| parse_matching_registry_idiomatic_file(path, rt.idiomatic_files))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(versions);
+        }
         if crate::config::config_file::idiomatic_version::package_json::is_package_json(path) {
             return crate::config::config_file::idiomatic_version::package_json::parse(
                 path,
@@ -2064,15 +2532,25 @@ pub trait Backend: Debug + Send + Sync {
         &self,
         path: &Path,
     ) -> eyre::Result<Vec<(String, ToolVersionOptions)>> {
-        let versions =
-            if crate::config::config_file::idiomatic_version::package_json::is_package_json(path) {
-                crate::config::config_file::idiomatic_version::package_json::parse(path, self.id())?
-                    .into_iter()
-                    .map(|version| (version, None))
-                    .collect()
-            } else {
-                self._parse_idiomatic_file_with_options(path).await?
-            };
+        let versions = if let Some(versions) = REGISTRY
+            .get(self.id())
+            .map(|rt| parse_matching_registry_idiomatic_file(path, rt.idiomatic_files))
+            .transpose()?
+            .flatten()
+        {
+            versions
+                .into_iter()
+                .map(|version| (version, None))
+                .collect()
+        } else if crate::config::config_file::idiomatic_version::package_json::is_package_json(path)
+        {
+            crate::config::config_file::idiomatic_version::package_json::parse(path, self.id())?
+                .into_iter()
+                .map(|version| (version, None))
+                .collect()
+        } else {
+            self._parse_idiomatic_file_with_options(path).await?
+        };
         let options = self.ba().opts();
         Ok(versions
             .into_iter()
@@ -2160,9 +2638,7 @@ pub trait Backend: Debug + Send + Sync {
         // so its install dir already existing does NOT mean it's up-to-date.
         let rolling_reinstall = !ctx.force
             && self.is_version_installed(&ctx.config, &tv, true)
-            && self
-                .is_rolling_version_outdated(&ctx.config, &tv.request.version())
-                .await;
+            && self.is_rolling_version_outdated(&ctx.config, &tv).await;
 
         // Handle dry-run mode early to avoid plugin installation
         if ctx.dry_run {
@@ -2186,13 +2662,27 @@ pub trait Backend: Debug + Send + Sync {
             plugin.is_installed_err()?;
         }
 
-        // If --force and the install path resolved to a shared dir (but wasn't explicitly
-        // set via --system/--shared), redirect to primary dir to avoid modifying shared installs.
-        if ctx.force
+        // Incomplete markers are keyed by logical tool/version rather than by
+        // the physical install path. Use the same logical key as link and
+        // uninstall so shared and system installs cannot have their marker
+        // cleared while an install is still in progress.
+        let state_version = tv.tv_pathname();
+        let _state_lock = install_state::lock_tool_version(&tv.ba().short, &state_version)?;
+
+        let mut install_satisfied = self
+            .is_install_satisfied_or_false(&ctx.config, &tv, true)
+            .await
+            && !rolling_reinstall;
+
+        // If the install path resolved to a shared dir (but wasn't explicitly set via
+        // --system/--shared), redirect forced or incompatible installs to the primary dir
+        // to avoid modifying shared installs.
+        if (ctx.force || !install_satisfied)
             && tv.install_path.is_none()
             && env::install_path_category(&tv.install_path()) != env::InstallPathCategory::Local
         {
             tv.install_path = Some(tv.ba().installs_path.join(tv.tv_pathname()));
+            install_satisfied = false;
         }
 
         let will_uninstall =
@@ -2208,14 +2698,10 @@ pub trait Backend: Debug + Send + Sync {
         ctx.pr.start_operations(total_ops);
 
         if will_uninstall {
-            self.uninstall_version(&ctx.config, &tv, ctx.pr.as_ref(), false)
+            self.uninstall_version_unlocked(&ctx.config, &tv, ctx.pr.as_ref(), false)
                 .await?;
             ctx.pr.next_operation();
-        } else if self
-            .is_install_satisfied_or_false(&ctx.config, &tv, true)
-            .await
-            && !rolling_reinstall
-        {
+        } else if install_satisfied {
             return Ok(tv);
         }
 
@@ -2224,18 +2710,6 @@ pub trait Backend: Debug + Send + Sync {
         versions_host::track_install(tv.short(), &tv.ba().full(), &tv.version);
 
         ctx.pr.set_message("install".into());
-        let _lock = lock_file::get(&tv.install_path(), ctx.force)?;
-
-        // Double-checked (locking) that it wasn't installed while we were waiting for the lock
-        if self
-            .is_install_satisfied_or_false(&ctx.config, &tv, true)
-            .await
-            && !ctx.force
-            && !rolling_reinstall
-        {
-            return Ok(tv);
-        }
-
         self.create_install_dirs(&tv)?;
 
         let old_tv = tv.clone();
@@ -2266,26 +2740,11 @@ pub trait Backend: Debug + Send + Sync {
         }
 
         self.cleanup_install_dirs(&tv);
-        // attempt to touch all the .tool-version files to trigger updates in hook-env
-        let mut touch_dirs = vec![dirs::DATA.to_path_buf()];
-        touch_dirs.extend(ctx.config.config_files.keys().cloned());
-        for path in touch_dirs {
-            let err = file::touch_dir(&path);
-            if let Err(err) = err {
-                trace!("error touching config file: {:?} {:?}", path, err);
-            }
+        // Touch the data directory to trigger updates in hook-env after PATH changes.
+        if let Err(err) = file::touch_dir(&dirs::DATA) {
+            trace!("error touching data directory: {:?}", err);
         }
-        let incomplete_path = self.incomplete_file_path(&tv);
-        if let Err(err) = file::remove_file(&incomplete_path) {
-            debug!("error removing incomplete file: {:?}", err);
-        } else {
-            // Sync parent directory to ensure file removal is immediately visible
-            if let Some(parent) = incomplete_path.parent()
-                && let Err(err) = file::sync_dir(parent)
-            {
-                debug!("error syncing incomplete file parent directory: {:?}", err);
-            }
-        }
+        install_state::clear_incomplete_marker_best_effort(&tv.ba().short, &tv.tv_pathname());
         if let Some(script) = tv.request.options().get("postinstall") {
             ctx.pr
                 .finish_with_message("running custom postinstall hook".to_string());
@@ -2336,7 +2795,7 @@ pub trait Backend: Debug + Send + Sync {
         // "{{ tools.python.path }}/bin/python3"`) for the tool-level `postinstall`
         // hook, resolved against this tool's already-installed dependencies. The
         // config env added above is resolved without tools (`NonToolsOnly`), so it
-        // omits these; `install_value_toolset` is fully resolved (offline) so
+        // omits these; `install_dependency_toolset` is fully resolved (offline) so
         // `{{ tools.<dep>.path }}` maps to a real install path — `ctx.ts` is the raw,
         // unresolved install toolset during a combined install. PATH stays owned by
         // `path_env` below. Best-effort: any resolution error leaves the tool-less
@@ -2361,7 +2820,10 @@ pub trait Backend: Debug + Send + Sync {
                 .is_some_and(|deps| !deps.is_empty());
         if declares_deps {
             let base = env_vars.clone();
-            let tool_vals = match self.install_value_toolset(&ctx.config, &tv_exact).await {
+            let tool_vals = match self
+                .install_dependency_toolset(&ctx.config, &tv_exact)
+                .await
+            {
                 Ok(dep_ts) => dep_ts.tool_val_env(&ctx.config, &base).await,
                 Err(e) => Err(e),
             };
@@ -2449,6 +2911,25 @@ pub trait Backend: Debug + Send + Sync {
         pr: &dyn SingleReport,
         dryrun: bool,
     ) -> eyre::Result<()> {
+        let state_version = tv.tv_pathname();
+        let _state_lock = if dryrun {
+            None
+        } else {
+            Some(install_state::lock_tool_version(
+                &tv.ba().short,
+                &state_version,
+            )?)
+        };
+        self.uninstall_version_unlocked(config, tv, pr, dryrun)
+            .await
+    }
+    async fn uninstall_version_unlocked(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &dyn SingleReport,
+        dryrun: bool,
+    ) -> eyre::Result<()> {
         pr.set_message("uninstall".into());
 
         if !dryrun {
@@ -2516,22 +2997,40 @@ pub trait Backend: Debug + Send + Sync {
         tv: &ToolVersion,
         bin_name: &str,
     ) -> eyre::Result<Option<PathBuf>> {
-        let bin_paths = self
-            .list_bin_paths(config, tv)
-            .await?
-            .into_iter()
-            .filter(|p| p.parent().is_some());
-        for bin_path in bin_paths {
-            for bin_path in executable_names(bin_name)
+        Ok(which_in_dirs(
+            self.list_bin_paths(config, tv)
+                .await?
                 .into_iter()
-                .map(|bin| bin_path.join(bin))
-            {
-                if bin_path.exists() && file::is_executable(&bin_path) {
-                    return Ok(Some(bin_path));
-                }
-            }
-        }
-        Ok(None)
+                .filter(|p| p.parent().is_some()),
+            bin_name,
+            false,
+        ))
+    }
+
+    /// [`Self::which`] narrowed to a path the OS can spawn.
+    ///
+    /// Same bin paths, same directory-major traversal, stricter predicate: a shebang-only
+    /// `npm` or an `npm.ps1` is skipped and the search *continues*, so an `npm.cmd` beside
+    /// them wins. `None` here is a stronger statement than [`Self::which`]'s — "this tool
+    /// provides nothing spawnable for `bin_name`" — which is what makes a gate built on it
+    /// trustworthy.
+    ///
+    /// No backend overrides [`Self::which`], so the two can never disagree about which
+    /// directories they searched.
+    async fn which_spawnable(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        bin_name: &str,
+    ) -> eyre::Result<Option<PathBuf>> {
+        Ok(which_in_dirs(
+            self.list_bin_paths(config, tv)
+                .await?
+                .into_iter()
+                .filter(|p| p.parent().is_some()),
+            bin_name,
+            true,
+        ))
     }
 
     fn create_install_dirs(&self, tv: &ToolVersion) -> eyre::Result<()> {
@@ -2549,9 +3048,18 @@ pub trait Backend: Debug + Send + Sync {
     }
     fn cleanup_install_dirs_on_error(&self, tv: &ToolVersion) {
         if !Settings::get().always_keep_install {
-            let _ = remove_all_with_warning(tv.install_path());
-            // Clean up the incomplete marker from cache
-            let _ = file::remove_file(self.incomplete_file_path(tv));
+            let install_path = tv.install_path();
+            let install_removed = remove_all_with_warning(&install_path).is_ok()
+                && matches!(
+                    std::fs::symlink_metadata(&install_path),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound
+                );
+            if install_removed {
+                install_state::clear_incomplete_marker_best_effort(
+                    &tv.ba().short,
+                    &tv.tv_pathname(),
+                );
+            }
             // Remove parent installs dir if it's now empty (no other versions present)
             let installs_path = &self.ba().installs_path;
             if installs_path.exists()
@@ -2627,11 +3135,13 @@ pub trait Backend: Debug + Send + Sync {
     /// Like [`Self::dependency_toolset`] but also includes this tool's per-instance
     /// mise.toml `depends` option (`tv.request.options().depends`). `get_dependencies`
     /// only covers backend/plugin-metadata deps, so a user-declared
-    /// `gcloud = { depends = ["python"] }` is invisible to `dependency_toolset`. Used
-    /// to resolve `tools = true` `[env]` value templates like `{{ tools.python.path }}`
-    /// at install time. Resolved offline; the declared deps are installed before the
-    /// dependent (depends ordering), so their install paths are present. (#10282)
-    async fn install_value_toolset(
+    /// `gcloud = { depends = ["python"] }` is invisible to `dependency_toolset`.
+    /// Used anywhere an install needs the concrete paths or values of its declared
+    /// dependencies, including `tools = true` `[env]` value templates and asdf
+    /// install scripts. Resolved offline; the declared deps are installed before the
+    /// dependent (depends ordering), so their install paths are present. (#10282,
+    /// #4384)
+    async fn install_dependency_toolset(
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
@@ -2643,7 +3153,11 @@ pub trait Backend: Debug + Send + Sync {
             .collect();
         let opts = tv.request.options();
         if let Some(user_deps) = opts.core.depends {
-            names.extend(user_deps);
+            names.extend(
+                user_deps
+                    .into_iter()
+                    .flat_map(|dep| BackendArg::from(dep).all_fulls()),
+            );
         }
         let mut ts: Toolset = config
             .get_tool_request_set()
@@ -2684,6 +3198,94 @@ pub trait Backend: Debug + Send + Sync {
             return Some(bin);
         }
         self.dependency_which(config, bin).await
+    }
+
+    /// The spawnable path for a dependency program: the same three sources as
+    /// [`Self::dependency_path_for_install`] — the install's own toolset, the dependency
+    /// toolset, and PATH — except every candidate must be something the OS can launch.
+    ///
+    /// The preference order deliberately differs from `dependency_path_for_install`,
+    /// which consults PATH before the dependency toolset. This resolver stands in for
+    /// the search `Command::spawn` used to perform itself: every spawn site hands the
+    /// child an environment whose PATH has the dependency toolset's dirs *prepended*
+    /// (`dependency_env`/`prepend_path`), and std resolves a bare program against that
+    /// child PATH — so the mise-managed tool won. Resolving host PATH first here would
+    /// flip that, and a system npm would beat the node-bundled one for the `ts: None`
+    /// metadata probes (`npm view`, `gem sources`, `go list`). Dependency toolset first
+    /// preserves the old selection.
+    ///
+    /// Returns `None` only when *nothing spawnable* exists in any of them, which is
+    /// strictly stronger than `dependency_path_for_install`'s `None`: a `pipx.ps1`, a
+    /// `pipx.vbs` or a shebang-only `pipx.pyz` satisfies that one, while this one steps
+    /// past it and keeps looking. Use this for gate and bail decisions so that "we found
+    /// it" and "we can run it" stop being two different questions.
+    ///
+    /// On unix the predicate degenerates to today's: `executable_names` yields one name,
+    /// `can_execute_directly` *is* `is_executable`, and both the `is_file()` and shim
+    /// filters are `cfg!(windows)`-gated. (`spawn_program` additionally short-circuits
+    /// on unix and never calls this at all.)
+    async fn spawnable_dependency(
+        &self,
+        config: &Arc<Config>,
+        ts: Option<&Toolset>,
+        bin: &str,
+    ) -> Option<PathBuf> {
+        if let Some(ts) = ts
+            && let Some(bin) = ts.which_bin_spawnable(config, bin).await
+        {
+            return Some(bin);
+        }
+        if let Ok(dts) = self.dependency_toolset(config).await
+            && let Some(bin) = dts.which_bin_spawnable(config, bin).await
+        {
+            return Some(bin);
+        }
+        which_non_pristine_spawnable(bin)
+    }
+
+    /// The program to hand `CmdLineRunner::new` or `cmd!` for `bin`.
+    ///
+    /// On Windows: a resolved absolute path when one spawnable candidate was found. mise's
+    /// own lookup is PATHEXT-aware — `executable_names` expands the
+    /// `windows_executable_extensions` setting — but `Command::new` is not: std only ever
+    /// appends `.exe` to a bare name and then reports "program not found". mise's node
+    /// install ships `npm` (a `#!/usr/bin/env bash` script), `npm.cmd` and `npm.ps1` but no
+    /// `npm.exe`, and on Windows the node plugin puts the install root itself on PATH;
+    /// pipx from scoop or `pip install pipx` is only ever `pipx.cmd` (discussion #5333).
+    /// Handing over the resolved path skips std's weaker second lookup — std routes
+    /// `.cmd`/`.bat` through cmd.exe with escaped arguments, the same way the `pip.cmd`
+    /// wrappers mise synthesizes for Windows python are already run.
+    ///
+    /// Falls back to the bare name — today's behavior on every platform — when nothing
+    /// spawnable resolved. The child still receives a PATH built from the toolset, so the
+    /// fallback *is* the old code path and a genuinely missing program produces exactly the
+    /// error it produces today.
+    ///
+    /// Unix keeps the bare name on purpose, and `cfg!(windows)` short-circuits so it does
+    /// no filesystem work to get there. The unix spawn already works, and it is the child
+    /// PATH that decides between a mise-managed tool and a system one
+    /// (`e2e/backend/test_pipx_direct_dependencies` asserts that preference). Resolving
+    /// there would move that decision out of the child's PATH and into mise.
+    ///
+    /// Returns `OsString`, and that is load-bearing rather than cosmetic: duct implements
+    /// `IntoExecutablePath for PathBuf` as `Path::new(".").join(path)`, so a `PathBuf` in a
+    /// `cmd!` program position becomes `./npm` and stops being a PATH lookup at all. duct's
+    /// `OsString` impl returns the value verbatim, and std's `Command::new` never dotifies.
+    async fn spawn_program(
+        &self,
+        config: &Arc<Config>,
+        ts: Option<&Toolset>,
+        bin: &str,
+    ) -> OsString {
+        let resolved = if cfg!(windows) {
+            self.spawnable_dependency(config, ts, bin).await
+        } else {
+            None
+        };
+        match resolved {
+            Some(path) => path.into_os_string(),
+            None => OsString::from(bin),
+        }
     }
 
     /// Check if a required dependency is available and show a warning if not.
@@ -2774,20 +3376,34 @@ pub trait Backend: Debug + Send + Sync {
     }
 
     fn get_remote_version_cache(&self) -> Arc<TokioMutex<VersionCacheManager>> {
+        self.get_remote_version_cache_with_context(None)
+    }
+
+    fn get_remote_version_cache_with_context(
+        &self,
+        context: Option<&str>,
+    ) -> Arc<TokioMutex<VersionCacheManager>> {
         // use a mutex to prevent deadlocks that occurs due to reentrant cache access
         static REMOTE_VERSION_CACHE: Lazy<
             Mutex<HashMap<String, Arc<TokioMutex<VersionCacheManager>>>>,
         > = Lazy::new(Default::default);
 
+        let map_key = match context {
+            Some(context) => format!("{}\0{context}", self.ba().full()),
+            None => self.ba().full(),
+        };
         REMOTE_VERSION_CACHE
             .lock()
             .unwrap()
-            .entry(self.ba().full())
+            .entry(map_key)
             .or_insert_with(|| {
                 let mut cm = CacheManagerBuilder::new(
                     self.ba().cache_path.join("remote_versions.msgpack.z"),
                 )
                 .with_fresh_duration(Settings::get().fetch_remote_versions_cache());
+                if let Some(context) = context {
+                    cm = cm.with_cache_key(context.to_string());
+                }
                 if let Some(plugin_path) = self.plugin().map(|p| p.path()) {
                     cm = cm
                         .with_fresh_file(plugin_path.clone())
@@ -2813,23 +3429,42 @@ pub trait Backend: Debug + Send + Sync {
         let platform_key = self.get_platform_key();
 
         // Get or create asset info for this platform
-        let platform_info = tv.lock_platforms.entry(platform_key.clone()).or_default();
+        let locked = tv
+            .lock_platforms
+            .entry(platform_key.clone())
+            .or_default()
+            .clone();
 
-        if let Some(checksum) = &platform_info.checksum {
+        if let Some(checksum) = &locked.checksum {
             ctx.pr.set_message(format!("checksum {filename}"));
             if let Some((algo, check)) = checksum.split_once(':') {
-                hash::ensure_checksum(file, check, Some(ctx.pr.as_ref()), algo)?;
+                hash::ensure_checksum(file, check, Some(ctx.pr.as_ref()), algo).wrap_err_with(
+                    || {
+                        // Name the lock entry the expectation came from: a mismatch
+                        // usually means the entry describes a different artifact
+                        // than the one this machine downloads (e.g. a Swift build
+                        // for another Linux distro).
+                        let entry = self.describe_lock_entry(tv, &platform_key);
+                        match &locked.url {
+                            Some(url) => format!("{entry} locks {url}"),
+                            None => entry,
+                        }
+                    },
+                )?;
             } else {
                 bail!("Invalid checksum: {checksum}");
             }
         } else if lockfile_enabled {
             ctx.pr.set_message(format!("generate checksum {filename}"));
             let hash = hash::file_hash_blake3(file, Some(ctx.pr.as_ref()))?;
-            platform_info.checksum = Some(format!("blake3:{hash}"));
+            tv.lock_platforms
+                .entry(platform_key.clone())
+                .or_default()
+                .checksum = Some(format!("blake3:{hash}"));
         }
 
         // Handle size verification and generation
-        if let Some(expected_size) = platform_info.size {
+        if let Some(expected_size) = locked.size {
             ctx.pr.set_message(format!("verify size {filename}"));
             let actual_size = file.metadata()?.len();
             if actual_size != expected_size {
@@ -2841,9 +3476,24 @@ pub trait Backend: Debug + Send + Sync {
                 );
             }
         } else if lockfile_enabled {
-            platform_info.size = Some(file.metadata()?.len());
+            tv.lock_platforms.entry(platform_key).or_default().size = Some(file.metadata()?.len());
         }
         Ok(())
+    }
+
+    /// Human-readable identity of the lock entry consulted for `tv` on
+    /// `platform_key`, including the options that distinguish artifact variants.
+    fn describe_lock_entry(&self, tv: &ToolVersion, platform_key: &str) -> String {
+        let options = self
+            .resolve_lockfile_options(&tv.request, &PlatformTarget::from_current())
+            .unwrap_or_default();
+        let entry = format!("lockfile entry for {} on {platform_key}", tv.style());
+        if options.is_empty() {
+            entry
+        } else {
+            let options = options.iter().map(|(k, v)| format!("{k}={v}")).join(", ");
+            format!("{entry} [{options}]")
+        }
     }
 
     async fn outdated_info(
@@ -3383,6 +4033,37 @@ mod latest_version_tests {
 
         assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
         assert_eq!(backend.list_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remote_version_cache_contexts_are_isolated() {
+        let _config = Config::get().await.unwrap();
+        let backend = LatestBackend::new("test-context-cache");
+        let first = backend.get_remote_version_cache_with_context(Some("first"));
+        let second = backend.get_remote_version_cache_with_context(Some("second"));
+
+        first
+            .lock()
+            .await
+            .write(&vec![VersionInfo {
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            }])
+            .unwrap();
+        second
+            .lock()
+            .await
+            .write(&vec![VersionInfo {
+                version: "2.0.0".to_string(),
+                ..Default::default()
+            }])
+            .unwrap();
+
+        assert_eq!(first.lock().await.get_cached().unwrap()[0].version, "1.0.0");
+        assert_eq!(
+            second.lock().await.get_cached().unwrap()[0].version,
+            "2.0.0"
+        );
     }
 
     #[tokio::test]

@@ -113,6 +113,19 @@ depends = ["lint"]   # Also works (for migration compatibility)
 run = "webpack build"
 ```
 
+Dependency paths beginning with `./` are resolved relative to the task that
+declares them. This makes it possible to reuse the same dependency declaration
+at different levels of a monorepo:
+
+```toml
+[tasks.test]
+depends = [{ task = "./...:groups:tests:*", optional = true }]
+```
+
+For example, when declared by `//apps/frontend:test`, this pattern resolves to
+`//apps/frontend/...:groups:tests:*` and matches the current project and its
+descendants without matching sibling projects.
+
 The bare name syntax (without `:`) is supported primarily to ease migration from non-monorepo to monorepo configurations. When migrating, you won't need to update all your task dependencies immediately - they'll continue to work. However, using the `:` prefix makes it clear you're referencing a task in the current config_root.
 :::
 
@@ -297,6 +310,228 @@ Single-level globs (`*`) are supported, but recursive globs (`**`) are not. This
 ::: warning Automatic Discovery Deprecated
 Automatic filesystem walking to discover monorepo subdirectories is deprecated. If you don't define `[monorepo].config_roots`, mise will still walk the filesystem but will emit a deprecation warning. Please migrate to explicit config roots.
 :::
+
+### Nested Monorepo Roots
+
+When more than one config in the hierarchy sets `monorepo_root = true`, the **nearest** one wins. This comes up with git worktrees checked out inside the main checkout:
+
+```
+myproject/mise.toml                       # monorepo_root = true
+myproject/packages/api/mise.toml
+myproject/.worktrees/feature-x/mise.toml  # monorepo_root = true (same repo, other branch)
+myproject/.worktrees/feature-x/packages/api/mise.toml
+```
+
+From inside `myproject/.worktrees/feature-x`, that directory is the monorepo root: `//packages/api:build` resolves to the worktree's copy, `{{config_root}}` points inside the worktree, and the worktree's own `[monorepo].config_roots` are the ones expanded.
+
+Tasks from the **enclosing** monorepo are not loaded. They belong to a different monorepo's task set rather than to a parent namespace of the selected root, so loading them would place them outside the `//` namespace — you'd see `build` from the main checkout sitting next to `//:build` from the worktree. Everything above the enclosing root (your global config, a `$HOME/mise.toml`) is unaffected and still contributes tasks as usual.
+
+The enclosing config is still an ancestor config for **tools, environment variables, and vars**, which inherit the same way any parent config's would. If you don't want that either, keep worktrees outside the main checkout (e.g. `myproject-worktrees/feature-x`).
+
+## Workspace Project Graph (Experimental)
+
+mise can infer a provider-neutral project graph from ecosystem workspace metadata. This graph is separate from config-root task discovery: a project does not need its own `mise.toml` to appear in the graph.
+
+Enable experimental features and mark the repository root:
+
+```toml
+# /myproject/mise.toml
+experimental = true
+monorepo_root = true
+```
+
+Inspect the inferred projects with:
+
+```bash
+mise tasks graph
+mise tasks graph --explain
+mise tasks graph --json
+```
+
+Use `--explain` to see which workspace provider inferred each project, dependency edge, and task.
+When a provider suggests task inputs, outputs, cacheability, or dependencies, the explanation also
+shows the provider and ecosystem metadata file for each suggested field. Values introduced by
+`[monorepo.projects]` overrides are labeled `configuration` instead of being attributed to a
+provider.
+
+The JSON output includes the same information in each project's `provenance`,
+`dependency_provenance`, and `tasks` fields. Task suggestions contain field-level provenance so
+other tooling can distinguish, for example, a `turbo.json` output declaration from a root mise task
+default.
+
+### Node Workspace Discovery
+
+The Node provider discovers npm, pnpm, Yarn, and Bun workspace packages from:
+
+- `pnpm-workspace.yaml`
+- the `workspaces` array in the root `package.json`
+- the single-pattern string form of `workspaces`
+- the Yarn Classic object form, `workspaces.packages`
+
+When both files exist, `pnpm-workspace.yaml` defines membership. For pnpm and detected Yarn workspaces, a valid root `package.json` with a `name` is implicitly included. Positive and negative patterns, recursive `**` globs, and brace patterns such as `packages/{web,api}` are supported for Node workspace discovery. Discovery skips `.git` and `node_modules`, but does not apply Git ignore files or `.ignore` files.
+
+Each discovered package must have a `name` in its `package.json`. mise uses that stable ecosystem identity to create an ID such as `node:@acme/web`; moving the package to another directory does not change its ID. `mise tasks graph` also reports the package root, workspace-definition source, and detected package manager.
+
+### Node Dependency Inference
+
+For every discovered Node package, mise checks these `package.json` fields:
+
+- `dependencies`
+- `devDependencies`
+- `optionalDependencies`
+- `peerDependencies`
+
+When a declared dependency name exactly matches another discovered workspace package, mise adds an edge to that package's stable `node:` project ID. External package names and declarations that refer back to the same project are ignored.
+
+Dependency version strings are treated as opaque. A matching internal name creates the same edge whether its value uses `workspace:*`, `catalog:`, `*`, a normal version range, or another package-manager-specific form. mise does not resolve or compare those values when constructing the project graph.
+
+All four dependency kinds participate in the same project graph, including development dependencies. If the declarations produce a cycle, `mise tasks graph` reports the cycle instead of silently dropping an edge. Use `depends`, `depends_add`, or `depends_remove` in a project override when the inferred build relationship needs to differ from the package manifests.
+
+### Node Package Scripts
+
+When experimental features are enabled, mise imports scripts from each discovered Node workspace
+package as tasks. Packages do not need their own `mise.toml`.
+
+An imported task uses the stable project ID followed by `#` and the package script name:
+
+```bash
+mise run 'node:@acme/web#build'
+```
+
+The equivalent monorepo path is available as an alias, so existing path patterns also work:
+
+```bash
+mise run //apps/web:build
+mise //...:test
+```
+
+The task runs in the package directory through the workspace package manager (`npm`, `pnpm`,
+`yarn`, or `bun`) and passes task arguments through to it. mise uses the root `packageManager`
+declaration or lockfile to select the manager and falls back to npm when neither identifies one.
+`mise task info` reports the package's `package.json` as the task source.
+
+An explicit mise task at the package's monorepo path takes precedence over the imported script.
+Both names continue to resolve to that explicit task.
+
+This inference is currently experimental and only runs for a configured monorepo root:
+
+```bash
+mise settings experimental=true
+```
+
+### Root Task Defaults
+
+Use `[monorepo.task_defaults.<name>]` in the root `mise.toml` to define shared defaults for
+tasks with the same name in every workspace project:
+
+```toml
+[monorepo.task_defaults.build]
+sources = ["src/**", "package.json"]
+outputs = ["dist/**"]
+cache = { enabled = true }
+
+[monorepo.task_defaults.test]
+env = { NODE_ENV = "test" }
+```
+
+These defaults apply to both provider-inferred tasks such as `node:@acme/web#build` and explicit
+mise tasks such as `//apps/web:build`. Task-local configuration takes precedence. When an explicit
+task uses `extends`, its template also takes precedence over the root default.
+
+Root task defaults are experimental and are ignored unless experimental features are enabled.
+
+### Task Definition Precedence
+
+Task definitions are resolved in two stages. First, an explicit project task replaces a
+provider-inferred task with the same project and task name. The provider task's project-ID name is
+kept as an alias for the explicit task, so either name runs the explicit definition.
+
+After selecting the task, mise fills unset fields in this order, from highest to lowest precedence:
+
+1. The selected task's own fields, whether they came from project-local configuration or provider
+   inference
+2. A task template named by `extends`, for explicit tasks that use one
+3. A matching `[monorepo.task_defaults.<name>]` definition from the workspace root
+
+Map fields such as `env`, `vars`, and `tools` merge across these layers, with entries from the
+higher-precedence layer winning. Collection fields such as `depends`, `sources`, and `outputs` use
+the complete value from the highest-precedence layer that defines them rather than concatenating
+values from multiple layers. These are the same merge rules used by [task templates](/tasks/templates).
+
+For example, an inferred package script keeps its provider command when the root default also
+defines `run`, while still inheriting cache inputs or environment entries that the provider did not
+specify. If a project later defines that task explicitly, the explicit command replaces the package
+script; a named template fills its missing fields before the root default does.
+
+### Provider Task Suggestions
+
+Workspace providers can attach task configuration when ecosystem metadata describes it
+unambiguously. A provider can suggest:
+
+- project-relative input patterns, which become task `sources`
+- project-relative output patterns, including an explicit declaration that a task has no file
+  outputs
+- whether task output caching is enabled or disabled
+- project-relative task dependencies and `^task` dependencies
+
+Suggestions are part of the inferred task definition, so they have the same precedence as the
+provider command. A matching explicit project task replaces them. Otherwise, task templates and
+root task defaults fill only fields the provider did not suggest. Providers leave fields unset when
+their ecosystem metadata is not authoritative; mise does not guess outputs or cacheability from a
+command string.
+
+The Node workspace provider reads `inputs`, `outputs`, `cache`, and `dependsOn` from matching
+`turbo.json` task definitions. Turbo-specific patterns that mise cannot preserve exactly, such as
+`$TURBO_ROOT$`, are left unset so a task template or root task default can supply them instead.
+
+### Upstream Task Dependencies
+
+Prefix a task dependency with `^` to run that task in upstream workspace projects first. A root
+task default is the usual way to apply this relationship across the workspace:
+
+```toml
+[monorepo.task_defaults.build]
+depends = ["^build"]
+```
+
+The `^` prefix is supported only in `depends`. It is rejected in `depends_post` and `wait_for`
+because those fields do not describe prerequisite work.
+
+Running `node:@acme/web#build` now runs `build` in each project that `@acme/web` depends on before
+building `@acme/web`. The relationship follows the complete project dependency graph, including
+through intermediate projects that do not define `build`. Missing upstream tasks are skipped.
+For a configured task root that is not represented in the detected project graph, the dependency
+is a no-op because that task has no upstream project relationship.
+
+Upstream dependencies work with both provider-inferred tasks and explicit mise tasks. They use the
+same task scheduler as ordinary `depends`, including cycle detection, deduplication, parallel
+execution, and dependency cache-key propagation. This syntax is available only for configured
+monorepo workspaces while experimental features are enabled.
+
+### Project Overrides
+
+Use `[monorepo.projects]` in the root `mise.toml` to correct or extend provider inference. Project IDs containing `:` or scoped package names must be quoted:
+
+```toml
+[monorepo.projects."node:@acme/web"]
+root = "apps/web"
+depends_add = ["custom:docs"]
+depends_remove = ["node:@acme/legacy"]
+
+[monorepo.projects."custom:docs"]
+root = "docs"
+metadata = { kind = "documentation" }
+```
+
+An override can:
+
+- set `remove = true` to remove an inferred project and its connected edges
+- set `root` or `metadata` to replace inferred values
+- set `depends` to replace the complete inferred dependency set
+- use `depends_add` and `depends_remove` to adjust individual edges
+- add a provider-independent project by giving a new namespaced ID an explicit `root`
+
+The final graph must reference existing project IDs and must not contain dependency cycles. Diagnostics identify the affected projects and the override fields that can repair the graph.
 
 ## Listing Tasks
 

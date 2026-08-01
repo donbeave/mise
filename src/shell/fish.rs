@@ -1,5 +1,4 @@
 #![allow(unknown_lints)]
-#![allow(clippy::literal_string_with_formatting_args)]
 use std::fmt::{Display, Formatter};
 
 use crate::config::Settings;
@@ -101,7 +100,9 @@ impl Shell for Fish {
                     echo;
                 end;
 
-                functions --erase __mise_cd_hook;
+                if test "$mise_fish_mode" = "eval_after_arrow";
+                    functions --erase __mise_cd_hook;
+                end;
             end;
 
             __mise_env_eval

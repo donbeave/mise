@@ -299,11 +299,11 @@ env = "MISE_CARGO_BINSTALL"
 type = "Bool"
 
 [cargo.binstall_native]
-description = "[experimental] Use mise's native cargo binary installer when cargo-binstall is unavailable."
+description = "Use mise's native cargo binary installer when cargo-binstall is unavailable."
 docs = """
 Controls mise's native cargo binary installer, which downloads precompiled binaries using
-`package.metadata.binstall` from the crate's `Cargo.toml` when `cargo-binstall` is not installed.
-This setting is experimental and requires `experimental = true` when explicitly enabled.
+conventional GitHub release artifact names from the crate's linked repository or
+`package.metadata.binstall` from its `Cargo.toml` when `cargo-binstall` is not installed.
 
 - If `true`: Try mise's native cargo binary installer first, fall back to `cargo install` if unavailable.
 - If `false`: Do not use mise's native cargo binary installer.
@@ -314,10 +314,9 @@ This setting is experimental and requires `experimental = true` when explicitly 
 Set `cargo.binstall = false` to force `cargo install` instead of either `cargo-binstall` or mise's
 native cargo binary installer.
 
-This is a best-effort fast path. If the crate does not declare compatible
-metadata, the artifact is unavailable, or the install uses Cargo build options
-that cannot affect a downloaded binary (including `locked = true`), mise falls
-back to `cargo install`.
+This is a best-effort fast path. If neither compatible metadata nor a conventionally named GitHub
+release artifact is available, or the install uses Cargo build options that would change the
+resulting binary, mise falls back to `cargo install`.
 """
 env = "MISE_CARGO_BINSTALL_NATIVE"
 optional = true
@@ -781,7 +780,8 @@ description = "Read Forgejo tokens from the fj CLI config."
 docs = """
 When enabled, mise will read tokens from the fj CLI keys file
 (`~/.local/share/forgejo-cli/keys.json` on Linux,
-`~/Library/Application Support/Cyborus.forgejo-cli/keys.json` on macOS).
+`~/Library/Application Support/forgejo-cli.forgejo-cli/keys.json` on macOS,
+with the legacy `Cyborus.forgejo-cli` location as a fallback).
 This is used as a fallback when no `FORGEJO_TOKEN` or `MISE_FORGEJO_TOKEN`
 environment variable is set.
 
@@ -1247,6 +1247,23 @@ env = "MISE_IDIOMATIC_VERSION_FILE"
 hide = true
 optional = true
 type = "Bool"
+
+[idiomatic_version_file_disable_files]
+default = []
+description = "Specific idiomatic version files to disable for a tool."
+docs = """
+Use `tool:filename` pairs to exclude individual idiomatic version files without disabling
+other files for the tool or other tools that read the same file.
+
+For example, this keeps `.nvmrc` enabled for node while preventing node from reading
+`devEngines.runtime` in `package.json`:
+
+    mise settings add idiomatic_version_file_disable_files node:package.json
+"""
+env = "MISE_IDIOMATIC_VERSION_FILE_DISABLE_FILES"
+parse_env = "set_by_comma"
+rust_type = "BTreeSet<String>"
+type = "SetString"
 
 [idiomatic_version_file_disable_tools]
 default = []
@@ -1772,11 +1789,11 @@ default = "auto"
 description = "Package manager to use for installing npm packages."
 docs = """
 Package manager to use for installing npm packages. The default, `auto`, uses
-`aube` when it is installed and falls back to `npm`, similar to how the pipx
-backend uses `uv` when available. Set this to `npm`, `aube`, `bun`, or `pnpm`
-to force a specific package manager.
+mise's embedded `aube` package manager. Set this to `aube_cli` to invoke a
+standalone aube executable, or to `npm`, `bun`, or `pnpm` to invoke that
+package manager instead.
 """
-enum = ["auto", "npm", "aube", "bun", "pnpm"]
+enum = ["auto", "npm", "aube", "aube_cli", "bun", "pnpm"]
 env = "MISE_NPM_PACKAGE_MANAGER"
 rust_type = "NpmPackageManager"
 type = "String"
@@ -1799,8 +1816,9 @@ as `cafile`, client certificates, or an auth token helper). When enabled, npm
 must be installed.
 
 This applies to the default/`auto` package manager. Explicitly selecting a
-package manager with [`npm.package_manager`](#npm-package-manager) (`bun`,
-`pnpm`, or `npm`) always shells out to that tool regardless of this setting.
+package manager with [`npm.package_manager`](#npm-package-manager) (`aube_cli`,
+`bun`, `pnpm`, or `npm`) always shells out to that tool regardless of this
+setting.
 """
 env = "MISE_NPM_SHELL_OUT"
 type = "Bool"
@@ -2602,6 +2620,18 @@ it, and skips sudo entirely when already running as root (e.g. containers/CI).
 env = "MISE_SYSTEM_PACKAGES_SUDO"
 type = "Bool"
 
+[task.cache_dir]
+description = "[experimental] Directory for task output cache artifacts."
+docs = """
+Store task output cache artifacts in this directory instead of
+`MISE_CACHE_DIR/task-artifacts`. mise stores the current artifact format in a
+versioned subdirectory and includes custom locations in `mise cache clear` and
+manual and automatic cache pruning.
+"""
+env = "MISE_TASK_CACHE_DIR"
+optional = true
+type = "Path"
+
 [task.disable_paths]
 default = []
 description = "Paths that mise will not look for tasks in."
@@ -2921,12 +2951,14 @@ type = "ListPath"
 default = "sh"
 description = "Default shell arguments for Unix to be used for file commands. For example, `sh` for sh."
 env = "MISE_UNIX_DEFAULT_FILE_SHELL_ARGS"
+global_only = true
 type = "String"
 
 [unix_default_inline_shell_args]
 default = "sh -c -o errexit"
 description = "Default shell arguments for Unix to be used for inline commands. For example, `sh -c` for sh."
 env = "MISE_UNIX_DEFAULT_INLINE_SHELL_ARGS"
+global_only = true
 type = "String"
 
 [url_replacements]
@@ -3005,12 +3037,14 @@ type = "Bool"
 default = "cmd /c"
 description = "Default shell arguments for Windows to be used for file commands. For example, `cmd /c` for cmd.exe."
 env = "MISE_WINDOWS_DEFAULT_FILE_SHELL_ARGS"
+global_only = true
 type = "String"
 
 [windows_default_inline_shell_args]
 default = "cmd /c"
 description = "Default shell arguments for Windows to be used for inline commands. For example, `cmd /c` for cmd.exe."
 env = "MISE_WINDOWS_DEFAULT_INLINE_SHELL_ARGS"
+global_only = true
 type = "String"
 
 [windows_executable_extensions]
@@ -3020,6 +3054,26 @@ env = "MISE_WINDOWS_EXECUTABLE_EXTENSIONS"
 parse_env = "list_by_comma"
 rust_type = "Vec<String>"
 type = "ListString"
+
+[windows_powershell_no_profile]
+default = true
+description = "Pass `-NoProfile` to PowerShell (`pwsh`/`powershell`) shells that mise spawns for tasks and inline commands, so startup profiles are skipped."
+docs = """
+When mise runs a task or inline command through PowerShell, it passes
+`-NoProfile` so the shell does not load the user's PowerShell profile. This
+matches the non-interactive behavior of `sh -c` / `zsh -c` on Unix, which do not
+source interactive startup files.
+
+Profiles that mutate `PATH` — for example a mise activation snippet that prepends
+the shims directory — can otherwise shadow a task's own installed tools and
+produce confusing `cannot find binary path` errors.
+
+Set to `false` if your tasks rely on side effects from your PowerShell profile
+(environment variables, functions, aliases). This only affects `pwsh` and
+`powershell`; it has no effect on `cmd` or on non-Windows shells.
+"""
+env = "MISE_WINDOWS_POWERSHELL_NO_PROFILE"
+type = "Bool"
 
 [windows_shim_mode]
 default = "exe"

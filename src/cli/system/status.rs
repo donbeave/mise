@@ -60,6 +60,10 @@ impl SystemStatus {
                         any_missing = true;
                         ("".to_string(), "missing")
                     }
+                    PackageState::NeedsRepair { installed } => {
+                        any_missing = true;
+                        (installed.clone(), "needs repair")
+                    }
                     PackageState::VersionMismatch { installed } => {
                         any_missing = true;
                         (installed.clone(), "version mismatch")
@@ -104,7 +108,7 @@ impl SystemStatus {
             }
         }
         if self.missing && any_missing {
-            crate::exit(1);
+            return Err(crate::request_exit(1));
         }
         Ok(())
     }

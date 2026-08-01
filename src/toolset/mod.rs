@@ -138,7 +138,9 @@ impl Toolset {
             .collect::<Vec<_>>();
         let tvls = parallel::parallel(versions, |(config, ba, mut tvl, opts)| async move {
             if let Err(err) = tvl.resolve(&config, &opts).await {
-                warn!("Failed to resolve tool version list for {ba}: {err}");
+                // warn_once: a command may resolve the same toolset more than
+                // once, and repeating an identical failure adds no information.
+                warn_once!("Failed to resolve tool version list for {ba}: {err}");
             }
             Ok((ba, tvl))
         })
@@ -572,6 +574,25 @@ impl Toolset {
         Self::sort_by_overrides(&mut installed).unwrap();
         for (p, tv) in installed {
             if let Ok(Some(bin)) = Box::pin(p.which(config, &tv, bin_name)).await {
+                return Some(bin);
+            }
+        }
+        None
+    }
+
+    /// [`Self::which_bin`] narrowed to a path the OS can spawn, for
+    /// [`Backend::spawn_program`] and [`Backend::spawnable_dependency`]. `which_bin` itself
+    /// is untouched because `mise which`, shim dispatch and auto-install all depend on its
+    /// answer.
+    pub async fn which_bin_spawnable(
+        &self,
+        config: &Arc<Config>,
+        bin_name: &str,
+    ) -> Option<PathBuf> {
+        let mut installed = self.list_current_installed_versions(config);
+        Self::sort_by_overrides(&mut installed).unwrap();
+        for (p, tv) in installed {
+            if let Ok(Some(bin)) = Box::pin(p.which_spawnable(config, &tv, bin_name)).await {
                 return Some(bin);
             }
         }

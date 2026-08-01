@@ -1,12 +1,11 @@
 use crate::config::{Config, Settings};
-use crate::exit::exit;
 use crate::task::TaskOutput;
 use crate::ui::{self, ctrlc};
-use crate::{Result, backend};
+use crate::{Result, backend, request_exit};
 use crate::{cli::args::ToolArg, path::PathExt};
 use crate::{hook_env as hook_env_module, logger, migrate, shims};
 use clap::{ArgAction, CommandFactory, Subcommand};
-use eyre::bail;
+use eyre::{Report, bail};
 use std::path::PathBuf;
 
 mod activate;
@@ -36,6 +35,7 @@ mod hook_not_found;
 mod tool_alias;
 
 pub use hook_env::HookReason;
+mod command_effects;
 mod deps;
 pub(crate) mod edit;
 mod implode;
@@ -419,8 +419,55 @@ fn escape_args_after_separator(args: &[String], separator_idx: usize) -> Vec<Str
     result
 }
 
-fn first_non_global_arg_idx(cmd: &clap::Command, args: &[String]) -> Option<usize> {
-    let (flags_with_values, _) = get_global_flags(cmd);
+/// Long and short forms of the top-level flags that consume a following argument.
+///
+/// Hardcoded rather than derived because `env.rs` needs it from `Lazy` statics
+/// during startup — before anything has parsed arguments — and deriving it means
+/// building the entire clap tree, which costs ~3.1M instructions. Doing that
+/// there is what made every mise command ~6.3M instructions more expensive.
+///
+/// `test_global_flags_with_values_matches_clap` asserts this equals what clap
+/// reports, so adding a value-taking flag to [`Cli`] without updating this list
+/// fails CI rather than silently mis-parsing arguments.
+pub(crate) const GLOBAL_FLAGS_WITH_VALUES: &[&str] = &[
+    "--cd",
+    "-C",
+    "--env",
+    "-E",
+    "--jobs",
+    "-j",
+    "--profile",
+    "-P",
+    "--shell",
+    "-s",
+    "--tool",
+    "-t",
+    "--log-level",
+    "--output",
+];
+
+/// Index of the first argument that is not a global flag or one of its values.
+///
+/// Takes a `&Command` so callers that have already built one (argument parsing)
+/// use its real flag set. Callers without one want
+/// [`first_non_global_arg_idx_cached`].
+pub(crate) fn first_non_global_arg_idx(cmd: &clap::Command, args: &[String]) -> Option<usize> {
+    let flags = get_global_flags(cmd).0;
+    first_non_global_arg_idx_with(|f| flags.iter().any(|x| x == f), args)
+}
+
+/// As [`first_non_global_arg_idx`], against [`GLOBAL_FLAGS_WITH_VALUES`].
+///
+/// For callers with no `Command` to hand, which would otherwise build the whole
+/// tree just to read its top-level arguments.
+pub(crate) fn first_non_global_arg_idx_cached(args: &[String]) -> Option<usize> {
+    first_non_global_arg_idx_with(|f| GLOBAL_FLAGS_WITH_VALUES.contains(&f), args)
+}
+
+fn first_non_global_arg_idx_with(
+    takes_value: impl Fn(&str) -> bool,
+    args: &[String],
+) -> Option<usize> {
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -433,12 +480,12 @@ fn first_non_global_arg_idx(cmd: &clap::Command, args: &[String]) -> Option<usiz
             return Some(i);
         }
 
-        let flag_takes_value = if arg.starts_with("--") {
+        let flag_takes_separate_value = if arg.starts_with("--") {
             if arg.contains('=') {
                 false
             } else {
                 let flag_name = arg.split('=').next().unwrap();
-                flags_with_values.iter().any(|f| f == flag_name)
+                takes_value(flag_name)
             }
         } else if let Some(flag_name) = arg.get(..2) {
             // `arg.get(..2)` (not `&arg[..2]`) avoids panicking when the arg is
@@ -446,12 +493,12 @@ fn first_non_global_arg_idx(cmd: &clap::Command, args: &[String]) -> Option<usiz
             // malformed byte becomes a multi-byte U+FFFD and byte index 2 may not
             // be a char boundary. A short flag is always ASCII, so a non-ASCII
             // prefix simply matches no value-taking flag.
-            flags_with_values.iter().any(|f| f == flag_name)
+            arg.len() == 2 && takes_value(flag_name)
         } else {
             false
         };
 
-        if flag_takes_value && i + 1 < args.len() {
+        if flag_takes_separate_value && i + 1 < args.len() {
             i += 2;
         } else {
             i += 1;
@@ -628,6 +675,10 @@ fn preprocess_args_for_naked_run(cmd: &clap::Command, args: &[String]) -> Vec<St
 
 impl Cli {
     pub async fn run(args: &Vec<String>) -> Result<()> {
+        run_with_exit_signal(Self::run_inner(args), ctrlc::exit_signal()).await
+    }
+
+    async fn run_inner(args: &Vec<String>) -> Result<()> {
         crate::env::ARGS.write().unwrap().clone_from(args);
         // Load .miserc.toml early, before MISE_ENV and other early settings are accessed.
         // This allows setting MISE_ENV in a config file instead of only via env vars.
@@ -645,7 +696,6 @@ impl Cli {
         measure!("logger", { logger::init() });
         check_working_directory();
         measure!("handle_shim", { shims::handle_shim().await })?;
-        ctrlc::init();
         let print_version = version::print_version_if_requested(args)?;
         // Clap's tool argument parsers consult installed plugin/tool metadata while
         // resolving registry options. Initialize that filesystem-only state before
@@ -665,12 +715,12 @@ impl Cli {
         // Reuse the already-built clap command rather than letting
         // `Cli::parse_from` construct the whole tree a second time.
         let cli = measure!("get_matches_from", {
-            let matches = cmd.get_matches_from(processed_args.iter());
-            match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
-                Ok(cli) => cli,
-                Err(err) => err.format(&mut Cli::command()).exit(),
-            }
-        });
+            let matches = cmd
+                .try_get_matches_from(processed_args.iter())
+                .map_err(clap_error)?;
+            <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+                .map_err(|err| clap_error(err.format(&mut Cli::command())))
+        })?;
         // Validate --cd path BEFORE Settings processes it and changes the directory
         validate_cd_path(&cli.cd)?;
         measure!("add_cli_matches", { Settings::add_cli_matches(&cli) });
@@ -690,7 +740,7 @@ impl Cli {
         trace!("MISE_BIN: {}", crate::env::MISE_BIN.display_user());
         if print_version {
             version::show_latest().await;
-            exit(0);
+            return Err(request_exit(0));
         }
         let cmd = cli.get_command().await?;
         measure!("run {cmd}", { cmd.run().await })
@@ -704,7 +754,7 @@ impl Cli {
                 // Handle special case: "help", "-h", or "--help" as task should print help
                 if task == "help" || task == "-h" || task == "--help" {
                     Cli::command().print_help()?;
-                    exit(0);
+                    return Err(request_exit(0));
                 }
 
                 let config = Config::get().await?;
@@ -744,6 +794,7 @@ impl Cli {
                         context_builder: Default::default(),
                         executor: None,
                         no_cache: Default::default(),
+                        task_cache: crate::task::TaskCacheMode::from_env()?,
                         timeout: None,
                         skip_deps: false,
                         skip_tools: false,
@@ -769,12 +820,30 @@ impl Cli {
                             .chain(self.task_args_last)
                             .collect(),
                     )?;
-                    exit(0);
+                    return Err(request_exit(0));
                 }
             }
             Cli::command().print_help()?;
-            exit(1)
+            Err(request_exit(1))
         }
+    }
+}
+
+async fn run_with_exit_signal<T>(
+    command: impl std::future::Future<Output = Result<T>>,
+    exit_signal: impl std::future::Future<Output = i32>,
+) -> Result<T> {
+    tokio::select! {
+        result = command => result,
+        code = exit_signal => Err(request_exit(code)),
+    }
+}
+
+fn clap_error(err: clap::Error) -> Report {
+    let code = err.exit_code();
+    match err.print() {
+        Ok(()) => request_exit(code),
+        Err(err) => err.into(),
     }
 }
 
@@ -851,7 +920,51 @@ fn validate_cd_path(cd: &Option<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Guards [`GLOBAL_FLAGS_WITH_VALUES`]. It is hardcoded so that startup does
+    /// not have to build the clap tree; this keeps it honest. If you added a
+    /// value-taking flag to `Cli`, add it to that list too.
+    #[test]
+    fn test_global_flags_with_values_matches_clap() {
+        let derived = get_global_flags(&Cli::command()).0;
+        let mut derived_sorted = derived.clone();
+        derived_sorted.sort();
+        let mut hardcoded: Vec<String> = GLOBAL_FLAGS_WITH_VALUES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        hardcoded.sort();
+        assert_eq!(
+            hardcoded, derived_sorted,
+            "GLOBAL_FLAGS_WITH_VALUES is stale; clap reports {derived:?}"
+        );
+    }
     use super::*;
+
+    #[tokio::test]
+    async fn exit_signal_drops_command_future_before_returning() {
+        struct DropGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = DropGuard(dropped.clone());
+        let command = async move {
+            let _guard = guard;
+            std::future::pending::<Result<()>>().await
+        };
+
+        let err = run_with_exit_signal(command, std::future::ready(42))
+            .await
+            .unwrap_err();
+
+        assert_eq!(crate::exit::requested_exit_code(&err), Some(42));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn test_subcommands_are_sorted() {
@@ -956,6 +1069,26 @@ mod tests {
         ];
 
         assert!(!uses_deprecated_backends_alias(&cmd, &args));
+    }
+
+    #[test]
+    fn test_first_non_global_arg_idx_handles_attached_short_flag_values() {
+        let cmd = Cli::command();
+        let args = |args: &[&str]| {
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for args in [
+            args(&["mise", "-C", "/tmp", "lock"]),
+            args(&["mise", "-C/tmp", "lock"]),
+            args(&["mise", "-C=/tmp", "lock"]),
+            args(&["mise", "-j8", "lock"]),
+        ] {
+            let idx = first_non_global_arg_idx(&cmd, &args).unwrap();
+            assert_eq!(args[idx], "lock");
+        }
     }
 
     #[test]

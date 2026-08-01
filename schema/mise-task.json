@@ -160,15 +160,15 @@
         "outputs": {
           "oneOf": [
             {
-              "description": "files created by this task",
+              "description": "files created by this task (entries starting with `!` are excluded; use `\\!` to escape a literal `!` prefix)",
               "items": {
-                "description": "glob pattern or path to files created by this task",
+                "description": "glob pattern or path to files created by this task (entries starting with `!` are excluded)",
                 "type": "string"
               },
               "type": "array"
             },
             {
-              "description": "glob pattern or path to files created by this task",
+              "description": "glob pattern or path to files created by this task (entries starting with `!` are excluded)",
               "type": "string"
             },
             {
@@ -184,6 +184,32 @@
               "type": "object"
             }
           ]
+        },
+        "cache": {
+          "description": "experimental local artifact cache for declared task outputs",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "store and restore task outputs from the local mise cache",
+              "type": "boolean"
+            },
+            "env": {
+              "description": "ambient environment variable names whose values affect the cache key",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command_inputs": {
+              "description": "commands whose stdout and stderr affect the cache key",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
         },
         "output": {
           "description": "output style for this task (prefix, interleave, keep-order, replacing, timed, quiet, silent). Independent of the quiet/silent verbosity fields.",
@@ -277,6 +303,9 @@
             }
           ]
         },
+        "watch": {
+          "$ref": "#/$defs/task_watch"
+        },
         "shell": {
           "description": "specify a shell command to run the script with",
           "type": "string"
@@ -337,6 +366,13 @@
         },
         "allow_env": {
           "description": "allow specific env vars through",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pass_through_env": {
+          "description": "experimental ambient env vars preserved under environment denial without affecting the task cache key",
           "items": {
             "type": "string"
           },
@@ -787,6 +823,18 @@
         ]
       }
     },
+    "task_watch": {
+      "description": "options used by `mise watch` for this task",
+      "type": "object",
+      "unevaluatedProperties": false,
+      "properties": {
+        "no_vcs_ignore": {
+          "default": false,
+          "description": "do not load VCS ignore files such as `.gitignore` when watching this task",
+          "type": "boolean"
+        }
+      }
+    },
     "tool": {
       "oneOf": [
         {
@@ -930,6 +978,10 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "optional": {
+              "description": "do not fail when the task name or pattern has no matches",
+              "type": "boolean"
             }
           },
           "required": ["task"],
@@ -1039,6 +1091,9 @@
         "tools": {
           "$ref": "#/$defs/env_tools"
         },
+        "expand": {
+          "$ref": "#/$defs/env_file_expand"
+        },
         "redact": {
           "$ref": "#/$defs/env_redact"
         },
@@ -1108,6 +1163,11 @@
           }
         }
       ]
+    },
+    "env_file_expand": {
+      "type": "boolean",
+      "default": false,
+      "description": "enable shell-style variable expansion for values loaded by env._.file"
     },
     "os_filter_item": {
       "description": "operating system or os/arch pair to install on",

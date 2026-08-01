@@ -5,14 +5,13 @@ use crate::Plugin;
 use crate::error::Result;
 
 impl Plugin {
-    #[allow(clippy::needless_return)] // seems to be a clippy bug
     #[tokio::main(flavor = "current_thread")]
     pub async fn available(&self) -> Result<Vec<AvailableVersion>> {
         self.available_async().await
     }
 
     pub async fn available_async(&self) -> Result<Vec<AvailableVersion>> {
-        debug!("[vfox:{}] available_async", &self.name);
+        debug!("[vfox:{}] available_async", self.name);
         let ctx = self.context(None)?;
         let available = self
             .eval_async(chunk! {

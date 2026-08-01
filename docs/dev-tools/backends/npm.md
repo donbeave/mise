@@ -25,8 +25,11 @@ auth token helper.
 
 You can also pick a specific installer with
 [`npm.package_manager`](/configuration/settings.html#npm-package-manager). The
-default `auto` uses the embedded aube; setting it to `bun`, `pnpm`, or `npm`
-shells out to that tool, which must then be installed.
+default `auto` uses the embedded aube; setting it to `aube_cli`, `bun`, `pnpm`,
+or `npm` shells out to that tool, which must then be installed. The standalone
+`aube_cli` mode uses mise's built-in HTTP client for version metadata when
+`npm.shell_out` remains at its default `false`, and invokes `aube` directly for
+installation; it does not rely on aube's `npm` compatibility shim.
 
 The npm backend forwards [`minimum_release_age`](/configuration/settings.html#minimum_release_age)
 to transitive dependency resolution during install. The embedded aube installer
@@ -49,6 +52,67 @@ mise use -g pnpm
 # or
 mise use -g bun
 ```
+
+## Socket security
+
+There are two ways to use [Socket](https://socket.dev) with `npm:` tools installed
+by mise.
+
+### Bun-compatible security scanner
+
+The embedded aube installer implements
+[Bun's Security Scanner API](https://bun.sh/docs/pm/security-scanner-api) and is
+compatible with Socket's
+[`@socketsecurity/bun-security-scanner`](https://socket.dev/blog/socket-integrates-with-bun-1-3-security-scanner-api).
+Set `AUBE_SECURITY_SCANNER` to enable it:
+
+```sh
+MISE_NPM_PACKAGE_MANAGER=aube \
+AUBE_SECURITY_SCANNER=/absolute/path/to/scanner.mjs \
+  mise install npm:prettier@latest
+```
+
+Selecting `aube` explicitly ensures the scanner is used even if the user's
+mise settings otherwise select npm, Bun, or pnpm.
+
+The scanner runs after dependency resolution and before package tarballs are
+downloaded. It receives the resolved direct and transitive registry packages;
+a fatal finding blocks the install. A configured scanner also fails closed if
+it cannot start or complete. See
+[aube's security scanner documentation](https://aube.jdx.dev/package-manager/security-scanner.html)
+for the complete behavior and configuration.
+
+Mise installs each `npm:` tool in a synthetic project, so a bare scanner package
+name is not normally resolvable from that project's `node_modules`. Point the
+setting at an absolute module instead. For example, install the Socket scanner
+in a separate, stable directory and place this wrapper beside that directory's
+`node_modules`:
+
+```js
+// scanner.mjs
+export { scanner } from "@socketsecurity/bun-security-scanner";
+```
+
+The scanner bridge requires Node.js 22.6 or newer. It inherits Socket-specific
+environment variables such as `SOCKET_SECURITY_API_KEY`, while aube removes
+common npm and GitHub credentials from the scanner subprocess.
+
+### Socket Firewall
+
+[Socket Firewall](https://docs.socket.dev/docs/socket-firewall-free) can instead
+wrap mise itself:
+
+```sh
+sfw mise install npm:prettier@latest
+sfw mise use -g npm:prettier
+```
+
+This works at the network layer. Mise's npm metadata client and embedded aube
+installer both use aube-registry, which honors the `HTTP_PROXY`, `HTTPS_PROXY`,
+and `NO_PROXY` settings and explicitly loads the `NODE_EXTRA_CA_CERTS` bundle
+into its Rust TLS clients. Socket currently documents npm, yarn, and pnpm rather
+than mise or aube as supported JavaScript package managers, so this
+interoperability is not an upstream compatibility guarantee.
 
 ## Usage
 
@@ -85,14 +149,17 @@ allowing them means allowing code from the selected package and its dependencies
 installation.
 
 With the default `npm.package_manager = "auto"` setting, mise installs through its embedded `aube`
-package manager. Setting `npm.package_manager = "aube"`, `"pnpm"`, `"bun"`, or `"npm"` chooses a
-package manager explicitly (`aube` also uses the embedded one; the others shell out).
-[`npm.shell_out`](/configuration/settings.html#npm-shell-out) forces the npm CLI. The `allow_builds`,
-`trust_policy_excludes`, `pnpm_args`, `bun_args`, and `npm_args` options only affect the package
-manager that is actually used; an approval option for one does not change the behavior of another.
+package manager. Setting `npm.package_manager = "aube"`, `"aube_cli"`, `"pnpm"`, `"bun"`, or
+`"npm"` chooses a package manager explicitly (`aube` also uses the embedded one; the others shell
+out).
+With the default `auto` package manager, [`npm.shell_out`](/configuration/settings.html#npm-shell-out)
+forces the npm CLI. An explicitly selected installer still takes precedence for installation.
+The `allow_builds`, `trust_policy_excludes`, `pnpm_args`, `bun_args`, and `npm_args` options only
+affect the package manager that is actually used; an approval option for one does not change the
+behavior of another.
 
 For tools that need reviewed dependency build scripts, use `allow_builds` with `aube` (default),
-`pnpm`, or npm 11.16.0+.
+`aube_cli`, `pnpm`, or npm 11.16.0+.
 
 ### `aube` (default)
 
@@ -109,6 +176,20 @@ Use `allow_builds` for reviewed dependency builds:
 Use `trust_policy_excludes` for reviewed aube trust-policy exceptions.
 Set `allow_builds = true` to allow every dependency build script when you explicitly accept the risk.
 (The `aube_args` option is ignored now that installs run in-process rather than via the `aube` CLI.)
+
+### `aube_cli`
+
+Set `npm.package_manager = "aube_cli"` to install through a standalone `aube`
+executable while retaining mise's built-in HTTP metadata lookup:
+
+```toml
+[settings.npm]
+package_manager = "aube_cli"
+```
+
+This mode invokes `aube add --global` directly. It forwards `aube_args` and
+`allow_builds`, and does not require `aube activate` or depend on the behavior
+of aube's npm compatibility shim.
 
 ### `pnpm`
 
@@ -184,8 +265,8 @@ go in `[tools]` in `mise.toml`.
 ### `allow_builds`
 
 Packages whose dependency lifecycle build scripts should be approved when
-`settings.npm.package_manager = "aube"`, `"pnpm"`, or npm 11.16.0+. Use this instead of spelling out
-package-manager-specific approval flags in `aube_args`, `pnpm_args`, or `npm_args`.
+`settings.npm.package_manager = "aube"`, `"aube_cli"`, `"pnpm"`, or npm 11.16.0+. Use this instead
+of spelling out package-manager-specific approval flags in `aube_args`, `pnpm_args`, or `npm_args`.
 
 For example, to allow one verified dependency build script:
 
@@ -215,8 +296,8 @@ requires npm 11.16.0+.
 ### `trust_policy_excludes`
 
 Packages or package version ranges that should be exempt from aube's `trustPolicy=no-downgrade`
-check when `settings.npm.package_manager = "aube"`. Use this for reviewed dependency provenance
-metadata churn without disabling the trust policy for the whole install.
+check when `settings.npm.package_manager = "aube"` or `"aube_cli"`. Use this for reviewed dependency
+provenance metadata churn without disabling the trust policy for the whole install.
 
 For example, to exempt every version of a dependency:
 
@@ -235,10 +316,62 @@ To exempt only selected versions, use aube's package-version pattern syntax:
 `trust_policy_excludes` is written to the aube install `.npmrc` as `trustPolicyExclude`. It does
 not affect `npm`, `pnpm`, or `bun` installs.
 
+### `allow_low_downloads`
+
+Allows the requested package to install even though its weekly download count falls below aube's
+`lowDownloadThreshold` (1000 by default). Without it, aube refuses:
+
+```
+refusing to add some-tool: only 930 weekly downloads (threshold: 1000).
+```
+
+```toml
+[tools]
+"npm:some-tool" = { version = "latest", allow_low_downloads = true }
+```
+
+The exemption is scoped to the package you asked for, written to the aube install `.npmrc` as
+`allowedUnpopularPackages=<package>`. Transitive dependencies stay gated, and the threshold itself
+is left alone — so this cannot silently admit an unpopular dependency you did not choose.
+
+An npm tool resolved from `mise.lock` is trusted automatically for this download-count check, so
+reproducing an existing lockfile does not require `allow_low_downloads`. The explicit option is
+still required to approve the first unlocked install.
+
+Download count is a popularity signal, not a safety one: a low count means few others have vetted
+the package, so prefer confirming you trust the publisher over reaching for this. It does not affect
+`npm`, `pnpm`, or `bun` installs.
+
+### Investigating trust downgrades
+
+A `trustPolicy=no-downgrade` failure is a supply-chain signal, not an ordinary inability to find a
+matching version. It means an earlier release had stronger npm trusted-publisher, staged-publish,
+or provenance evidence than the selected release.
+
+Before adding an exception:
+
+1. Inspect the npm release, source tag/commit, publisher identity, and tarball, compare the metadata
+   with npmjs.org, and confirm nothing appears tampered with.
+2. Check whether the maintainer intentionally published manually, backported outside the trusted
+   workflow, skipped provenance, or used a registry that stripped metadata.
+3. Report inconsistent evidence to the relevant upstream owner. Package-release drift belongs with
+   the maintainer; metadata present on npmjs.org but missing from a proxy or mirror belongs with
+   that registry operator.
+4. Prefer a version-scoped `"<package>@<version>"` exception after review. A bare package name
+   exempts every future version.
+
+With the default `auto` package manager, using `mise settings npm.shell_out=true` switches to the npm
+CLI and bypasses this aube check entirely, so it should be a last resort rather than the first
+workaround. An explicit `npm.package_manager = "aube_cli"` selection still uses standalone aube for
+installation.
+
+See aube's [trust-policy documentation](https://aube.jdx.dev/security#trust-policy) for more
+detail.
+
 ### `aube_args`
 
 Additional arguments to pass to `aube add --global` when
-`settings.npm.package_manager = "aube"`.
+`settings.npm.package_manager = "aube_cli"`.
 These are raw user-supplied arguments.
 
 For example, to install `npm` with aube's append-only reporter mode:

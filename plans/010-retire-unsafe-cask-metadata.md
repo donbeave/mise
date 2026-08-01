@@ -133,12 +133,12 @@ existing mise receipt does not trigger Homebrew metadata repair.
 
 ## Done criteria
 
-- [ ] No production code creates or repairs Homebrew cask metadata.
-- [ ] Existing foreign Homebrew metadata is never deleted or rewritten.
-- [ ] Mise receipt/status behavior remains tested.
-- [ ] Docs describe truthful mise-only ownership.
-- [ ] Focused tests and docs build pass.
-- [ ] `rtk git diff --check` emits no output.
+- [x] No production code creates or repairs Homebrew cask metadata.
+- [x] Existing foreign Homebrew metadata is never deleted or rewritten.
+- [x] Mise receipt/status behavior remains tested.
+- [x] Docs describe truthful mise-only ownership.
+- [x] Focused tests and docs build pass.
+- [x] `rtk git diff --check` emits no output.
 
 ## STOP conditions
 

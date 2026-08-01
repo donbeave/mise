@@ -162,7 +162,11 @@ fn cache_dir() -> PathBuf {
 
 pub fn get_headers<U: IntoUrl>(url: U) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let url = url.into_url().unwrap();
+    // An invalid URL just means no auth headers; the real error surfaces when the
+    // request is made. Avoid panicking here. See #3547.
+    let Ok(url) = url.into_url() else {
+        return headers;
+    };
 
     if let Some((token, _source)) = resolve_token(url.host_str().unwrap_or("codeberg.org")) {
         headers.insert(
@@ -196,6 +200,27 @@ impl fmt::Display for TokenSource {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Test-only hook that lets tests seed a token without mutating the environment.
+    //! Only consulted from [`super::resolve_token`] under `#[cfg(test)]`; production builds
+    //! never see it. Deliberately checked *before* the env-var branch so a developer's
+    //! ambient `FORGEJO_TOKEN` / `MISE_FORGEJO_ENTERPRISE_TOKEN` cannot change the outcome.
+    //! Mirrors the equivalent in [`crate::github`].
+
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    /// Overrides the `forgejo_tokens.toml` source in [`super::resolve_token`], keyed by host.
+    pub(crate) static TOKENS_FILE_OVERRIDE: RwLock<Option<HashMap<String, String>>> =
+        RwLock::new(None);
+
+    pub(crate) fn lookup_tokens_file_override(host: &str) -> Option<String> {
+        let guard = TOKENS_FILE_OVERRIDE.read().ok()?;
+        guard.as_ref()?.get(host).cloned()
+    }
+}
+
 /// Resolve the Forgejo token for the given hostname.
 ///
 /// Priority:
@@ -206,6 +231,11 @@ impl fmt::Display for TokenSource {
 /// 5. fj CLI token (from `keys.json`)
 /// 6. `git credential fill` (if enabled)
 pub fn resolve_token(host: &str) -> Option<(String, TokenSource)> {
+    #[cfg(test)]
+    if let Some(token) = test_support::lookup_tokens_file_override(host) {
+        return Some((token, TokenSource::TokensFile));
+    }
+
     let settings = Settings::get();
     let is_codeberg = host == "codeberg.org";
 
@@ -278,20 +308,29 @@ static FJ_HOSTS: Lazy<HashMap<String, String>> = Lazy::new(|| read_fj_hosts().un
 fn fj_keys_path() -> Option<PathBuf> {
     // Linux/XDG: $XDG_DATA_HOME/forgejo-cli/keys.json
     let xdg_path = env::XDG_DATA_HOME.join("forgejo-cli/keys.json");
-    if xdg_path.exists() {
-        return Some(xdg_path);
-    }
+    let candidates = [xdg_path.clone()]
+        .into_iter()
+        .chain(fj_native_keys_paths())
+        .collect();
+    Some(tokens::first_existing_file(candidates, xdg_path))
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let macos_path =
-            dirs::HOME.join("Library/Application Support/Cyborus.forgejo-cli/keys.json");
-        if macos_path.exists() {
-            return Some(macos_path);
-        }
-    }
+#[cfg(target_os = "macos")]
+fn fj_native_keys_paths() -> Vec<PathBuf> {
+    fj_macos_keys_paths(&dirs::HOME).into()
+}
 
-    Some(xdg_path)
+#[cfg(not(target_os = "macos"))]
+fn fj_native_keys_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn fj_macos_keys_paths(home: &std::path::Path) -> [PathBuf; 2] {
+    [
+        home.join("Library/Application Support/forgejo-cli.forgejo-cli/keys.json"),
+        home.join("Library/Application Support/Cyborus.forgejo-cli/keys.json"),
+    ]
 }
 
 fn read_fj_hosts() -> Option<HashMap<String, String>> {
@@ -398,6 +437,22 @@ something_else = "value"
 "#;
         let result = tokens::parse_tokens_toml(toml).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_fj_macos_keys_paths_prefers_current_path() {
+        let paths = fj_macos_keys_paths(std::path::Path::new("/Users/test"));
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from(
+                    "/Users/test/Library/Application Support/forgejo-cli.forgejo-cli/keys.json"
+                ),
+                PathBuf::from(
+                    "/Users/test/Library/Application Support/Cyborus.forgejo-cli/keys.json"
+                ),
+            ]
+        );
     }
 
     // #10343: a first page made up entirely of prereleases must not yield "no
@@ -537,5 +592,71 @@ something_else = "value"
         p3.assert_async().await;
         p4.assert_async().await;
         assert_eq!(releases.len(), 3);
+    }
+
+    const TEST_TOKEN: &str = "forgejo_paginate_test";
+
+    /// Seeds a token for `host` for the lifetime of the guard.
+    struct TokensFileOverrideGuard;
+
+    impl TokensFileOverrideGuard {
+        fn set(host: &str) -> Self {
+            let mut tokens = std::collections::HashMap::new();
+            tokens.insert(host.to_string(), TEST_TOKEN.to_string());
+            *test_support::TOKENS_FILE_OVERRIDE.write().unwrap() = Some(tokens);
+            Self
+        }
+    }
+
+    impl Drop for TokensFileOverrideGuard {
+        fn drop(&mut self) {
+            *test_support::TOKENS_FILE_OVERRIDE.write().unwrap() = None;
+        }
+    }
+
+    // Regression: every paginated request must carry the Authorization header. This loop is
+    // already correct; the test exists because nothing pinned it -- gitlab had the same loop
+    // without the auth re-derivation and nobody noticed for a year.
+    #[tokio::test]
+    async fn test_list_releases_sends_auth_on_every_page() {
+        let _config = crate::config::Config::get().await.unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let repo = "owner/auth-on-every-page";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host);
+        let auth = format!("Bearer {TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("/repos/{repo}/releases").as_str())
+            .match_query(mockito::Matcher::UrlEncoded("limit".into(), "100".into()))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{base}/page2>; rel=\"next\"").as_str())
+            .with_body(
+                serde_json::to_string(&vec![release("v2.0.0-alpha.1", false, true)]).unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/page2")
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![release("v1.0.0", false, false)]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let releases = list_releases_(&base, repo).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(releases.len(), 2);
     }
 }
