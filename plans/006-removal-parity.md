@@ -196,3 +196,25 @@ exit 0.
   directives would leave residue and pass tests that only count removals.
 - Deferred: `brew uninstall --zap` equivalence (no mise surface exists;
   out of scope by design).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** a disposable local Homebrew prefix was unavailable for
+  the requested uninstall listing, and recorded uninstall metadata can
+  contain action kinds that must not be silently skipped.
+- **Evidence:** Homebrew's `Keg#unlink` and formula uninstall code define
+  the formula post-state; cask receipts contain the installed version's
+  `uninstall_artifacts`, including direct artifacts and `uninstall`
+  directives. `zap` is a separate artifact and is excluded from plain
+  uninstall. The source-derived listing is committed under `testdata/`;
+  plan 007 supplies the disposable differential execution.
+- **Options:** (1) continue using only legacy mise target receipts —
+  rejected because Homebrew-origin state remains unremovable; (2) fetch
+  today's catalog — rejected because uninstall facts are version-specific;
+  (3) pre-validate and execute the installed receipt's direct targets plus
+  native `pkgutil`, `delete`, `quit`, and `launchctl` actions, refusing
+  unknown kinds before any removal.
+- **Choice:** option 3. Both origins now share the prune path, all
+  candidates are validated before the first mutation, metadata is removed
+  with the final version, zap is ignored by construction, and formula
+  racks are removed only when empty.
