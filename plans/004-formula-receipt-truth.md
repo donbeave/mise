@@ -47,7 +47,7 @@ Verified at `origin/main` `d5e0390dc`, `src/system/packages/brew/pour.rs`:
   receipt's `homebrew_version` back — mise itself consumes this field for
   relocation decisions; keep behavior identical under the new value.
 - Lines 303-377: `write_receipt(rf, tag, keg, report, closure,
-  poured_from_bottle)` builds the JSON inline. Key excerpt:
+poured_from_bottle)` builds the JSON inline. Key excerpt:
 
   ```rust
   let receipt = json!({
@@ -89,11 +89,11 @@ Verified at `origin/main` `d5e0390dc`, `src/system/packages/brew/pour.rs`:
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| Linux e2e | `mise run test:e2e e2e/cli/test_system_install_brew_linux` | pass on Linux CI; skip elsewhere |
-| Lint | `mise run lint` | exit 0 |
+| Purpose    | Command                                                    | Expected on success              |
+| ---------- | ---------------------------------------------------------- | -------------------------------- |
+| Unit tests | `cargo test --all-features system::packages::brew`         | exit 0                           |
+| Linux e2e  | `mise run test:e2e e2e/cli/test_system_install_brew_linux` | pass on Linux CI; skip elsewhere |
+| Lint       | `mise run lint`                                            | exit 0                           |
 
 ## Scope
 

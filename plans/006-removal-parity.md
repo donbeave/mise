@@ -75,11 +75,11 @@ cannot be read (never delete what you cannot classify).
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| Linux e2e | `mise run test:e2e e2e/cli/test_system_install_brew_linux` | pass on Linux CI |
-| Lint | `mise run lint` | exit 0 |
+| Purpose    | Command                                                    | Expected on success |
+| ---------- | ---------------------------------------------------------- | ------------------- |
+| Unit tests | `cargo test --all-features system::packages::brew`         | exit 0              |
+| Linux e2e  | `mise run test:e2e e2e/cli/test_system_install_brew_linux` | pass on Linux CI    |
+| Lint       | `mise run lint`                                            | exit 0              |
 
 ## Scope
 
@@ -167,13 +167,13 @@ exit 0.
 
 - [ ] Teardown consumes recorded receipts, never today's catalog.
 - [ ] Zap directives are never executed by any removal path
-  (test-enforced).
+      (test-enforced).
 - [ ] Cask prune handles both origins; unreadable receipt → skip/refuse,
-  no deletion.
+      no deletion.
 - [ ] Formula removal matches the captured real-brew post-state listing.
 - [ ] Dry-run paths byte-identical output to current CLI; no mutation.
 - [ ] `cargo test --all-features system::packages::brew` and
-  `mise run lint` exit 0.
+      `mise run lint` exit 0.
 - [ ] ONE commit; only in-scope files; `plans/README.md` row 006 updated.
 
 ## STOP conditions

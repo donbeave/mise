@@ -69,11 +69,11 @@ Verified at `origin/main` `d5e0390dc` (files unchanged from baseline):
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Linux e2e | `mise run test:e2e e2e/cli/test_system_install_brew_linux` | pass on Linux CI as root; skip elsewhere |
-| macOS e2e | `mise run test:e2e e2e/cli/test_system_install_brew_macos_slow` | pass on macOS CI; skip elsewhere |
-| Lint | `mise run lint` | exit 0 |
+| Purpose   | Command                                                         | Expected on success                      |
+| --------- | --------------------------------------------------------------- | ---------------------------------------- |
+| Linux e2e | `mise run test:e2e e2e/cli/test_system_install_brew_linux`      | pass on Linux CI as root; skip elsewhere |
+| macOS e2e | `mise run test:e2e e2e/cli/test_system_install_brew_macos_slow` | pass on macOS CI; skip elsewhere         |
+| Lint      | `mise run lint`                                                 | exit 0                                   |
 
 ## Scope
 
@@ -127,7 +127,7 @@ assertions:
    installer inside the disposable CI container — test-only; keep the
    existing root/arch guards and EXIT trap);
 2. `brew install --formula xz -y`; snapshot A; `brew uninstall --formula
-   xz -y`; assert clean post-state; SAVE the post-uninstall tree listing
+xz -y`; assert clean post-state; SAVE the post-uninstall tree listing
    (this is plan 006's parity fixture — commit it under
    `src/system/packages/brew/testdata/` if plan 006 has not already);
 3. engine install `brew:xz` via `mise bootstrap packages apply --yes`;
@@ -194,10 +194,10 @@ engine state, corpus class table.
 ## Done criteria
 
 - [ ] Both e2e suites pass on their CI platforms (evidence: CI run link or
-  local platform runs recorded in the PR description).
+      local platform runs recorded in the PR description).
 - [ ] Normalized differential diffs are EMPTY for all fixtures.
 - [ ] Codex-scenario regression present (brew-installed cask → status
-  installed → apply no-op → zero state change).
+      installed → apply no-op → zero state change).
 - [ ] Post-uninstall parity listings committed as fixtures.
 - [ ] `plans/007-corpus-results.md` complete per Step 4.
 - [ ] No `src/` production change in this plan's commit.

@@ -109,12 +109,12 @@ test style (fake prefix via `MISE_SYSTEM_BREW_PREFIX`).
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Build | `mise run build` | exit 0 |
-| Targeted unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| Lint | `mise run lint` | exit 0 |
-| Lint fix | `mise run lint-fix` | exit 0 |
+| Purpose             | Command                                            | Expected on success |
+| ------------------- | -------------------------------------------------- | ------------------- |
+| Build               | `mise run build`                                   | exit 0              |
+| Targeted unit tests | `cargo test --all-features system::packages::brew` | exit 0              |
+| Lint                | `mise run lint`                                    | exit 0              |
+| Lint fix            | `mise run lint-fix`                                | exit 0              |
 
 ## Scope
 
@@ -265,9 +265,9 @@ ALL must hold:
 - [ ] `cargo test --all-features system::packages::brew` exits 0.
 - [ ] `mise run lint` exits 0 (run `mise run lint-fix` first if needed).
 - [ ] `grep -rn "deny_unknown_fields" src/system/packages/brew/receipt.rs`
-  → no matches.
+      → no matches.
 - [ ] `grep -rn "6\.0\.17" src/system/packages/brew/ | grep -v receipt.rs`
-  → no matches (pin lives only in the module).
+      → no matches (pin lives only in the module).
 - [ ] `git status --short` shows only the in-scope files modified/created.
 - [ ] `plans/README.md` row 001 updated.
 
@@ -294,3 +294,39 @@ Stop and report (do not improvise) if:
   writers.
 - Deferred: SBOM generation (plan 004 decides how `sbom.spdx.json` is
   produced; this plan only ships the fixture and creator-string knowledge).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** the mandatory lint gate failed on the committed executor
+  plans and changed byte-exact real-Homebrew fixtures: Prettier reported all
+  plan Markdown files and added fixture EOF newlines; markdownlint parsed the
+  controlling design's bare `#11810` text as a second top-level heading.
+- **Evidence:** `mise run lint-fix` named `plans/001..008`, `plans/README.md`,
+  and the controlling design as Prettier inputs; markdownlint reported
+  `MD025` at the bare issue reference. Source behavior and receipt fixtures
+  were unaffected.
+- **Options:** (1) skip the lint gate or accept formatter-altered fixtures,
+  violating mandatory verification or byte identity; (2) format only touched
+  plan files, leaving the same repository-wide lint failure; (3) format the
+  executor-plan Markdown corpus, disambiguate the issue as `jdx/mise#11810`,
+  and exclude captured receipt fixtures from Prettier like existing
+  `test/data` fixtures.
+- **Choice:** option 3. It preserves every hard invariant and fixture byte
+  identity, changes no runtime behavior, makes repository lint reproducible,
+  and keeps the issue reference semantically exact.
+
+### Standalone foundation dead-code gate
+
+- **Condition:** `mise run lint` denied `dead_code` warnings because plan 001
+  deliberately lands the shared schema before plans 002–004 consume it.
+- **Evidence:** cargo named only the new receipt module's constant, models,
+  readers, and writers; all are exercised by plan-001 tests and have explicit
+  consumers in the next plans.
+- **Options:** (1) violate plan ordering by combining consumer behavior into
+  this commit; (2) make the binary's private `system` module public solely to
+  suppress reachability warnings; (3) temporarily allow Rust `dead_code` on
+  the receipt module registration, then remove it when consumers land.
+- **Choice:** option 3. It is scoped to this staged foundation, adds no Clippy
+  exclusion, no runtime behavior, and no public surface. Plan 002 must remove
+  it when the first production reader is wired; plans 003–004 consume the
+  remaining writers and models.

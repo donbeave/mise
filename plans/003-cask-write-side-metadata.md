@@ -52,8 +52,8 @@ Verified at `origin/main` `d5e0390dc`:
   the caskroom lock at 332-339), stages, installs artifacts, then writes
   the mise receipt.
 - `cask.rs:~3907-3931` — the mise receipt writer builds `CaskReceipt {
-  schema_version: 3, version, apps, binaries, fonts, completions, pkg_ids,
-  targets (fingerprints), prune_safe, prune_blocker }` and
+schema_version: 3, version, apps, binaries, fonts, completions, pkg_ids,
+targets (fingerprints), prune_safe, prune_blocker }` and
   `write_durable_file(&caskroom.join(".mise-cask.toml"), ...)`.
 - `cask.rs:648-651` — `upgrade` simply calls `install`.
 - `cask.rs:895-913` — `cask_ruby_bin()` shells out to PATH
@@ -89,11 +89,11 @@ Verified at `origin/main` `d5e0390dc`:
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| macOS e2e | `mise run test:e2e e2e/cli/test_system_install_brew_macos_slow` | pass on macOS CI; skip elsewhere |
-| Lint | `mise run lint` | exit 0 |
+| Purpose    | Command                                                         | Expected on success              |
+| ---------- | --------------------------------------------------------------- | -------------------------------- |
+| Unit tests | `cargo test --all-features system::packages::brew`              | exit 0                           |
+| macOS e2e  | `mise run test:e2e e2e/cli/test_system_install_brew_macos_slow` | pass on macOS CI; skip elsewhere |
+| Lint       | `mise run lint`                                                 | exit 0                           |
 
 ## Scope
 
@@ -216,11 +216,11 @@ started, but the full oracle remains 007's deliverable.
 ## Done criteria
 
 - [ ] `cargo test --all-features system::packages::brew` exits 0 incl. new
-  tests.
+      tests.
 - [ ] Fresh engine install writes `.metadata` set and no `.mise-cask.toml`.
 - [ ] Guard removed; already-installed is a no-op.
 - [ ] `grep -rn "Command::new(brew)\|\"brew\", \"ruby\"\|which(\"brew\")" src/` →
-  no production matches.
+      no production matches.
 - [ ] `mise run lint` exits 0.
 - [ ] ONE commit; `git status --short` clean of out-of-scope files.
 - [ ] `plans/README.md` row 003 updated.

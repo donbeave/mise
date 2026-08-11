@@ -71,10 +71,10 @@ condition: `NeedsRepair` with a one-line instruction; mutate nothing.
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| Lint | `mise run lint` | exit 0 |
+| Purpose    | Command                                            | Expected on success |
+| ---------- | -------------------------------------------------- | ------------------- |
+| Unit tests | `cargo test --all-features system::packages::brew` | exit 0              |
+| Lint       | `mise run lint`                                    | exit 0              |
 
 ## Scope
 
@@ -123,8 +123,8 @@ lock):
    then report `Installed { version }`;
 5. any fail → `NeedsRepair` with reason exactly one line, e.g.
    `brew-cask:<token>: legacy mise install cannot be converted (installed
-   1.2.3 != catalog 1.3.0); reinstall with either 'brew install --cask
-   <token>' or mise apply after uninstalling`.
+1.2.3 != catalog 1.3.0); reinstall with either 'brew install --cask
+<token>' or mise apply after uninstalling`.
 
 Order matters: the receipt set must be fully written before
 `.mise-cask.toml` is removed, so an interruption leaves a convertible
@@ -165,10 +165,10 @@ pass.
 
 - [ ] All seven test cases exist and pass.
 - [ ] Backfill writes the complete receipt set before removing
-  `.mise-cask.toml` (test asserts intermediate order via injected failure
-  or file inspection).
+      `.mise-cask.toml` (test asserts intermediate order via injected failure
+      or file inspection).
 - [ ] No payload file is ever touched by backfill (test asserts payload
-  mtimes/hashes unchanged).
+      mtimes/hashes unchanged).
 - [ ] `mise run lint` exits 0.
 - [ ] ONE commit; only in-scope files; `plans/README.md` row 005 updated.
 
@@ -188,7 +188,7 @@ pass.
 
 - This path becomes dead code once the legacy fleet converges; mark it
   clearly (`// legacy .mise-cask.toml backfill — remove when fleet
-  converged`) so a future cleanup can delete reading+backfill together.
+converged`) so a future cleanup can delete reading+backfill together.
 - Reviewer focus: mutation ordering (receipts-before-removal) and that no
   gate failure path writes anything.
 - Deferred: operator-facing aggregate report of all NeedsRepair casks in
