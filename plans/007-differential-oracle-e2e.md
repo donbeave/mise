@@ -226,3 +226,22 @@ engine state, corpus class table.
   entries that hide real divergence defeat the entire architecture.
 - Deferred: scheduled-CI wiring if the repo has no cron workflow pattern
   (follow-up; note it in the PR).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** local platform commands only prove the scripts' guarded
+  skip paths; destructive real-brew installs are forbidden on the
+  operator's live macOS machine, and Linux provisioning requires root in
+  a disposable runner.
+- **Evidence:** `.github/workflows/test.yml` exposes `workflow_dispatch`
+  and contains the macOS slow test. The Linux test creates a dedicated
+  `linuxbrew` user and removes `/home/linuxbrew` on exit. The macOS test
+  refuses non-CI execution and guards every fixture target.
+- **Options:** (1) set `CI=true` locally — rejected as destructive on live
+  state; (2) weaken the oracle or report local skip as a pass — rejected;
+  (3) commit and push the guarded oracle, dispatch the repository test
+  workflow on this branch, then mark DONE only after platform evidence.
+- **Choice:** option 3. The normalization list is limited to explicit
+  machine/time facts and fails if required keys are missing. Corpus classes
+  without a safe disposable representative carry explicit NOT VERIFIED
+  reasons rather than silent success.

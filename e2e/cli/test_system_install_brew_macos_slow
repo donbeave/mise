@@ -10,68 +10,99 @@ fi
 
 # shellcheck source=e2e/cli/brew_oracle_guard.sh
 source "${BASH_SOURCE[0]%/*}/brew_oracle_guard.sh"
+# shellcheck source=e2e/cli/brew_oracle.sh
+source "${BASH_SOURCE[0]%/*}/brew_oracle.sh"
 brew_oracle_require_disposable macos-cask /opt/homebrew
 brew_oracle_configure_runtime /opt/homebrew
+brew=$BREW_ORACLE_BREW
 
 cask_app="/Applications/Hidden Bar.app"
 caskroom="/opt/homebrew/Caskroom/hiddenbar"
+prefix=/opt/homebrew
+hiddenbar_app=$cask_app
+hiddenbar_room=$caskroom
+font_room="$prefix/Caskroom/font-jetbrains-mono"
 
 brew_oracle_require_absent_path "$cask_app" "foreign or stale fixture app"
 brew_oracle_require_absent_path "$caskroom" "foreign or stale fixture Caskroom"
+brew_oracle_require_absent_path "$font_room" "foreign or stale font Caskroom"
+if find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print -quit 2>/dev/null | grep -q .; then
+  brew_oracle_fail "foreign or stale JetBrains Mono font exists"
+fi
 
 cleanup() {
+  "$brew" uninstall --cask hiddenbar --yes >/dev/null 2>&1 || true
+  "$brew" uninstall --cask font-jetbrains-mono --yes >/dev/null 2>&1 || true
   shopt -s nullglob
   local app_work_paths=(
     /Applications/Hidden\ Bar.mise-old-*
     /Applications/Hidden\ Bar.mise-tmp-*
   )
-  chmod -RN "$cask_app" "${app_work_paths[@]}" 2>/dev/null || true
-  rm -rf "$cask_app" "$caskroom" "${app_work_paths[@]}"
+  chmod -RN "$hiddenbar_app" "${app_work_paths[@]}" 2>/dev/null || true
+  rm -rf "$hiddenbar_app" "$hiddenbar_room" "$font_room" "${app_work_paths[@]}"
   brew_oracle_remove_runtime_bridge
 }
 trap cleanup EXIT
 
+oracle_cask() {
+  local token=$1 room="$prefix/Caskroom/$1"
+  cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew-cask:$token" = "latest"
+EOF
+
+  "$brew" install --cask "$token" --yes
+  brew_oracle_snapshot "$room" "brew-$token.snapshot"
+  "$brew" uninstall --cask "$token" --yes
+  assert_fail "test -e '$room'"
+
+  mise bootstrap packages apply --yes
+  brew_oracle_snapshot "$room" "mise-$token.snapshot"
+  brew_oracle_diff "brew-$token.snapshot" "mise-$token.snapshot"
+  assert_contains "'$brew' list --cask" "$token"
+  assert_succeed "'$brew' info --cask '$token'"
+  "$brew" uninstall --cask "$token" --yes
+  assert_fail "test -e '$room'"
+
+  "$brew" install --cask "$token" --yes
+  brew_oracle_snapshot "$room" "before-$token-noop.snapshot"
+  assert_contains "mise bootstrap packages status" "installed"
+  assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
+  brew_oracle_snapshot "$room" "after-$token-noop.snapshot"
+  brew_oracle_diff "before-$token-noop.snapshot" "after-$token-noop.snapshot"
+  "$brew" uninstall --cask "$token" --yes
+}
+
+oracle_cask hiddenbar
+oracle_cask font-jetbrains-mono
+
+# Preserve tap coverage.
 assert_contains "mise bootstrap packages brew tap --dry-run jdx/tap" "~/.config/mise/config.toml"
 mise bootstrap packages brew tap jdx/tap
 assert_contains "cat ~/.config/mise/config.toml" '[bootstrap.brew.taps]'
-assert_contains "cat ~/.config/mise/config.toml" '"jdx/tap" = "https://github.com/jdx/homebrew-tap.git"'
 
+# Protected reinstall still refreshes complete Homebrew metadata.
 cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew-cask:hiddenbar" = "latest"
 EOF
-
+mise bootstrap packages apply --yes
+chmod +a "everyone deny delete_child" "$hiddenbar_app/Contents"
+rm -rf "$hiddenbar_room"
 assert_contains "mise bootstrap packages status" "missing"
 mise bootstrap packages apply --yes
-
-assert_directory_exists "$cask_app"
-assert_directory_exists "$caskroom"
-assert_contains "mise bootstrap packages status" "installed"
-
-# Force a reinstall while the existing app contains a delete-protected
-# directory. This exercises the complete app swap and permission-recovery path
-# without downloading the much larger docker-desktop cask.
-chmod +a "everyone deny delete_child" "$cask_app/Contents"
-rm -rf "$caskroom"
-assert_contains "mise bootstrap packages status" "missing"
-mise bootstrap packages apply --yes
-
-assert_directory_exists "$cask_app"
-assert_directory_exists "$caskroom"
+assert_directory_exists "$hiddenbar_app"
+assert_directory_exists "$hiddenbar_room/.metadata"
 assert_contains "mise bootstrap packages status" "installed"
 assert_fail "find /Applications -maxdepth 1 -name 'Hidden Bar.mise-old-*' -print -quit | grep -q ."
 
-# aube's install docs reference jdx/tap/aube. It currently lives in
-# homebrew/core and the public jdx tap does not publish aube API metadata, so
-# this assertion starts validating the tapped install path as soon as that tap
-# metadata is available without falling back to the brew CLI.
 if curl --retry 3 --retry-delay 1 --max-time 10 -fsSL https://raw.githubusercontent.com/jdx/homebrew-tap/HEAD/api/formula/aube.json >/dev/null 2>&1; then
   cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew:jdx/tap/aube" = "latest"
 EOF
   mise bootstrap packages apply --yes
-  assert_contains "/opt/homebrew/bin/aube --version" "aube"
+  assert_contains "$prefix/bin/aube --version" "aube"
 fi
 
 brew_oracle_complete test_system_install_brew_macos_slow 1 /opt/homebrew

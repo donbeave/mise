@@ -22,6 +22,8 @@ esac
 
 # shellcheck source=e2e/cli/brew_oracle_guard.sh
 source "${BASH_SOURCE[0]%/*}/brew_oracle_guard.sh"
+# shellcheck source=e2e/cli/brew_oracle.sh
+source "${BASH_SOURCE[0]%/*}/brew_oracle.sh"
 brew_oracle_require_disposable linux-formula /home/linuxbrew/.linuxbrew
 
 linuxbrew_home_existed=0
@@ -65,6 +67,7 @@ done
 } >"$MISE_BREW_ORACLE_RESULT_DIR/linux-home.preexisting"
 
 cleanup_linuxbrew_home() {
+  userdel linuxbrew 2>/dev/null || true
   rm -rf /home/linuxbrew
   if [[ $linuxbrew_home_existed == 1 ]]; then
     install -d -m "$linuxbrew_home_mode" -o root -g root /home/linuxbrew
@@ -72,26 +75,53 @@ cleanup_linuxbrew_home() {
 }
 trap cleanup_linuxbrew_home EXIT
 
+useradd --create-home --home-dir /home/linuxbrew linuxbrew
+curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh \
+  -o /home/linuxbrew/install-homebrew.sh
+chown linuxbrew:linuxbrew /home/linuxbrew/install-homebrew.sh
+runuser -u linuxbrew -- env NONINTERACTIVE=1 CI=1 \
+  bash /home/linuxbrew/install-homebrew.sh
+brew=/home/linuxbrew/.linuxbrew/bin/brew
+
 cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew:xz" = "latest"
 EOF
 
+# Real Homebrew baseline in disposable state.
+runuser -u linuxbrew -- "$brew" install --formula xz --yes
+brew_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
+brew_oracle_snapshot "$brew_keg" brew-xz.snapshot
+runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
+assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
+
+# Engine state must be indistinguishable after explicit volatile normalization.
 assert_contains "mise bootstrap packages status" "missing"
-
 mise bootstrap packages apply --yes
+mise_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
+brew_oracle_snapshot "$mise_keg" mise-xz.snapshot
+brew_oracle_diff brew-xz.snapshot mise-xz.snapshot
+assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "xz"
+assert_succeed "runuser -u linuxbrew -- '$brew' info xz"
+runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
+
+# Brew-installed state is an engine no-op and remains byte-identical.
+runuser -u linuxbrew -- "$brew" install --formula xz --yes
+brew_oracle_snapshot "$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)" before-noop.snapshot
 assert_contains "mise bootstrap packages status" "installed"
-assert_succeed "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
-assert_succeed "test \"$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)\" = \"$(readlink -f /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz)\""
+assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
+brew_oracle_snapshot "$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)" after-noop.snapshot
+brew_oracle_diff before-noop.snapshot after-noop.snapshot
+runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
 
-# the poured binary runs at the canonical prefix (relocation + linking worked)
-assert_contains "/home/linuxbrew/.linuxbrew/bin/xz --version" "xz"
-
-# repair either active-keg record without repouring or relinking the keg
-keg="$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)"
-receipt_mtime="$(stat -c %y "$keg/INSTALL_RECEIPT.json")"
-keg_inode="$(stat -c %i "$keg")"
-public_link_inode="$(stat -c %i /home/linuxbrew/.linuxbrew/bin/xz)"
+# Keep repair/import/prune coverage on engine-installed state.
+mise bootstrap packages apply --yes
+keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
+receipt_mtime=$(stat -c %y "$keg/INSTALL_RECEIPT.json")
+keg_inode=$(stat -c %i "$keg")
+public_link_inode=$(stat -c %i /home/linuxbrew/.linuxbrew/bin/xz)
 rm /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz
 assert_contains "mise bootstrap packages status" "needs repair"
 mise bootstrap packages apply --yes
@@ -104,21 +134,12 @@ rm /home/linuxbrew/.linuxbrew/opt/xz
 assert_contains "mise bootstrap packages status" "needs repair"
 mise bootstrap packages apply --yes
 assert_succeed "test \"$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)\" = \"$keg\""
-assert_succeed "test \"$(stat -c %i "$keg")\" = \"$keg_inode\""
-assert_succeed "test \"$(stat -c %i /home/linuxbrew/.linuxbrew/bin/xz)\" = \"$public_link_inode\""
 
-# idempotent
-assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
-
-# import previews and writes the currently installed requested formula
 assert_contains "mise bootstrap packages import --manager brew --dry-run --path imported.toml" '"brew:xz" = "latest"'
 mise bootstrap packages import --manager brew --path imported.toml
 assert_contains "cat imported.toml" '"brew:xz" = "latest"'
-
-# prune is a no-op while the formula is still configured
 assert_contains "mise bootstrap packages prune --manager brew --dry-run 2>&1" "nothing to prune"
 
-# after removing it from config, prune previews and removes the linked formula
 cat <<EOF >mise.toml
 [bootstrap.packages]
 EOF
