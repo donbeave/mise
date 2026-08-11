@@ -184,6 +184,13 @@ pass.
 - The one-line repair message cannot name a safe manual path for some
   artifact class (report the class).
 
+## Blocker resolution — 2026-08-12 verification review
+
+- **Condition:** fingerprint validation did not prove that the legacy receipt inventory was complete.
+- **Evidence:** a receipt omitting a current catalog artifact could pass because only recorded targets were checked.
+- **Options:** trust the partial receipt, derive metadata from catalog alone, or require exact per-class target and package-id equality before backfill.
+- **Choice:** require exact inventory equality plus existing fingerprints/version/package checks; mismatch remains untouched as `NeedsRepair`.
+
 ## Maintenance notes
 
 - This path becomes dead code once the legacy fleet converges; mark it

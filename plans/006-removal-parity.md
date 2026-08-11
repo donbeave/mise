@@ -218,3 +218,10 @@ exit 0.
   candidates are validated before the first mutation, metadata is removed
   with the final version, zap is ignored by construction, and formula
   racks are removed only when empty.
+
+## Blocker resolution — 2026-08-12 verification review
+
+- **Condition:** JSON receipts with uninstall flight blocks or relative `delete` paths could enter teardown; direct targets were removed before fallible recorded actions.
+- **Evidence:** Homebrew stores the Ruby cask source when flight blocks exist (`cask/installer.rb`), so JSON cannot replay them; receipt paths are destructive authority.
+- **Options:** silently skip unsupported facts, fetch today's catalog, or fail closed before mutation and run validated installed-receipt actions before direct targets.
+- **Choice:** fail closed for flight blocks and non-absolute/non-normalized delete paths; validate every candidate first; execute recorded actions before direct target removal.

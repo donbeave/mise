@@ -162,7 +162,6 @@ checksum = "sha256:6fdc27e146e5d6a45abf60ef7cf2e83d5b7284acbba4cecf6237905bd528a
 url = "https://github.com/jdx/aube/releases/download/v1.37.0/aube-v1.37.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/jdx/aube/releases/assets/496852124"
 provenance = "github-attestations"
-provenance_verified = true
 
 [tools.aube."platforms.windows-x64"]
 checksum = "sha256:7a264819a7c05d107ac72916f82209a183bfd26842b9528f1ca281bb32596c5e"
@@ -359,7 +358,6 @@ checksum = "sha256:15fd88593edc83ac50020818e17d0ccefc048d9179bdfd28329710476d3ae
 url = "https://github.com/jdx/communique/releases/download/v1.2.4/communique-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/jdx/communique/releases/assets/489909561"
 provenance = "github-attestations"
-provenance_verified = true
 
 [tools.communique."platforms.windows-x64"]
 checksum = "sha256:8b8667d205bf61b229a17b36bdd05c316d9c55f0cc985acf4fc0cf85b8a046a3"

@@ -4228,6 +4228,40 @@ fn validate_legacy_cask(cask: &Cask, state: InstalledCaskState) -> Result<Instal
             &format!("installed {} != catalog {}", legacy.version, cask.version),
         ));
     }
+    let artifacts = match cask_artifacts(cask) {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            return Ok(legacy_needs_repair(
+                cask,
+                &legacy.version,
+                &format!("catalog artifact inventory could not be classified: {err}"),
+            ));
+        }
+    };
+    let expected_apps = artifacts
+        .apps
+        .iter()
+        .map(|app| app_target_path(app.target_name()))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_binaries = binary_targets(&artifacts)?;
+    let expected_fonts = artifacts
+        .fonts
+        .iter()
+        .map(font_target_path)
+        .collect::<Result<Vec<_>>>()?;
+    let expected_completions = completion_target_paths(cask, &artifacts)?;
+    if legacy.apps != expected_apps
+        || legacy.binaries != expected_binaries
+        || legacy.fonts != expected_fonts
+        || legacy.completions != expected_completions
+        || legacy.pkg_ids != artifacts.pkg_ids
+    {
+        return Ok(legacy_needs_repair(
+            cask,
+            &legacy.version,
+            "recorded artifact inventory does not match the installed-version catalog",
+        ));
+    }
     let targets_match = legacy
         .targets
         .iter()
@@ -5226,13 +5260,13 @@ fn apply_cask_prune_plan_in(
             completed: Vec::new(),
         };
         write_cask_journal_in(state_dir, &journal)?;
-        for (index, target) in candidate.receipt.targets.iter().enumerate() {
-            remove_artifact_target_elevating(&target.path)?;
-            record_cask_action_in(state_dir, &mut journal, &format!("prune_target[{index}]"))?;
-        }
         if let Some(homebrew) = &candidate.homebrew_receipt {
             execute_homebrew_uninstall_artifacts(candidate, homebrew)?;
             record_cask_action_in(state_dir, &mut journal, "uninstall_artifacts")?;
+        }
+        for (index, target) in candidate.receipt.targets.iter().enumerate() {
+            remove_artifact_target_elevating(&target.path)?;
+            record_cask_action_in(state_dir, &mut journal, &format!("prune_target[{index}]"))?;
         }
         file::remove_all(&candidate.version_dir)?;
         record_cask_action_in(state_dir, &mut journal, "prune_caskroom")?;
@@ -5351,7 +5385,26 @@ fn validate_homebrew_uninstall_artifacts(
     token: &str,
     homebrew: &receipt::CaskReceipt,
 ) -> Result<()> {
+    if homebrew.uninstall_flight_blocks {
+        bail!(
+            "brew-cask:{token}: installed uninstall flight blocks cannot be replayed from JSON metadata"
+        );
+    }
     let actions = homebrew_uninstall_actions(token, homebrew)?;
+    for action in &actions {
+        if let HomebrewUninstallAction::Delete(path) = action {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "brew-cask:{token}: recorded uninstall delete path is not an absolute normalized path: {}",
+                    path.display()
+                );
+            }
+        }
+    }
     #[cfg(target_os = "macos")]
     let _ = &actions;
     #[cfg(not(target_os = "macos"))]
@@ -8736,6 +8789,33 @@ end
     }
 
     #[test]
+    fn homebrew_uninstall_rejects_flight_blocks_and_unsafe_delete_paths() -> Result<()> {
+        let mut value: Value =
+            serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
+        value["uninstall_flight_blocks"] = Value::Bool(true);
+        let receipt: receipt::CaskReceipt = serde_json::from_value(value.clone())?;
+        assert!(
+            validate_homebrew_uninstall_artifacts("example", &receipt)
+                .unwrap_err()
+                .to_string()
+                .contains("flight blocks")
+        );
+
+        value["uninstall_flight_blocks"] = Value::Bool(false);
+        value["uninstall_artifacts"] = serde_json::json!([
+            {"uninstall": [{"delete": "relative/path"}]}
+        ]);
+        let receipt: receipt::CaskReceipt = serde_json::from_value(value)?;
+        assert!(
+            validate_homebrew_uninstall_artifacts("example", &receipt)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute normalized path")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cask_prune_fails_closed_when_a_receipt_is_corrupt() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
@@ -9507,6 +9587,43 @@ end
             reconcile_legacy_cask(&cask, installed_cask_state(&cask, &artifacts)?)?,
             InstalledCaskState::Installed(cask.version.clone())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mise_incomplete_inventory_needs_repair_without_mutation() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let mut cask = test_cask("legacy-incomplete", "1.0.0");
+        cask.artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["Expected.app"]}
+        ]))?;
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        let receipt = CaskReceipt {
+            schema_version: 3,
+            version: cask.version.clone(),
+            apps: Vec::new(),
+            binaries: Vec::new(),
+            fonts: Vec::new(),
+            completions: Vec::new(),
+            pkg_ids: Vec::new(),
+            targets: Vec::new(),
+            prune_safe: true,
+            prune_blocker: None,
+        };
+        file::write(
+            version_dir.join(".mise-cask.toml"),
+            toml::to_string_pretty(&receipt)?,
+        )?;
+
+        assert!(matches!(
+            reconcile_legacy_cask(&cask, InstalledCaskState::LegacyMise(receipt))?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        assert!(version_dir.join(".mise-cask.toml").exists());
+        assert!(!caskroom_token_dir(&cask.token).join(".metadata").exists());
         Ok(())
     }
 
