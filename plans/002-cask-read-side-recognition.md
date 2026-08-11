@@ -232,3 +232,22 @@ ALL must hold:
   accident class the design forbids.
 - Deferred: reading `.metadata` config/timestamped snapshots (needed by
   plans 003/006, not for recognition).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** `PackageState::NeedsRepair` could store only an installed
+  version, while this plan requires a truthful corruption reason naming the
+  token and receipt path. Putting the reason in `installed` would falsify
+  status JSON's `installed_version`.
+- **Evidence:** `src/cli/system/status.rs` serializes the sole field as
+  `installed_version`; existing formula repair states have a real version.
+  The driver already pattern-matches this variant structurally and can preserve
+  the installed value independently from a reason.
+- **Options:** (1) overload `installed` with the reason, producing false JSON;
+  (2) turn receipt corruption into an immediate error, losing the required
+  per-package needs-repair state; (3) add `reason: Option<String>` to
+  `NeedsRepair`, keep existing constructors at `None`, and have status expose
+  the reason separately.
+- **Choice:** option 3. It removes the state-model condition that conflated
+  identity with diagnostics, preserves current formula behavior, and expresses
+  corrupt cask state truthfully without new CLI/config surface.

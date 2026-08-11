@@ -596,15 +596,20 @@ impl SystemPackageManager for BrewCaskManager {
                 });
                 continue;
             }
-            let version = installed_cask_version(&cask, &artifacts)?;
-            let state = match version {
-                Some(version) => match &req.version {
+            let state = match installed_cask_state(&cask, &artifacts)? {
+                InstalledCaskState::Installed(version) => match &req.version {
                     Some(requested) if version != *requested => {
                         PackageState::VersionMismatch { installed: version }
                     }
                     _ => PackageState::Installed { version },
                 },
-                None => PackageState::Missing,
+                InstalledCaskState::Absent => PackageState::Missing,
+                InstalledCaskState::NeedsRepair { installed, reason } => {
+                    PackageState::NeedsRepair {
+                        installed: installed.unwrap_or_default(),
+                        reason,
+                    }
+                }
             };
             statuses.push(PackageStatus {
                 request: req.clone(),
@@ -3796,30 +3801,87 @@ fn remove_obsolete_binary_links(
 
 #[cfg(not(test))]
 fn installed_cask_version(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Option<String>> {
-    installed_cask_version_in(cask, artifacts, &crate::dirs::STATE)
+    Ok(installed_cask_state_in(cask, artifacts, &crate::dirs::STATE)?.version())
 }
 
 #[cfg(test)]
 fn installed_cask_version(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Option<String>> {
-    installed_cask_version_in(cask, artifacts, &prefix::prefix().join(".mise-test-state"))
+    Ok(
+        installed_cask_state_in(cask, artifacts, &prefix::prefix().join(".mise-test-state"))?
+            .version(),
+    )
 }
 
-fn installed_cask_version_in(
+#[cfg(not(test))]
+fn installed_cask_state(cask: &Cask, artifacts: &CaskArtifacts) -> Result<InstalledCaskState> {
+    installed_cask_state_in(cask, artifacts, &crate::dirs::STATE)
+}
+
+#[cfg(test)]
+fn installed_cask_state(cask: &Cask, artifacts: &CaskArtifacts) -> Result<InstalledCaskState> {
+    installed_cask_state_in(cask, artifacts, &prefix::prefix().join(".mise-test-state"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstalledCaskState {
+    Installed(String),
+    Absent,
+    NeedsRepair {
+        installed: Option<String>,
+        reason: String,
+    },
+}
+
+impl InstalledCaskState {
+    fn version(self) -> Option<String> {
+        match self {
+            Self::Installed(version) => Some(version),
+            Self::Absent | Self::NeedsRepair { .. } => None,
+        }
+    }
+}
+
+fn installed_cask_state_in(
     cask: &Cask,
     _artifacts: &CaskArtifacts,
     state_dir: &Path,
-) -> Result<Option<String>> {
+) -> Result<InstalledCaskState> {
     if cask_journal_pending_in(state_dir, &cask.token) {
-        return Ok(None);
+        return Ok(InstalledCaskState::Absent);
+    }
+    let token_dir = caskroom_token_dir(&cask.token);
+    if token_dir.join(".metadata").symlink_metadata().is_ok() {
+        return Ok(match super::receipt::read_cask_receipt(&token_dir) {
+            Ok(receipt) => {
+                let version = receipt.source.version;
+                let version_dir = caskroom_version_dir(&cask.token, &version);
+                if version_dir.is_dir() {
+                    InstalledCaskState::Installed(version)
+                } else {
+                    InstalledCaskState::NeedsRepair {
+                        installed: Some(version.clone()),
+                        reason: format!(
+                            "brew-cask:{}: Homebrew receipt records version {version}, but {} is missing",
+                            cask.token,
+                            version_dir.display()
+                        ),
+                    }
+                }
+            }
+            Err(err) => InstalledCaskState::NeedsRepair {
+                installed: installed_version(&cask.token),
+                reason: format!("brew-cask:{}: {err}", cask.token),
+            },
+        });
     }
     let Some(version) = installed_version(&cask.token) else {
-        return Ok(None);
+        return Ok(InstalledCaskState::Absent);
     };
     let version_dir = caskroom_version_dir(&cask.token, &version);
     match read_receipt(&version_dir)? {
         Some(receipt) => {
             if receipt.schema_version > 3 {
-                return Ok(None);
+                return Ok(InstalledCaskState::Absent);
             }
             if receipt.schema_version >= 2 {
                 let targets_match = receipt
@@ -3830,7 +3892,11 @@ fn installed_cask_version_in(
                     .into_iter()
                     .all(|matches| matches);
                 let pkgs_installed = pkg_ids_installed(&receipt.pkg_ids)?;
-                return Ok((targets_match && pkgs_installed).then_some(receipt.version));
+                return Ok(if targets_match && pkgs_installed {
+                    InstalledCaskState::Installed(receipt.version)
+                } else {
+                    InstalledCaskState::Absent
+                });
             }
 
             // Legacy receipts remain usable only from the historical facts they
@@ -3843,9 +3909,13 @@ fn installed_cask_version_in(
                 .chain(&receipt.completions)
                 .all(|target| target.exists());
             let pkgs_installed = pkg_ids_installed(&receipt.pkg_ids)?;
-            Ok((targets_exist && pkgs_installed).then_some(receipt.version))
+            Ok(if targets_exist && pkgs_installed {
+                InstalledCaskState::Installed(receipt.version)
+            } else {
+                InstalledCaskState::Absent
+            })
         }
-        None => Ok(None),
+        None => Ok(InstalledCaskState::Absent),
     }
 }
 
@@ -4787,6 +4857,21 @@ mod tests {
                 None => crate::env::remove_var("MISE_SYSTEM_BREW_PREFIX"),
             }
         }
+    }
+
+    fn write_homebrew_cask_receipt(token: &str, version: &str, mutate: impl FnOnce(&mut Value)) {
+        let token_dir = caskroom_token_dir(token);
+        file::create_dir_all(token_dir.join(".metadata")).unwrap();
+        file::create_dir_all(token_dir.join(version)).unwrap();
+        let mut receipt: Value =
+            serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json")).unwrap();
+        receipt["source"]["version"] = Value::String(version.to_string());
+        mutate(&mut receipt);
+        file::write(
+            token_dir.join(".metadata/INSTALL_RECEIPT.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
     }
 
     fn run_cask_shim(
@@ -8111,6 +8196,134 @@ end
                 }
             )?,
             Some("2.0.0".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn homebrew_receipt_reports_opaque_installed_version() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("homebrew-owned", "current");
+        write_homebrew_cask_receipt(&cask.token, "0.147.0@preview,1", |_| {});
+
+        assert_eq!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Installed("0.147.0@preview,1".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn homebrew_receipt_older_than_catalog_still_reports_installed() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("homebrew-owned", "9.0.0");
+        write_homebrew_cask_receipt(&cask.token, "1.0.0", |_| {});
+
+        assert_eq!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Installed("1.0.0".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_homebrew_receipt_needs_repair() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("broken-receipt", "1.0.0");
+        let token_dir = caskroom_token_dir(&cask.token);
+        file::create_dir_all(token_dir.join(".metadata"))?;
+        file::write(token_dir.join(".metadata/INSTALL_RECEIPT.json"), "{")?;
+
+        let InstalledCaskState::NeedsRepair { reason, .. } =
+            installed_cask_state(&cask, &CaskArtifacts::default())?
+        else {
+            panic!("malformed Homebrew receipt must need repair");
+        };
+        assert!(reason.contains("broken-receipt"));
+        assert!(reason.contains("INSTALL_RECEIPT.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn newer_homebrew_receipt_with_extra_key_reports_installed() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("future-receipt", "1.0.0");
+        write_homebrew_cask_receipt(&cask.token, "1.0.0", |receipt| {
+            receipt["homebrew_version"] = Value::String("7.0.1-3-gdeadbee".to_string());
+            receipt["future_key"] = Value::Bool(true);
+        });
+
+        assert_eq!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Installed("1.0.0".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_without_homebrew_receipt_needs_repair() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("missing-receipt", "1.0.0");
+        file::create_dir_all(caskroom_token_dir(&cask.token).join(".metadata"))?;
+
+        assert!(matches!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn no_metadata_or_legacy_receipt_is_absent() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("absent", "1.0.0");
+
+        assert_eq!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Absent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mise_receipt_behavior_remains_installed() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("legacy-mise", "2.0.0");
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        file::write(
+            version_dir.join(".mise-cask.toml"),
+            toml::to_string_pretty(&CaskReceipt {
+                schema_version: 3,
+                version: cask.version.clone(),
+                apps: Vec::new(),
+                binaries: Vec::new(),
+                fonts: Vec::new(),
+                completions: Vec::new(),
+                pkg_ids: Vec::new(),
+                targets: Vec::new(),
+                prune_safe: true,
+                prune_blocker: None,
+            })?,
+        )?;
+
+        assert_eq!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Installed("2.0.0".to_string())
         );
         Ok(())
     }
