@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 use super::api::RubySourceChecksum;
 use super::prefix;
+use super::receipt;
 use super::source;
 use crate::cmd::CmdLineRunner;
 use crate::file::{self, ExtractOptions, ExtractionFormat};
@@ -64,8 +65,29 @@ struct Cask {
     ruby_source_checksum: Option<RubySourceChecksum>,
     #[serde(default)]
     tap_git_head: Option<String>,
+    #[serde(default)]
+    tap: Option<String>,
+    #[serde(default)]
+    auto_updates: bool,
+    #[serde(default)]
+    depends_on: Value,
     #[serde(skip)]
     raw_base: Option<String>,
+    #[serde(skip)]
+    definition_source: String,
+    #[serde(skip)]
+    loaded_from_internal_api: bool,
+}
+
+#[derive(Deserialize)]
+struct InternalApiEnvelope {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct InternalApiPayload {
+    casks: BTreeMap<String, Value>,
+    cask_tap_git_head: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,17 +305,23 @@ impl BrewCaskManager {
         req: &PackageRequest,
         opts: &InstallOpts,
         pr: Option<&dyn SingleReport>,
+        upgrading: bool,
     ) -> Result<String> {
         let cask = fetch_cask(req).await?;
         let artifacts = cask_artifacts(&cask)?;
         validate_platform_support(&cask, &artifacts)?;
-        if homebrew_metadata_present(&cask.token) {
-            bail!(
-                "brew-cask:{}: Homebrew owns this cask; remove it with Homebrew before installing it with mise",
-                cask.token
-            );
+        let installed = installed_cask_state(&cask, &artifacts)?;
+        if let Some(version) = existing_install_noop(&installed, &cask, upgrading) {
+            info!("brew-cask:{}: already installed", cask.token);
+            return Ok(version);
         }
-        if installed_cask_version(&cask, &artifacts)?.as_deref() == Some(cask.version.as_str()) {
+        if let InstalledCaskState::NeedsRepair { reason, .. } = &installed {
+            bail!("brew-cask:{}: needs repair: {reason}", cask.token);
+        }
+        if matches!(
+            installed,
+            InstalledCaskState::Installed(ref version) if version == &cask.version
+        ) {
             info!("brew-cask:{}: already installed", cask.token);
             return Ok(cask.version);
         }
@@ -329,16 +357,23 @@ impl BrewCaskManager {
         prefix::bootstrap(false)?;
         let stage = fetch_and_stage(&cask, pr).await?;
         let _caskroom_lock = lock_caskroom()?;
-        if homebrew_metadata_present(&cask.token) {
-            file::remove_all(&stage)?;
-            bail!(
-                "brew-cask:{}: Homebrew took ownership of this cask while installation was pending",
-                cask.token
-            );
-        }
-        if installed_cask_version(&cask, &artifacts)?.as_deref() == Some(cask.version.as_str()) {
-            file::remove_all(stage)?;
-            return Ok(cask.version);
+        match installed_cask_state(&cask, &artifacts)? {
+            InstalledCaskState::NeedsRepair { reason, .. } => {
+                file::remove_all(&stage)?;
+                bail!("brew-cask:{}: needs repair: {reason}", cask.token);
+            }
+            InstalledCaskState::Installed(version)
+                if existing_install_noop(
+                    &InstalledCaskState::Installed(version.clone()),
+                    &cask,
+                    upgrading,
+                )
+                .is_some() =>
+            {
+                file::remove_all(stage)?;
+                return Ok(version);
+            }
+            InstalledCaskState::Installed(_) | InstalledCaskState::Absent => {}
         }
         let previous_binaries = previous_binary_targets(&cask)?;
         let previous_fonts = previous_font_targets(&cask)?;
@@ -433,7 +468,7 @@ impl BrewCaskManager {
             for font in &artifacts.fonts {
                 link_font(&caskroom, font)?;
             }
-            write_receipt(&caskroom, &cask, &artifacts)?;
+            write_homebrew_metadata(&caskroom, &cask)?;
             Ok(())
         });
         if let Err(err) = activation {
@@ -626,7 +661,7 @@ impl SystemPackageManager for BrewCaskManager {
         if opts.dry_run {
             prefix::bootstrap(true)?;
             for pkg in pkgs {
-                self.install_one(pkg, opts, None).await?;
+                self.install_one(pkg, opts, None, false).await?;
             }
             return Ok(());
         }
@@ -634,7 +669,7 @@ impl SystemPackageManager for BrewCaskManager {
         mpr.init_footer(false, "install", pkgs.len());
         for pkg in pkgs {
             let pr: Box<dyn SingleReport> = mpr.add(&format!("brew-cask:{}", pkg.name));
-            match self.install_one(pkg, opts, Some(&*pr)).await {
+            match self.install_one(pkg, opts, Some(&*pr), false).await {
                 Ok(version) => {
                     pr.finish_with_message(version);
                     mpr.footer_inc(1);
@@ -651,7 +686,30 @@ impl SystemPackageManager for BrewCaskManager {
     }
 
     async fn upgrade(&self, pkgs: &[PackageRequest], opts: &InstallOpts) -> Result<()> {
-        self.install(pkgs, opts).await
+        if opts.dry_run {
+            for pkg in pkgs {
+                self.install_one(pkg, opts, None, true).await?;
+            }
+            return Ok(());
+        }
+        let mpr = MultiProgressReport::get();
+        mpr.init_footer(false, "upgrade", pkgs.len());
+        for pkg in pkgs {
+            let pr: Box<dyn SingleReport> = mpr.add(&format!("brew-cask:{}", pkg.name));
+            match self.install_one(pkg, opts, Some(&*pr), true).await {
+                Ok(version) => {
+                    pr.finish_with_message(version);
+                    mpr.footer_inc(1);
+                }
+                Err(err) => {
+                    pr.finish_with_icon("failed".to_string(), ProgressIcon::Error);
+                    mpr.footer_finish();
+                    return Err(err);
+                }
+            }
+        }
+        mpr.footer_finish();
+        Ok(())
     }
 }
 
@@ -663,6 +721,16 @@ async fn fetch_cask(req: &PackageRequest) -> Result<Cask> {
         None => (name.as_str(), true),
     };
     validate_cask_path_component("requested token", requested_token)?;
+    if official_api {
+        let mut cask = fetch_internal_cask(requested_token)
+            .await
+            .wrap_err_with(|| {
+                format!("failed to fetch Homebrew internal cask '{requested_token}'")
+            })?;
+        cask.raw_base = Some(HOMEBREW_CASK_RAW.to_string());
+        validate_cask_identity(&cask, requested_token, true)?;
+        return Ok(cask);
+    }
     let (url, raw_base) = match split_tap_name(name) {
         Some(("homebrew", "cask", token)) => (
             format!("{API_BASE}/cask/{token}.json"),
@@ -684,18 +752,165 @@ async fn fetch_cask(req: &PackageRequest) -> Result<Cask> {
             Some(HOMEBREW_CASK_RAW.to_string()),
         ),
     };
-    let mut cask = HTTP_FETCH
-        .json_cached::<Cask, _>(url)
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "failed to fetch Homebrew cask '{name}' directly. \
+    let definition_json = HTTP_FETCH.get_text_cached(&url).await.wrap_err_with(|| {
+        format!(
+            "failed to fetch Homebrew cask '{name}' directly. \
                  Tapped casks must publish API metadata at api/cask/<token>.json"
-            )
-        })?;
+        )
+    })?;
+    let mut cask: Cask = serde_json::from_str(&definition_json)
+        .wrap_err_with(|| format!("failed to parse Homebrew cask '{name}' metadata"))?;
     cask.raw_base = raw_base;
+    cask.definition_source = url;
+    cask.loaded_from_internal_api = false;
+    if cask.tap.is_none() {
+        cask.tap = Some(match split_tap_name(name) {
+            Some((owner, tap, _)) => format!("{owner}/{tap}"),
+            None => "homebrew/cask".to_string(),
+        });
+    }
     validate_cask_identity(&cask, requested_token, official_api)?;
     Ok(cask)
+}
+
+async fn fetch_internal_cask(token: &str) -> Result<Cask> {
+    let url = format!(
+        "{API_BASE}/internal/packages.{}.jws.json",
+        super::tag::host_tag()
+    );
+    let envelope: InternalApiEnvelope = serde_json::from_str(
+        &HTTP_FETCH
+            .get_text_cached(&url)
+            .await
+            .wrap_err("failed to fetch Homebrew internal packages API")?,
+    )?;
+    let payload: InternalApiPayload = serde_json::from_str(&envelope.payload)?;
+    let raw = payload
+        .casks
+        .get(token)
+        .ok_or_else(|| eyre!("Homebrew internal API has no cask '{token}'"))?;
+    let object = raw
+        .as_object()
+        .ok_or_else(|| eyre!("Homebrew internal API cask '{token}' is not an object"))?;
+    let url_args = object
+        .get("url_args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("Homebrew internal API cask '{token}' has no URL"))?;
+    let url_value = url_args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("Homebrew internal API cask '{token}' has invalid URL args"))?;
+    let url_kwargs = object.get("url_kwargs").map(strip_internal_symbols);
+    let url_specs = CaskUrlSpecs {
+        branch: url_kwargs
+            .as_ref()
+            .and_then(|value| value.get("branch"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        only_path: url_kwargs
+            .as_ref()
+            .and_then(|value| value.get("only_path"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    let raw_artifacts = object
+        .get("raw_artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("Homebrew internal API cask '{token}' has no artifacts"))?;
+    let artifacts = raw_artifacts
+        .iter()
+        .map(internal_artifact_to_api)
+        .collect::<Result<Vec<_>>>()?;
+    let ruby_source_checksum = object
+        .get("ruby_source_checksum")
+        .map(strip_internal_symbols)
+        .map(serde_json::from_value)
+        .transpose()?;
+    Ok(Cask {
+        token: token.to_string(),
+        aliases: Vec::new(),
+        old_tokens: Vec::new(),
+        version: object
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| eyre!("Homebrew internal API cask '{token}' has no version"))?
+            .to_string(),
+        url: url_value.to_string(),
+        url_specs,
+        sha256: object
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        artifacts,
+        ruby_source_path: object
+            .get("ruby_source_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ruby_source_checksum,
+        tap_git_head: Some(payload.cask_tap_git_head),
+        tap: object
+            .get("tap_string")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        auto_updates: object
+            .get("auto_updates")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        depends_on: object
+            .get("depends_on_args")
+            .map(strip_internal_symbols)
+            .unwrap_or(Value::Null),
+        raw_base: None,
+        definition_source: url,
+        loaded_from_internal_api: true,
+    })
+}
+
+fn strip_internal_symbols(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.strip_prefix(':').unwrap_or(key).to_string(),
+                        strip_internal_symbols(value),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(strip_internal_symbols).collect()),
+        Value::String(value) => Value::String(value.strip_prefix(':').unwrap_or(value).to_string()),
+        value => value.clone(),
+    }
+}
+
+fn internal_artifact_to_api(raw: &Value) -> Result<Value> {
+    let parts = raw
+        .as_array()
+        .ok_or_else(|| eyre!("Homebrew internal API artifact is not an array"))?;
+    let key = parts
+        .first()
+        .and_then(Value::as_str)
+        .and_then(|key| key.strip_prefix(':'))
+        .ok_or_else(|| eyre!("Homebrew internal API artifact has no DSL key"))?;
+    let mut args = match parts.get(1).map(strip_internal_symbols) {
+        None => Value::Null,
+        Some(Value::Array(args)) => Value::Array(args),
+        Some(Value::Object(kwargs)) => Value::Array(vec![Value::Object(kwargs)]),
+        Some(value) => Value::Array(vec![value]),
+    };
+    if let Some(Value::Object(kwargs)) = parts.get(2).map(strip_internal_symbols)
+        && !kwargs.is_empty()
+    {
+        match &mut args {
+            Value::Array(args) => args.push(Value::Object(kwargs)),
+            _ => unreachable!(),
+        }
+    }
+    let mut artifact = serde_json::Map::new();
+    artifact.insert(key.to_string(), args);
+    Ok(Value::Object(artifact))
 }
 
 fn validate_cask_identity(cask: &Cask, requested_token: &str, official_api: bool) -> Result<()> {
@@ -898,19 +1113,6 @@ async fn execute_lifecycle_hook(
 }
 
 async fn cask_ruby_bin() -> Result<PathBuf> {
-    if let Some(brew) = file::which("brew")
-        && let Ok(output) = tokio::process::Command::new(brew)
-            .args(["ruby", "-e", "print RbConfig.ruby"])
-            .output()
-            .await
-        && output.status.success()
-        && let Ok(path) = String::from_utf8(output.stdout)
-    {
-        let path = PathBuf::from(path.trim());
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
     if let Some(ruby) = file::which("ruby") {
         return Ok(ruby);
     }
@@ -3799,11 +4001,6 @@ fn remove_obsolete_binary_links(
     Ok(())
 }
 
-#[cfg(not(test))]
-fn installed_cask_version(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Option<String>> {
-    Ok(installed_cask_state_in(cask, artifacts, &crate::dirs::STATE)?.version())
-}
-
 #[cfg(test)]
 fn installed_cask_version(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Option<String>> {
     Ok(
@@ -3832,6 +4029,24 @@ enum InstalledCaskState {
     },
 }
 
+fn existing_install_noop(
+    state: &InstalledCaskState,
+    cask: &Cask,
+    upgrading: bool,
+) -> Option<String> {
+    match state {
+        InstalledCaskState::Installed(version)
+            if !upgrading || cask.auto_updates || version == &cask.version =>
+        {
+            Some(version.clone())
+        }
+        InstalledCaskState::Installed(_)
+        | InstalledCaskState::Absent
+        | InstalledCaskState::NeedsRepair { .. } => None,
+    }
+}
+
+#[cfg(test)]
 impl InstalledCaskState {
     fn version(self) -> Option<String> {
         match self {
@@ -3919,6 +4134,7 @@ fn installed_cask_state_in(
     }
 }
 
+#[cfg(test)]
 fn cask_prune_blocker(cask: &Cask, artifacts: &CaskArtifacts) -> Option<String> {
     if !artifacts.pkgs.is_empty() {
         return Some("pkg artifacts require uninstall support".to_string());
@@ -3948,6 +4164,7 @@ fn cask_prune_blocker(cask: &Cask, artifacts: &CaskArtifacts) -> Option<String> 
     None
 }
 
+#[cfg(test)]
 fn write_receipt(caskroom: &Path, cask: &Cask, artifacts: &CaskArtifacts) -> Result<()> {
     let mut target_paths = artifacts
         .apps
@@ -3998,6 +4215,293 @@ fn write_receipt(caskroom: &Path, cask: &Cask, artifacts: &CaskArtifacts) -> Res
     let body = toml::to_string_pretty(&receipt)?;
     write_durable_file(&caskroom.join(".mise-cask.toml"), body.as_bytes())?;
     Ok(())
+}
+
+fn write_homebrew_metadata(caskroom: &Path, cask: &Cask) -> Result<()> {
+    let token_dir = caskroom
+        .parent()
+        .ok_or_else(|| eyre!("brew-cask:{}: caskroom has no token directory", cask.token))?;
+    let metadata = token_dir.join(".metadata.mise-tmp");
+    let destination = token_dir.join(".metadata");
+    let backup = token_dir.join(".metadata.mise-backup");
+    file::remove_all(&metadata)?;
+    file::remove_all(&backup)?;
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y%m%d%H%M%S%.3f").to_string();
+    let uninstall_artifacts = cask_uninstall_artifacts(cask);
+    let snapshot_bytes = installed_cask_snapshot(cask, &uninstall_artifacts)?;
+    let snapshot = metadata
+        .join(&cask.version)
+        .join(timestamp)
+        .join("Casks")
+        .join(format!("{}.json", cask.token));
+    let runtime_dependencies = cask_runtime_dependencies(cask)?;
+    let receipt = receipt::CaskReceipt {
+        homebrew_version: receipt::EMULATED_BREW_VERSION.to_string(),
+        loaded_from_api: true,
+        // mise fetches the public per-cask API, not Homebrew's signed internal API.
+        loaded_from_internal_api: cask.loaded_from_internal_api,
+        uninstall_flight_blocks: cask.artifacts.iter().any(|artifact| {
+            matches!(
+                artifact_type(artifact).as_str(),
+                "uninstall_preflight" | "uninstall_postflight"
+            )
+        }),
+        installed_on_request: true,
+        time: now.timestamp().try_into()?,
+        runtime_dependencies,
+        source: receipt::CaskSource {
+            tap: cask
+                .tap
+                .clone()
+                .ok_or_else(|| eyre!("brew-cask:{}: definition has no source tap", cask.token))?,
+            tap_git_head: cask.tap_git_head.clone(),
+            version: cask.version.clone(),
+            path: Some(cask.definition_source.clone()),
+            extra: serde_json::Map::new(),
+        },
+        arch: match std::env::consts::ARCH {
+            "aarch64" => "arm64".to_string(),
+            arch => arch.to_string(),
+        },
+        uninstall_artifacts,
+        built_on: native_build_system_info()?,
+        extra: serde_json::Map::new(),
+    };
+    let config = native_cask_config();
+    write_durable_file(
+        &metadata.join("INSTALL_RECEIPT.json"),
+        &receipt.to_json_bytes()?,
+    )?;
+    write_durable_file(&metadata.join("config.json"), &config.to_json_bytes()?)?;
+    write_durable_file(&snapshot, &snapshot_bytes)?;
+    let had_previous = destination.symlink_metadata().is_ok();
+    if had_previous {
+        file::rename(&destination, &backup)?;
+    }
+    if let Err(err) = file::rename(&metadata, &destination) {
+        if had_previous {
+            file::rename(&backup, &destination)?;
+        }
+        return Err(err);
+    }
+    file::remove_all(backup)?;
+    Ok(())
+}
+
+fn installed_cask_snapshot(cask: &Cask, uninstall_artifacts: &[Value]) -> Result<Vec<u8>> {
+    if cask.artifacts.iter().any(|artifact| {
+        matches!(
+            artifact_type(artifact).as_str(),
+            "uninstall_preflight" | "uninstall_postflight"
+        )
+    }) {
+        bail!(
+            "brew-cask:{}: uninstall Ruby flight blocks require a verbatim Ruby snapshot",
+            cask.token
+        );
+    }
+    let mut installed = serde_json::Map::new();
+    if let Some(only_path) = &cask.url_specs.only_path {
+        installed.insert(
+            "url_specs".to_string(),
+            serde_json::json!({ "only_path": only_path }),
+        );
+    }
+    if uninstall_artifacts.is_empty() {
+        installed.insert("artifacts".to_string(), Value::Array(Vec::new()));
+    }
+    Ok(serde_json::to_vec_pretty(&Value::Object(installed))?)
+}
+
+fn cask_uninstall_artifacts(cask: &Cask) -> Vec<Value> {
+    let mut artifacts = cask
+        .artifacts
+        .iter()
+        .filter_map(|artifact| {
+            let object = artifact.as_object()?;
+            let key = object.keys().find(|key| key.as_str() != "target")?;
+            if matches!(key.as_str(), "pkg" | "preflight" | "postflight") {
+                return None;
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert(key.clone(), object.get(key).cloned().unwrap_or(Value::Null));
+            Some(Value::Object(entry))
+        })
+        .collect::<Vec<_>>();
+    // The public API serializes Homebrew's ArtifactSet after MRI has sorted it.
+    // Loading it for install sorts it again. For equal-class runs MRI's qsort
+    // swaps the endpoints once the run reaches eight entries; applying the same
+    // involution recovers the order real brew records (notably font casks).
+    let mut start = 0;
+    while start < artifacts.len() {
+        let key = artifact_type(&artifacts[start]);
+        let mut end = start + 1;
+        while end < artifacts.len() && artifact_type(&artifacts[end]) == key {
+            end += 1;
+        }
+        if end - start >= 8 {
+            artifacts.swap(start, end - 1);
+        }
+        start = end;
+    }
+    artifacts
+}
+
+fn cask_runtime_dependencies(cask: &Cask) -> Result<serde_json::Map<String, Value>> {
+    let runtime = cask
+        .depends_on
+        .as_object()
+        .map(|depends_on| {
+            ["formula", "cask"].into_iter().any(|key| {
+                depends_on.get(key).is_some_and(|value| match value {
+                    Value::Null => false,
+                    Value::Array(values) => !values.is_empty(),
+                    Value::Object(values) => !values.is_empty(),
+                    _ => true,
+                })
+            })
+        })
+        .unwrap_or(false);
+    if runtime {
+        bail!(
+            "brew-cask:{}: cannot write a truthful receipt before runtime dependency versions are resolved",
+            cask.token
+        );
+    }
+    Ok(serde_json::Map::new())
+}
+
+fn native_cask_config() -> receipt::CaskConfig {
+    let home = crate::dirs::HOME.to_string_lossy();
+    let language = std::env::var("LANG")
+        .ok()
+        .and_then(|lang| lang.split('.').next().map(str::to_string))
+        .filter(|lang| !lang.is_empty() && lang != "C" && lang != "POSIX")
+        .map(|lang| lang.replace('_', "-"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    receipt::CaskConfig {
+        default: serde_json::json!({
+            "languages": language,
+            "appdir": "/Applications",
+            "appimagedir": format!("{home}/Applications"),
+            "keyboard_layoutdir": "/Library/Keyboard Layouts",
+            "colorpickerdir": format!("{home}/Library/ColorPickers"),
+            "prefpanedir": format!("{home}/Library/PreferencePanes"),
+            "qlplugindir": format!("{home}/Library/QuickLook"),
+            "mdimporterdir": format!("{home}/Library/Spotlight"),
+            "dictionarydir": format!("{home}/Library/Dictionaries"),
+            "fontdir": format!("{home}/Library/Fonts"),
+            "servicedir": format!("{home}/Library/Services"),
+            "input_methoddir": format!("{home}/Library/Input Methods"),
+            "internet_plugindir": format!("{home}/Library/Internet Plug-Ins"),
+            "audio_unit_plugindir": format!("{home}/Library/Audio/Plug-Ins/Components"),
+            "vst_plugindir": format!("{home}/Library/Audio/Plug-Ins/VST"),
+            "vst3_plugindir": format!("{home}/Library/Audio/Plug-Ins/VST3"),
+            "screen_saverdir": format!("{home}/Library/Screen Savers")
+        }),
+        env: serde_json::json!({}),
+        explicit: serde_json::json!({}),
+        extra: serde_json::Map::new(),
+    }
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn native_build_system_info() -> Result<receipt::BuiltOn> {
+    let product_version = command_output("/usr/bin/sw_vers", &["-productVersion"])
+        .ok_or_else(|| eyre!("brew-cask: cannot determine macOS version"))?;
+    let mut parts = product_version.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let os_version = if minor == "0" || minor.is_empty() {
+        format!("macOS {major}")
+    } else {
+        format!("macOS {major}.{minor}")
+    };
+    let family = command_output("/usr/sbin/sysctl", &["-n", "hw.cpufamily"])
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(|value| value as u32)
+        .map(|value| match value {
+            0x2c91a47e => "arm_typhoon",
+            0x92fb37c8 => "arm_twister",
+            0x67ceee93 => "arm_hurricane_zephyr",
+            0xe81e7ef6 => "arm_monsoon_mistral",
+            0x07d34b9f => "arm_vortex_tempest",
+            0x462504d2 => "arm_lightning_thunder",
+            0x573b5eec => "arm_firestorm_icestorm",
+            0xda33d83d => "arm_blizzard_avalanche",
+            0xfa33415e => "arm_ibiza",
+            0x5f4dea93 => "arm_lobos",
+            0x72015832 => "arm_palma",
+            0x6f5129ac => "arm_donan",
+            0x17d5b93a => "arm_brava",
+            0x1d5a87e8 => "arm_hidra",
+            0xf76c5b1a => "arm_sotra",
+            _ => "dunno",
+        })
+        .unwrap_or("dunno")
+        .to_string();
+    let xcode = command_output("/usr/bin/xcodebuild", &["-version"]).and_then(|value| {
+        value
+            .lines()
+            .next()?
+            .strip_prefix("Xcode ")
+            .map(str::to_string)
+    });
+    let clt = command_output(
+        "/usr/sbin/pkgutil",
+        &["--pkg-info=com.apple.pkg.CLTools_Executables"],
+    )
+    .and_then(|value| {
+        value
+            .lines()
+            .find_map(|line| line.strip_prefix("version: ").map(str::to_string))
+    });
+    let preferred_perl = command_output("/usr/bin/perl", &["-e", "printf \"%vd\\n\", $^V"])
+        .and_then(|value| {
+            value
+                .rsplit_once('.')
+                .map(|(version, _)| version.to_string())
+        })
+        .ok_or_else(|| eyre!("brew-cask: cannot determine preferred system Perl"))?;
+    Ok(receipt::BuiltOn {
+        os: "Macintosh".to_string(),
+        os_version,
+        cpu_family: family,
+        xcode,
+        clt,
+        preferred_perl,
+        extra: serde_json::Map::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_build_system_info() -> Result<receipt::BuiltOn> {
+    let os_version = command_output("uname", &["-r"])
+        .ok_or_else(|| eyre!("brew-cask: cannot determine Linux version"))?;
+    Ok(receipt::BuiltOn {
+        os: "Linux".to_string(),
+        os_version,
+        cpu_family: std::env::consts::ARCH.to_string(),
+        xcode: None,
+        clt: None,
+        preferred_perl: command_output("perl", &["-e", "printf \"%vd\\n\", $^V"])
+            .unwrap_or_default(),
+        extra: serde_json::Map::new(),
+    })
 }
 
 fn cask_target_record_matches(record: &CaskTargetRecord) -> Result<bool> {
@@ -4918,8 +5422,119 @@ mod tests {
             ruby_source_path: None,
             ruby_source_checksum: None,
             tap_git_head: None,
+            tap: Some("homebrew/cask".to_string()),
+            auto_updates: false,
+            depends_on: Value::Null,
             raw_base: None,
+            definition_source: "https://formulae.brew.sh/api/cask/example.json".to_string(),
+            loaded_from_internal_api: false,
         }
+    }
+
+    #[test]
+    fn uninstall_artifacts_match_homebrew_order_and_shape() {
+        let mut codex = test_cask("codex", "1.2.3");
+        codex.artifacts = serde_json::from_value(serde_json::json!([
+            {"binary": ["codex-aarch64-apple-darwin", {"target": "codex"}]},
+            {"generate_completions_from_executable": ["codex", "completion"]},
+            {"postflight": null},
+            {"zap": [{"trash": "~/.codex"}]}
+        ]))
+        .unwrap();
+        assert_eq!(
+            cask_uninstall_artifacts(&codex),
+            serde_json::from_value::<Vec<Value>>(serde_json::json!([
+                {"binary": ["codex-aarch64-apple-darwin", {"target": "codex"}]},
+                {"generate_completions_from_executable": ["codex", "completion"]},
+                {"zap": [{"trash": "~/.codex"}]}
+            ]))
+            .unwrap()
+        );
+
+        let mut pkg = test_cask("example", "2.0");
+        pkg.artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["Example.app"], "target": "/Applications/Example.app"},
+            {"pkg": ["Example.pkg"]},
+            {"uninstall": [{"pkgutil": "com.example.pkg"}]},
+            {"postflight_steps": [{"steps": [{"type": "terminate_process", "name": "Example"}]}]},
+            {"uninstall_postflight": null},
+            {"zap": [{"trash": "~/Library/Application Support/Example"}]}
+        ]))
+        .unwrap();
+        assert_eq!(
+            cask_uninstall_artifacts(&pkg),
+            serde_json::from_value::<Vec<Value>>(serde_json::json!([
+                {"app": ["Example.app"]},
+                {"uninstall": [{"pkgutil": "com.example.pkg"}]},
+                {"postflight_steps": [{"steps": [{"type": "terminate_process", "name": "Example"}]}]},
+                {"uninstall_postflight": null},
+                {"zap": [{"trash": "~/Library/Application Support/Example"}]}
+            ]))
+            .unwrap()
+        );
+
+        let mut font = test_cask("font-example", "1.0");
+        font.artifacts = (0..8)
+            .map(|index| serde_json::json!({"font": [format!("font-{index}.ttf")]}))
+            .collect();
+        let ordered = cask_uninstall_artifacts(&font);
+        assert_eq!(ordered[0]["font"][0], "font-7.ttf");
+        assert_eq!(ordered[7]["font"][0], "font-0.ttf");
+    }
+
+    #[test]
+    fn homebrew_metadata_writer_creates_complete_set() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let caskroom = dir.path().join("Caskroom/example/1.2.3");
+        file::create_dir_all(&caskroom)?;
+        let mut cask = test_cask("example", "1.2.3");
+        cask.artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["Example.app"]},
+            {"zap": [{"trash": "~/.example"}]}
+        ]))?;
+
+        write_homebrew_metadata(&caskroom, &cask)?;
+
+        let token_dir = dir.path().join("Caskroom/example");
+        let receipt = receipt::read_cask_receipt(&token_dir)?;
+        assert_eq!(receipt.homebrew_version, receipt::EMULATED_BREW_VERSION);
+        assert_eq!(receipt.source.version, "1.2.3");
+        assert_eq!(receipt.uninstall_artifacts, cask_uninstall_artifacts(&cask));
+        assert!(token_dir.join(".metadata/config.json").is_file());
+        let snapshot_dir = receipt::newest_cask_metadata_dir(&token_dir, "1.2.3")?.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot_dir.join("Casks/example.json"))?,
+            "{}"
+        );
+        assert!(!caskroom.join(".mise-cask.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn installed_and_auto_update_casks_are_noops() {
+        let mut cask = test_cask("example", "2.0");
+        let installed = InstalledCaskState::Installed("1.0".to_string());
+        assert_eq!(
+            existing_install_noop(&installed, &cask, false),
+            Some("1.0".to_string())
+        );
+        assert_eq!(existing_install_noop(&installed, &cask, true), None);
+        cask.auto_updates = true;
+        assert_eq!(
+            existing_install_noop(&installed, &cask, true),
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            existing_install_noop(
+                &InstalledCaskState::NeedsRepair {
+                    installed: Some("1.0".to_string()),
+                    reason: "corrupt receipt".to_string(),
+                },
+                &cask,
+                false,
+            ),
+            None
+        );
     }
 
     fn write_test_app_receipt(cask: &Cask, app_name: &str) -> Result<PathBuf> {
@@ -8489,7 +9104,12 @@ end
             ruby_source_path: None,
             ruby_source_checksum: None,
             tap_git_head: None,
+            tap: Some("homebrew/cask".to_string()),
+            auto_updates: false,
+            depends_on: Value::Null,
             raw_base: None,
+            definition_source: "file:///font-test.json".to_string(),
+            loaded_from_internal_api: false,
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()

@@ -28,7 +28,7 @@ branch. Push to `fork` after each completed plan.
 | ---- | -------------------------------------------------------- | -------- | ------ | ------------- | ------ |
 | 001  | Shared Homebrew receipt schema module with emulation pin | P1       | M      | —             | DONE   |
 | 002  | Cask read-side recognition of Homebrew-installed state   | P1       | M      | 001           | DONE   |
-| 003  | Cask write-side 1:1 Homebrew metadata                    | P1       | L      | 001, 002      | TODO   |
+| 003  | Cask write-side 1:1 Homebrew metadata                    | P1       | L      | 001, 002      | DONE   |
 | 004  | Truthful formula receipts with pinned producer version   | P1       | L      | 001           | TODO   |
 | 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | TODO   |
 | 006  | Removal parity with brew uninstall                       | P1       | L      | 001, 003, 004 | TODO   |
