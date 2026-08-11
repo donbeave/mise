@@ -249,3 +249,24 @@ started, but the full oracle remains 007's deliverable.
   the same commit that installs the new artifact type.
 - Deferred: `.metadata` teardown on uninstall (plan 006); legacy backfill
   (plan 005).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** The planned public per-cask API source could not truthfully
+  emit Homebrew's stable `loaded_from_internal_api: true`, and the planned
+  verbatim definition snapshot contradicted the emulated Homebrew source.
+- **Evidence:** Homebrew 6.0.17 `api.rb` says the internal API is always used;
+  `cask_loader.rb` marks that loader internal; `cask/installer.rb#save_caskfile`
+  writes `to_installed_json_hash` (normally `{}`), not the fetched package
+  definition. `ArtifactSet#to_a` also re-sorts artifacts; a real-brew oracle
+  showed the public font list requires MRI's equal-class endpoint permutation
+  before its receipt matches.
+- **Options:** (1) keep the public API and write `false` (truthful but fails the
+  differential contract); (2) claim `true` while using public data (untruthful,
+  forbidden); (3) consume the same platform-specific internal packages API,
+  derive its cask struct, record `true`, and reproduce `save_caskfile`.
+- **Choice:** Option 3. Official casks now use the internal packages endpoint
+  with no silent public fallback; third-party taps retain their truthful public
+  API path. The snapshot writer follows `save_caskfile`, and receipt artifact
+  ordering follows `ArtifactSet`. This is the only option satisfying truthful
+  provenance and the differential oracle.
