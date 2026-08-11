@@ -223,6 +223,13 @@ engine state, corpus class table.
 - **Options:** retain broad normalization, compare only key presence, or compare immutable facts exactly while normalizing only time, producer identity, and producer-local paths.
 - **Choice:** compare immutable facts exactly. Plan remains IN PROGRESS until disposable Linux and macOS oracle jobs pass.
 
+## Blocker resolution — 2026-08-12 PR security review
+
+- **Condition:** the disposable Linux oracle downloaded and executed Homebrew's mutable `HEAD` installer.
+- **Evidence:** review comment `discussion_r3762598171`; the test jobs can receive credentials, so mutable remote execution violates supply-chain safety.
+- **Options:** retain `HEAD`, pin only a commit, or pin an immutable commit and verify the downloaded bytes.
+- **Choice:** pin Homebrew/install commit `a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5` and require SHA-256 `12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41` before execution.
+
 ## Maintenance notes
 
 - This suite is the drift alarm: schedule it (CI cron) against current
