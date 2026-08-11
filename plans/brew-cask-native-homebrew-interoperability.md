@@ -30,7 +30,7 @@
 - **Effort:** XL
 - **Risk:** HIGH — engine must reproduce Homebrew's private on-disk state
   exactly; emulation errors can surface as destructive `brew
-  upgrade`/`uninstall` misbehavior
+upgrade`/`uninstall` misbehavior
 - **Depends on:** none
 - **Category:** correctness / compatibility / architecture
 - **Planned at:** commit `14888188d`, 2026-08-05; direction revised
@@ -239,7 +239,7 @@ current main):
   receipt, and refuses to install when Homebrew `.metadata` exists.
 - **Exactly one external `brew` invocation exists in both providers:**
   `cask_ruby_bin()` (`cask.rs:780-784`) runs `brew ruby -e 'print
-  RbConfig.ruby'` from PATH solely to locate a Ruby interpreter for the shim,
+RbConfig.ruby'` from PATH solely to locate a Ruby interpreter for the shim,
   falling back to PATH `ruby`, then mise-provisioned Ruby. No package query,
   install, upgrade, link, or removal ever calls the `brew` executable.
 
@@ -446,8 +446,8 @@ differential pass.
 
 0. ~~Architecture~~ — **decided 2026-08-12**: keep engine + full 1:1 write
    emulation (see decision record above).
-1. *(Closed as moot 2026-08-12 — no delegated mutations remain in the chosen
-   architecture.)* Homebrew ask-mode suppression for delegated mutations.
+1. _(Closed as moot 2026-08-12 — no delegated mutations remain in the chosen
+   architecture.)_ Homebrew ask-mode suppression for delegated mutations.
 2. ~~Legacy mise-only casks~~ — **decided 2026-08-12: gated backfill on
    apply.** A legacy cask (`.mise-cask.toml`, no `.metadata`) is converted
    to full truthful Homebrew receipts during status/apply only when truth is
@@ -466,9 +466,9 @@ differential pass.
    backfill (version-mismatched destructive directives — July failure
    class), manual-repair-only (turns every existing bootstrap machine into
    repair errors after upgrade).
-3. *(Closed as moot 2026-08-12 — `--adopt` was a delegation-path tool; under
-   emulation the equivalent problem is receipt backfill, question 2.)*
-4. *(Closed as moot 2026-08-12 — native writers are retained by decision 0.)*
+3. _(Closed as moot 2026-08-12 — `--adopt` was a delegation-path tool; under
+   emulation the equivalent problem is receipt backfill, question 2.)_
+4. _(Closed as moot 2026-08-12 — native writers are retained by decision 0.)_
 5. ~~Prune/removal alignment~~ — **decided 2026-08-12: removal is in
    scope.** Formula prune, cask prune (#11810, arriving via the rebase onto
    main), and the cask uninstall/reinstall paths must all satisfy the same
@@ -666,16 +666,16 @@ policy hold.
 
 ### Supported steady-state matrix
 
-| Starting state | mise status | mise apply | mise upgrade | ordinary Homebrew afterward |
-|---|---|---|---|---|
-| Valid Homebrew formula, installed before declaration | installed | exact no-op | engine upgrade, brew-identical result | fully supported |
-| Valid Homebrew cask, installed before declaration | installed | exact no-op | engine upgrade, brew-identical result | fully supported |
-| Formula absent | missing | engine install, brew-identical result | later engine upgrade | fully supported |
-| Cask absent | missing | engine install, brew-identical result | later engine upgrade | fully supported |
-| Installed through the new engine | installed | no-op | engine or `brew upgrade` — interchangeable | indistinguishable from `brew install` |
-| Legacy mise-only cask, truth provable | installed after gated backfill | backfill receipts, no payload mutation | normal | fully supported after backfill |
-| Legacy mise-only cask, truth not provable | needs repair | no mutation, one-line fix instruction | no mutation | untouched |
-| Homebrew state corrupt/unparseable | error for that package | no mutation | no mutation | untouched |
+| Starting state                                       | mise status                    | mise apply                             | mise upgrade                               | ordinary Homebrew afterward           |
+| ---------------------------------------------------- | ------------------------------ | -------------------------------------- | ------------------------------------------ | ------------------------------------- |
+| Valid Homebrew formula, installed before declaration | installed                      | exact no-op                            | engine upgrade, brew-identical result      | fully supported                       |
+| Valid Homebrew cask, installed before declaration    | installed                      | exact no-op                            | engine upgrade, brew-identical result      | fully supported                       |
+| Formula absent                                       | missing                        | engine install, brew-identical result  | later engine upgrade                       | fully supported                       |
+| Cask absent                                          | missing                        | engine install, brew-identical result  | later engine upgrade                       | fully supported                       |
+| Installed through the new engine                     | installed                      | no-op                                  | engine or `brew upgrade` — interchangeable | indistinguishable from `brew install` |
+| Legacy mise-only cask, truth provable                | installed after gated backfill | backfill receipts, no payload mutation | normal                                     | fully supported after backfill        |
+| Legacy mise-only cask, truth not provable            | needs repair                   | no mutation, one-line fix instruction  | no mutation                                | untouched                             |
+| Homebrew state corrupt/unparseable                   | error for that package         | no mutation                            | no mutation                                | untouched                             |
 
 `apply` means presence reconciliation, not update. An installed older version
 satisfies an unpinned `"latest"` declaration. Only the existing explicit
@@ -718,9 +718,9 @@ Homebrew `6.0.17`:
 
 ### Canonical prefixes
 
-| Platform | Prefix |
-|---|---|
-| macOS arm64 | `/opt/homebrew` |
+| Platform           | Prefix                       |
+| ------------------ | ---------------------------- |
+| macOS arm64        | `/opt/homebrew`              |
 | Linux x86_64/arm64 | `/home/linuxbrew/.linuxbrew` |
 
 `MISE_SYSTEM_BREW_PREFIX` remains a test-only override, never documented as
@@ -870,7 +870,7 @@ state model changes underneath.
 
 `src/system/packages/brew/maintenance.rs:150-161` and
 `src/cli/system/prune.rs:66-89` unlink and delete formula kegs; main's
-#11810 adds cask prune. Under decision 5, every removal path must leave
+jdx/mise#11810 adds cask prune. Under decision 5, every removal path must leave
 post-state identical to `brew uninstall`, including executing recorded
 `uninstall_artifacts` and tearing down `.metadata` — verified by the
 round-trip oracle.
@@ -881,14 +881,14 @@ CLI.
 
 ## Commands the executor will need
 
-| Purpose | Command | Expected result |
-|---|---|---|
-| Targeted unit tests | `rtk cargo test --all-features system::packages::brew` | exit 0 |
-| Linux formula e2e | `rtk mise run test:e2e e2e/cli/test_system_install_brew_linux` | all assertions pass |
+| Purpose                | Command                                                             | Expected result                                             |
+| ---------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Targeted unit tests    | `rtk cargo test --all-features system::packages::brew`              | exit 0                                                      |
+| Linux formula e2e      | `rtk mise run test:e2e e2e/cli/test_system_install_brew_linux`      | all assertions pass                                         |
 | macOS formula/cask e2e | `rtk mise run test:e2e e2e/cli/test_system_install_brew_macos_slow` | all assertions pass on macOS CI; intentional skip elsewhere |
-| Lint/fix before commit | `rtk mise run lint-fix` | exit 0; stage resulting relevant fixes |
-| Lint | `rtk mise run lint` | exit 0 |
-| Full gate | `rtk mise run ci` | exit 0 |
+| Lint/fix before commit | `rtk mise run lint-fix`                                             | exit 0; stage resulting relevant fixes                      |
+| Lint                   | `rtk mise run lint`                                                 | exit 0                                                      |
+| Full gate              | `rtk mise run ci`                                                   | exit 0                                                      |
 
 Never execute e2e scripts directly. Use the mise tasks shown above.
 
@@ -1115,7 +1115,7 @@ For one formula (Linux) and one app cask plus one font cask (macOS):
 4. assert A == B byte-for-byte after the explicit normalization list
    (timestamps, `built_on` machine facts, `source.path`, mtimes);
 5. round-trip: engine-installed package passes `brew list/info/upgrade/
-   uninstall` cleanly; brew-installed package satisfies mise status/apply as
+uninstall` cleanly; brew-installed package satisfies mise status/apply as
    a no-op and mise removal leaves brew-identical post-state;
 6. mise status and apply run twice against installed state and change no
    hashes.
@@ -1132,33 +1132,33 @@ evidence.
 All must hold:
 
 - [ ] Existing valid Homebrew formulae and casks report `installed` in mise,
-  and applying their declarations performs no mutation (Codex regression
-  test green).
+      and applying their declarations performs no mutation (Codex regression
+      test green).
 - [ ] Engine-installed formulae and casks pass real
-  `brew list/info/upgrade/uninstall` cleanly.
+      `brew list/info/upgrade/uninstall` cleanly.
 - [ ] Differential oracle: brew-install vs engine-install of each e2e
-  fixture compares byte-identical after the explicit normalization list.
+      fixture compares byte-identical after the explicit normalization list.
 - [ ] Removal parity: engine prune/uninstall post-state equals
-  `brew uninstall` post-state for the fixtures.
+      `brew uninstall` post-state for the fixtures.
 - [ ] Producer-identity fields carry the pinned emulated version everywhere;
-  `"5.1.15 (mise)"` and `.mise-cask.toml` writes are gone from new
-  installs.
+      `"5.1.15 (mise)"` and `.mise-cask.toml` writes are gone from new
+      installs.
 - [ ] Production code contains zero `brew` CLI invocations (including the
-  former `brew ruby` lookup).
+      former `brew ruby` lookup).
 - [ ] Legacy mise-only casks converge via the provable-truth backfill or
-  report needs-repair with the one-line instruction; nothing is silently
-  deleted, reinstalled, or fabricated.
+      report needs-repair with the one-line instruction; nothing is silently
+      deleted, reinstalled, or fabricated.
 - [ ] Schema-strict reads: corrupt/unknown state blocks mutation of that
-  package; newer brew versions alone never error.
+      package; newer brew versions alone never error.
 - [ ] Implementation-phase corpus verification recorded: essential-mac
-  equivalence-class table plus per-representative differential results.
+      equivalence-class table plus per-representative differential results.
 - [ ] No new mise CLI/config surface was added.
 - [ ] Version strings remain opaque; no new semver ordering exists.
 - [ ] Targeted unit and Linux/macOS e2e tests pass.
 - [ ] `rtk mise run lint` passes.
 - [ ] `rtk mise run ci` passes.
 - [ ] `rtk git status --short` shows no files outside the approved scope
-  except repository-generated docs required by the render process.
+      except repository-generated docs required by the render process.
 
 ## STOP conditions
 

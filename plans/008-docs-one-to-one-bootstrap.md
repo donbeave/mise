@@ -50,10 +50,10 @@ confusion the engineering removed.
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Lint (includes markdown/format checks) | `mise run lint` | exit 0 |
-| Docs dev preview (optional) | `mise run docs` | serves locally |
+| Purpose                                | Command         | Expected on success |
+| -------------------------------------- | --------------- | ------------------- |
+| Lint (includes markdown/format checks) | `mise run lint` | exit 0              |
+| Docs dev preview (optional)            | `mise run docs` | serves locally      |
 
 ## Scope
 

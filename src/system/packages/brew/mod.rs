@@ -34,6 +34,8 @@ mod macho;
 mod maintenance;
 mod pour;
 mod prefix;
+#[allow(dead_code)] // Removed when plans 002–004 wire the shared receipt module.
+pub mod receipt;
 mod relocate;
 mod resolve;
 mod source;

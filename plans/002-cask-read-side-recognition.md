@@ -106,11 +106,11 @@ Design contract for this plan (decisions 9 and 10):
 
 ## Commands you will need
 
-| Purpose | Command | Expected on success |
-|---|---|---|
-| Build | `mise run build` | exit 0 |
-| Unit tests | `cargo test --all-features system::packages::brew` | exit 0 |
-| Lint | `mise run lint` | exit 0 |
+| Purpose    | Command                                            | Expected on success |
+| ---------- | -------------------------------------------------- | ------------------- |
+| Build      | `mise run build`                                   | exit 0              |
+| Unit tests | `cargo test --all-features system::packages::brew` | exit 0              |
+| Lint       | `mise run lint`                                    | exit 0              |
 
 ## Scope
 
@@ -203,13 +203,13 @@ differential e2e in plan 007 — note it there, do not add e2e here.
 ALL must hold:
 
 - [ ] `cargo test --all-features system::packages::brew` exits 0 with the
-  new tests.
+      new tests.
 - [ ] The seven Step-3 cases exist and pass.
 - [ ] The ownership guard lines are UNCHANGED
-  (`grep -n "Homebrew owns this cask" src/system/packages/brew/cask.rs`
-  still matches twice in install paths).
+      (`grep -n "Homebrew owns this cask" src/system/packages/brew/cask.rs`
+      still matches twice in install paths).
 - [ ] No write path modified: `git diff` for this plan touches no code that
-  writes `.mise-cask.toml` or `.metadata`.
+      writes `.mise-cask.toml` or `.metadata`.
 - [ ] `mise run lint` exits 0.
 - [ ] `git status --short` — only in-scope files.
 - [ ] `plans/README.md` row 002 updated.
