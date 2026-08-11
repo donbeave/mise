@@ -69,6 +69,40 @@ REJECTED (with one-line rationale).
 - Never run destructive tests against a developer's real installed apps.
 - No `#[allow(clippy::...)]` exclusions; refactor until clippy passes.
 
+## Blocker resolution policy (maintainer instruction, 2026-08-12)
+
+Plan STOP conditions are **resolution checkpoints, not halt orders**. When
+one fires, do NOT mark the plan BLOCKED and wait. Instead:
+
+1. **Investigate immediately.** Gather the missing facts yourself:
+   Homebrew source (`$(brew --repository)`), real receipts from fresh
+   disposable installs, repository history, the design document's decision
+   records, upstream API payloads. Most STOP conditions are missing-fact
+   problems, and the facts are discoverable.
+2. **Enumerate 2–3 resolution options** and score them against, in order:
+   (a) the hard invariants below and the design document's decisions 0–10;
+   (b) fidelity to real Homebrew behavior (the differential oracle is the
+   arbiter); (c) goal completion.
+3. **Choose the best compliant option and continue.** Record a dated
+   "Blocker resolution" entry in the affected plan file: which condition
+   fired, the evidence gathered, the options, the choice, and why. Nothing
+   is resolved silently — the record IS the permission.
+4. **Verification failures**: keep diagnosing while each attempt produces
+   new evidence or progress; "failed twice" alone is not a halt reason.
+   Halt only at a genuine dead end where no attempted option changes the
+   outcome.
+5. **Hard-stop (BLOCKED) remains ONLY for**: any option that would write
+   an untruthful receipt field or placeholder; any destructive action on
+   non-disposable user state; overturning a maintainer decision (0–10) or
+   the Executive decision; adding new CLI/config surface; invoking the
+   brew CLI from production code; or a question only the maintainer can
+   answer (product policy, not discoverable fact). When hard-stopping,
+   the BLOCKED row must already contain the full analysis and a
+   recommended resolution — never a bare "blocked".
+
+This policy overrides the per-plan "STOP and report" phrasing wherever the
+two conflict, except for the hard-stop class in point 5.
+
 ## Findings considered and rejected
 
 - Delegating any production operation to the `brew` CLI: rejected by
