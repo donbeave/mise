@@ -275,6 +275,7 @@ pub struct CaskPruneCandidate {
     pub version: String,
     version_dir: PathBuf,
     receipt: CaskReceipt,
+    homebrew_receipt: Option<receipt::CaskReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,6 +385,12 @@ impl BrewCaskManager {
         let previous_binaries = previous_binary_targets(&cask)?;
         let previous_fonts = previous_font_targets(&cask)?;
         let previous_completions = previous_completion_targets(&cask)?;
+        let previous_homebrew_targets =
+            receipt::read_cask_receipt(&caskroom_token_dir(&cask.token))
+                .ok()
+                .map(|receipt| homebrew_receipt_targets(&cask.token, &receipt))
+                .transpose()?
+                .unwrap_or_default();
         let caskroom_token = caskroom_token_dir(&cask.token);
         let caskroom = caskroom_version_dir(&cask.token, &cask.version);
         let tmp_caskroom = caskroom_tmp_dir(&cask);
@@ -460,7 +467,14 @@ impl BrewCaskManager {
         let mut current_targets = current_binaries.clone();
         current_targets.extend(current_completions.iter().cloned());
         current_targets.extend(current_fonts.iter().cloned());
-        let mut link_transaction = ArtifactLinkTransaction::begin(current_targets)?;
+        current_targets.extend(
+            artifacts
+                .apps
+                .iter()
+                .map(|app| app_target_path(app.target_name()))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        let mut link_transaction = ArtifactLinkTransaction::begin(current_targets.clone())?;
         let activation = replace_caskroom(&cask, &tmp_caskroom, &caskroom, || {
             for binary in &artifacts.binaries {
                 link_binary(&caskroom, &appdir, binary)?;
@@ -490,6 +504,11 @@ impl BrewCaskManager {
         remove_obsolete_binary_links(&cask, &previous_binaries, &current_binaries)?;
         remove_obsolete_completions(&cask, &previous_completions, &current_completions)?;
         remove_obsolete_fonts(&cask, &previous_fonts, &current_fonts)?;
+        for target in previous_homebrew_targets {
+            if !current_targets.contains(&target.path) && cask_target_record_matches(&target)? {
+                remove_artifact_target_elevating(&target.path)?;
+            }
+        }
         remove_stale_versions(&caskroom_token, &cask.version)?;
         remove_cask_journals(&cask.token)?;
         file::remove_all(stage)?;
@@ -4771,6 +4790,130 @@ fn read_receipt(caskroom: &Path) -> Result<Option<CaskReceipt>> {
         .wrap_err_with(|| format!("failed to parse {}", path.display()))
 }
 
+fn cask_from_homebrew_receipt(token: &str, receipt: &receipt::CaskReceipt) -> Cask {
+    Cask {
+        token: token.to_string(),
+        aliases: Vec::new(),
+        old_tokens: Vec::new(),
+        version: receipt.source.version.clone(),
+        url: String::new(),
+        url_specs: CaskUrlSpecs::default(),
+        sha256: None,
+        artifacts: receipt.uninstall_artifacts.clone(),
+        ruby_source_path: None,
+        ruby_source_checksum: None,
+        tap_git_head: receipt.source.tap_git_head.clone(),
+        tap: Some(receipt.source.tap.clone()),
+        auto_updates: false,
+        depends_on: Value::Null,
+        raw_base: None,
+        definition_source: receipt.source.path.clone().unwrap_or_default(),
+        loaded_from_internal_api: receipt.loaded_from_internal_api,
+    }
+}
+
+fn homebrew_receipt_targets(
+    token: &str,
+    homebrew: &receipt::CaskReceipt,
+) -> Result<Vec<CaskTargetRecord>> {
+    let cask = cask_from_homebrew_receipt(token, homebrew);
+    let mut artifacts = CaskArtifacts::default();
+    for artifact in &cask.artifacts {
+        if let Some(app) = parse_app_artifact(artifact) {
+            artifacts.apps.push(app);
+        } else if let Some(binary) = parse_binary_artifact(artifact) {
+            artifacts.binaries.push(binary);
+        } else if let Some(wrapper) = parse_command_wrapper_artifact(artifact)? {
+            artifacts.command_wrappers.push(wrapper);
+        } else if let Some(font) = parse_font_artifact(artifact) {
+            artifacts.fonts.push(font);
+        } else if let Some(completion) = parse_completion_artifact(artifact)? {
+            artifacts.completions.push(completion);
+        } else if let Some(generated) = parse_generated_completion_artifact(artifact)? {
+            artifacts.generated_completions.push(generated);
+        } else if !is_non_install_artifact(&artifact_type(artifact)) {
+            bail!(
+                "brew-cask:{token}: unsupported recorded uninstall artifact {}",
+                artifact_type(artifact)
+            );
+        }
+    }
+    let mut paths = artifacts
+        .apps
+        .iter()
+        .map(|app| app_target_path(app.target_name()))
+        .collect::<Result<Vec<_>>>()?;
+    paths.extend(binary_targets(&artifacts)?);
+    paths.extend(
+        artifacts
+            .fonts
+            .iter()
+            .map(font_target_path)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    paths.extend(completion_target_paths(&cask, &artifacts)?);
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|path| path.symlink_metadata().is_ok())
+        .map(|path| {
+            Ok(CaskTargetRecord {
+                fingerprint: cask_target_fingerprint(&path)?,
+                path,
+            })
+        })
+        .collect()
+}
+
+fn synthetic_homebrew_prune_receipt(
+    token: &str,
+    homebrew: &receipt::CaskReceipt,
+) -> Result<CaskReceipt> {
+    let targets = homebrew_receipt_targets(token, homebrew)?;
+    let completion_roots = [
+        CompletionShell::Bash,
+        CompletionShell::Fish,
+        CompletionShell::Zsh,
+        CompletionShell::Pwsh,
+    ]
+    .map(default_completion_dir);
+    let mut apps = Vec::new();
+    let mut binaries = Vec::new();
+    let mut fonts = Vec::new();
+    let mut completions = Vec::new();
+    for target in &targets {
+        if target.fingerprint.kind == CaskTargetKind::Directory
+            && allowed_appdir_roots()
+                .iter()
+                .any(|root| path_is_below(&target.path, root))
+        {
+            apps.push(target.path.clone());
+        } else if path_is_below(&target.path, &font_dir()) {
+            fonts.push(target.path.clone());
+        } else if completion_roots
+            .iter()
+            .any(|root| path_is_below(&target.path, root))
+        {
+            completions.push(target.path.clone());
+        } else {
+            binaries.push(target.path.clone());
+        }
+    }
+    Ok(CaskReceipt {
+        schema_version: 3,
+        version: homebrew.source.version.clone(),
+        apps,
+        binaries,
+        fonts,
+        completions,
+        pkg_ids: Vec::new(),
+        targets,
+        prune_safe: true,
+        prune_blocker: None,
+    })
+}
+
 pub async fn cask_prune_plan(configured: &[PackageRequest]) -> Result<CaskPrunePlan> {
     let mut keep = BTreeSet::new();
     for request in configured {
@@ -4896,15 +5039,6 @@ fn cask_prune_plan_from_tokens(keep: &BTreeSet<String>, state_dir: &Path) -> Res
             }
             continue;
         }
-        if entry.path().join(".metadata").symlink_metadata().is_ok() {
-            if !configured {
-                plan.skipped.push(CaskPruneSkip {
-                    token,
-                    reason: "Homebrew owns this cask".to_string(),
-                });
-            }
-            continue;
-        }
         let [version] = versions.as_slice() else {
             if !configured {
                 plan.skipped.push(CaskPruneSkip {
@@ -4915,6 +5049,60 @@ fn cask_prune_plan_from_tokens(keep: &BTreeSet<String>, state_dir: &Path) -> Res
             continue;
         };
         let version_dir = version.path();
+        if entry.path().join(".metadata").symlink_metadata().is_ok() {
+            if configured {
+                continue;
+            }
+            let homebrew = match receipt::read_cask_receipt(&entry.path()) {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    plan.skipped.push(CaskPruneSkip {
+                        token,
+                        reason: format!("Homebrew receipt could not be read: {err}"),
+                    });
+                    continue;
+                }
+            };
+            let on_disk_version = version.file_name().to_string_lossy().to_string();
+            if homebrew.source.version != on_disk_version {
+                plan.skipped.push(CaskPruneSkip {
+                    token,
+                    reason: format!(
+                        "Homebrew receipt version {} does not match Caskroom version {on_disk_version}",
+                        homebrew.source.version
+                    ),
+                });
+                continue;
+            }
+            let synthetic =
+                match synthetic_homebrew_prune_receipt(&token, &homebrew).and_then(|receipt| {
+                    validate_homebrew_uninstall_artifacts(&token, &homebrew)?;
+                    Ok(receipt)
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(err) => {
+                        plan.skipped.push(CaskPruneSkip {
+                            token,
+                            reason: format!("recorded artifacts cannot be removed safely: {err:#}"),
+                        });
+                        continue;
+                    }
+                };
+            for target in &synthetic.targets {
+                claims
+                    .entry(target.path.clone())
+                    .or_default()
+                    .insert(token.clone());
+            }
+            candidates.push(CaskPruneCandidate {
+                token,
+                version: on_disk_version,
+                version_dir,
+                receipt: synthetic,
+                homebrew_receipt: Some(homebrew),
+            });
+            continue;
+        }
         let Some(receipt) = receipts.remove(&version_dir) else {
             if !configured {
                 plan.skipped.push(CaskPruneSkip {
@@ -4956,6 +5144,7 @@ fn cask_prune_plan_from_tokens(keep: &BTreeSet<String>, state_dir: &Path) -> Res
             version,
             version_dir,
             receipt,
+            homebrew_receipt: None,
         };
         if let Err(reason) = validate_cask_prune_candidate(&candidate) {
             plan.skipped.push(CaskPruneSkip {
@@ -5024,17 +5213,12 @@ fn apply_cask_prune_plan_in(
     }
 
     let _caskroom_lock = lock_caskroom()?;
+    for candidate in &plan.remove {
+        validate_cask_prune_candidate(candidate)?;
+        validate_cask_prune_claims(candidate)?;
+    }
     let mut removed = 0;
     for candidate in &plan.remove {
-        if let Err(reason) = validate_cask_prune_candidate(candidate)
-            .and_then(|_| validate_cask_prune_claims(candidate))
-        {
-            warn!(
-                "brew-cask:{}: skipped because recorded artifacts changed after planning: {reason:#}",
-                candidate.token
-            );
-            continue;
-        }
         let mut journal = CaskTransactionJournal {
             schema_version: 1,
             token: &candidate.token,
@@ -5046,9 +5230,16 @@ fn apply_cask_prune_plan_in(
             remove_artifact_target_elevating(&target.path)?;
             record_cask_action_in(state_dir, &mut journal, &format!("prune_target[{index}]"))?;
         }
+        if let Some(homebrew) = &candidate.homebrew_receipt {
+            execute_homebrew_uninstall_artifacts(candidate, homebrew)?;
+            record_cask_action_in(state_dir, &mut journal, "uninstall_artifacts")?;
+        }
         file::remove_all(&candidate.version_dir)?;
         record_cask_action_in(state_dir, &mut journal, "prune_caskroom")?;
         if let Some(token_dir) = candidate.version_dir.parent() {
+            if token_dir.join(".metadata").exists() {
+                file::remove_all(token_dir.join(".metadata"))?;
+            }
             file::remove_dir(token_dir)?;
         }
         remove_cask_journals_in(state_dir, &candidate.token)?;
@@ -5106,13 +5297,162 @@ fn validate_cask_prune_claims(candidate: &CaskPruneCandidate) -> Result<()> {
     Ok(())
 }
 
-fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
-    if homebrew_metadata_present(&candidate.token) {
-        bail!("Homebrew now owns this cask");
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomebrewUninstallAction {
+    Pkgutil(String),
+    Delete(PathBuf),
+    Quit(String),
+    Launchctl(String),
+}
+
+fn homebrew_uninstall_actions(
+    token: &str,
+    homebrew: &receipt::CaskReceipt,
+) -> Result<Vec<HomebrewUninstallAction>> {
+    let mut actions = Vec::new();
+    for artifact in &homebrew.uninstall_artifacts {
+        let Some(uninstall) = artifact.get("uninstall") else {
+            continue;
+        };
+        let entries = uninstall
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(uninstall));
+        for entry in entries {
+            let object = entry.as_object().ok_or_else(|| {
+                eyre!("brew-cask:{token}: recorded uninstall directive is not an object")
+            })?;
+            for (kind, value) in object {
+                let values = value
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_else(|| std::slice::from_ref(value));
+                for value in values {
+                    let value = value.as_str().ok_or_else(|| {
+                        eyre!("brew-cask:{token}: recorded uninstall {kind} value is not a string")
+                    })?;
+                    actions.push(match kind.as_str() {
+                        "pkgutil" => HomebrewUninstallAction::Pkgutil(value.to_string()),
+                        "delete" => HomebrewUninstallAction::Delete(PathBuf::from(value)),
+                        "quit" => HomebrewUninstallAction::Quit(value.to_string()),
+                        "launchctl" => HomebrewUninstallAction::Launchctl(value.to_string()),
+                        _ => bail!(
+                            "brew-cask:{token}: unsupported recorded uninstall directive {kind}"
+                        ),
+                    });
+                }
+            }
+        }
     }
+    Ok(actions)
+}
+
+fn validate_homebrew_uninstall_artifacts(
+    token: &str,
+    homebrew: &receipt::CaskReceipt,
+) -> Result<()> {
+    let actions = homebrew_uninstall_actions(token, homebrew)?;
+    #[cfg(target_os = "macos")]
+    let _ = &actions;
+    #[cfg(not(target_os = "macos"))]
+    if actions.iter().any(|action| {
+        matches!(
+            action,
+            HomebrewUninstallAction::Pkgutil(_)
+                | HomebrewUninstallAction::Quit(_)
+                | HomebrewUninstallAction::Launchctl(_)
+        )
+    }) {
+        bail!("brew-cask:{token}: recorded macOS uninstall directive is unavailable on this host");
+    }
+    Ok(())
+}
+
+fn execute_homebrew_uninstall_artifacts(
+    candidate: &CaskPruneCandidate,
+    homebrew: &receipt::CaskReceipt,
+) -> Result<()> {
+    for action in homebrew_uninstall_actions(&candidate.token, homebrew)? {
+        match action {
+            HomebrewUninstallAction::Pkgutil(id) => {
+                #[cfg(not(target_os = "macos"))]
+                bail!(
+                    "brew-cask:{}: pkgutil uninstall is only available on macOS",
+                    candidate.token
+                );
+                #[cfg(target_os = "macos")]
+                run_uninstall_command("/usr/sbin/pkgutil", &["--forget", &id], &candidate.token)?;
+            }
+            HomebrewUninstallAction::Delete(path) => {
+                let raw = path.to_string_lossy();
+                let expanded = expand_cask_template(
+                    &raw,
+                    &candidate.version_dir,
+                    &cask_appdir(&[])?,
+                    Some(&candidate.version),
+                );
+                remove_artifact_target_elevating(Path::new(&expanded))?;
+            }
+            HomebrewUninstallAction::Quit(bundle_id) => {
+                #[cfg(not(target_os = "macos"))]
+                bail!(
+                    "brew-cask:{}: quit uninstall is only available on macOS",
+                    candidate.token
+                );
+                #[cfg(target_os = "macos")]
+                run_uninstall_command(
+                    "/usr/bin/osascript",
+                    &[
+                        "-e",
+                        &format!("tell application id \"{bundle_id}\" to quit"),
+                    ],
+                    &candidate.token,
+                )?;
+            }
+            HomebrewUninstallAction::Launchctl(label) => {
+                #[cfg(not(target_os = "macos"))]
+                bail!(
+                    "brew-cask:{}: launchctl uninstall is only available on macOS",
+                    candidate.token
+                );
+                #[cfg(target_os = "macos")]
+                run_uninstall_command("/bin/launchctl", &["remove", &label], &candidate.token)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_uninstall_command(program: &str, args: &[&str], token: &str) -> Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        bail!("brew-cask:{token}: uninstall command {program} failed");
+    }
+    Ok(())
+}
+
+fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
     let receipt = &candidate.receipt;
-    if read_receipt(&candidate.version_dir)?.as_ref() != Some(receipt) {
-        bail!("ownership receipt has changed");
+    if let Some(homebrew) = &candidate.homebrew_receipt {
+        let token_dir = candidate
+            .version_dir
+            .parent()
+            .ok_or_else(|| eyre!("cask version has no token directory"))?;
+        if receipt::read_cask_receipt(token_dir)? != *homebrew {
+            bail!("Homebrew receipt has changed");
+        }
+        validate_homebrew_uninstall_artifacts(&candidate.token, homebrew)?;
+    } else {
+        if homebrew_metadata_present(&candidate.token) {
+            bail!("Homebrew metadata appeared after planning");
+        }
+        if read_receipt(&candidate.version_dir)?.as_ref() != Some(receipt) {
+            bail!("ownership receipt has changed");
+        }
     }
     if receipt.schema_version != 3 || !receipt.prune_safe || !receipt.pkg_ids.is_empty() {
         bail!("receipt is not marked safe for direct-artifact pruning");
@@ -5130,7 +5470,7 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         .chain(&receipt.completions)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if expected.is_empty()
+    if (expected.is_empty() && candidate.homebrew_receipt.is_none())
         || records.len() != receipt.targets.len()
         || records.len() != expected.len()
     {
@@ -8286,7 +8626,7 @@ end
 
         write_test_app_receipt(&test_cask("late-claim", "1.0.0"), "Shared.app")?;
 
-        assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 0);
+        assert!(apply_cask_prune_plan_in(&plan, false, &state_dir).is_err());
         assert!(target.exists());
         assert!(caskroom_token_dir("planned").exists());
         Ok(())
@@ -8304,9 +8644,94 @@ end
 
         file::create_dir_all(caskroom_token_dir("claimed").join(".metadata"))?;
 
-        assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 0);
+        assert!(apply_cask_prune_plan_in(&plan, false, &state_dir).is_err());
         assert!(target.exists());
         assert!(caskroom_token_dir("claimed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cask_prune_removes_homebrew_binary_and_metadata() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let state_dir = tmp.path().join("state");
+        write_homebrew_cask_receipt("codex", "1.2.3", |_| {});
+        let target = tmp.path().join("bin/codex");
+        let source = caskroom_version_dir("codex", "1.2.3").join("bin/codex");
+        file::create_dir_all(source.parent().unwrap())?;
+        file::write(&source, "codex")?;
+        file::create_dir_all(target.parent().unwrap())?;
+        file::make_symlink(&source, &target)?;
+
+        let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
+        assert_eq!(plan.remove.len(), 1);
+        assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 1);
+        assert!(!target.exists());
+        assert!(!caskroom_token_dir("codex").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn homebrew_uninstall_rejects_unknown_before_removal_and_ignores_zap() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let state_dir = tmp.path().join("state");
+        write_homebrew_cask_receipt("codex", "1.2.3", |receipt| {
+            receipt["uninstall_artifacts"] = serde_json::json!([
+                {"binary": ["bin/codex"]},
+                {"uninstall": [{"signal": "codex"}]},
+                {"zap": [{"delete": "~/.codex"}]}
+            ]);
+        });
+        let target = tmp.path().join("bin/codex");
+        file::create_dir_all(target.parent().unwrap())?;
+        file::write(&target, "codex")?;
+        let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
+        assert!(plan.remove.is_empty());
+        assert!(
+            plan.skipped[0]
+                .reason
+                .contains("unsupported recorded uninstall directive signal")
+        );
+        assert!(target.exists());
+
+        write_homebrew_cask_receipt("codex", "1.2.3", |receipt| {
+            receipt["uninstall_artifacts"] = serde_json::json!([
+                {"binary": ["bin/codex"]},
+                {"zap": [{"delete": "~/.codex"}]}
+            ]);
+        });
+        let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
+        assert_eq!(plan.remove.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn homebrew_uninstall_actions_cover_recorded_native_directives() -> Result<()> {
+        let mut value: Value =
+            serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
+        value["uninstall_artifacts"] = serde_json::json!([
+            {"uninstall": [{
+                "pkgutil": ["com.example.one", "com.example.two"],
+                "delete": "/Library/Example",
+                "quit": "com.example.app",
+                "launchctl": "com.example.agent"
+            }]},
+            {"zap": [{"delete": "~/.example"}]}
+        ]);
+        let receipt: receipt::CaskReceipt = serde_json::from_value(value)?;
+        assert_eq!(
+            homebrew_uninstall_actions("example", &receipt)?,
+            vec![
+                HomebrewUninstallAction::Pkgutil("com.example.one".to_string()),
+                HomebrewUninstallAction::Pkgutil("com.example.two".to_string()),
+                HomebrewUninstallAction::Delete(PathBuf::from("/Library/Example")),
+                HomebrewUninstallAction::Quit("com.example.app".to_string()),
+                HomebrewUninstallAction::Launchctl("com.example.agent".to_string()),
+            ]
+        );
         Ok(())
     }
 

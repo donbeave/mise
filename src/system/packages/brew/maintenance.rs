@@ -244,7 +244,12 @@ fn unlink_and_remove_keg(candidate: &PruneCandidate) -> Result<()> {
     pour::remove_finalization_state(&candidate.keg)?;
     file::remove_all(&candidate.keg)?;
     let rack = prefix::cellar().join(&candidate.name);
-    file::remove_dir(&rack)?;
+    if rack
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_none())
+    {
+        file::remove_dir(&rack)?;
+    }
     Ok(())
 }
 
@@ -600,6 +605,38 @@ mod tests {
         assert!(tmp.path().join("opt").exists());
         assert!(!keg.exists());
         assert!(!tmp.path().join("Cellar").join("jq").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unlink_one_version_preserves_nonempty_rack() -> Result<()> {
+        assert!(
+            include_str!("testdata/brew-uninstall-post-state.txt")
+                .contains("present-if-other-version Cellar/jq/1.6")
+        );
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let old = write_keg(
+            tmp.path(),
+            "jq",
+            "1.6",
+            r#"{"installed_on_request":true,"source":{"tap":"homebrew/core"}}"#,
+        )?;
+        let current = write_keg(
+            tmp.path(),
+            "jq",
+            "1.7",
+            r#"{"installed_on_request":true,"source":{"tap":"homebrew/core"}}"#,
+        )?;
+        unlink_and_remove_keg(&PruneCandidate {
+            name: "jq".to_string(),
+            version: "1.7".to_string(),
+            keg: current.clone(),
+        })?;
+        assert!(old.exists());
+        assert!(!current.exists());
+        assert!(tmp.path().join("Cellar/jq").is_dir());
         Ok(())
     }
 
