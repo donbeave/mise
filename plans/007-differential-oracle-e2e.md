@@ -216,6 +216,13 @@ engine state, corpus class table.
 - `brew` prompts despite `--yes` (ask-mode regression — record brew
   version and report).
 
+## Blocker resolution — 2026-08-12 verification review
+
+- **Condition:** normalization erased immutable `built_on`, `tap_git_head`, and `source_modified_time` facts.
+- **Evidence:** Homebrew derives these from bottle/cask metadata and uses them downstream; they are not wall-clock noise.
+- **Options:** retain broad normalization, compare only key presence, or compare immutable facts exactly while normalizing only time, producer identity, and producer-local paths.
+- **Choice:** compare immutable facts exactly. Plan remains IN PROGRESS until disposable Linux and macOS oracle jobs pass.
+
 ## Maintenance notes
 
 - This suite is the drift alarm: schedule it (CI cron) against current

@@ -435,14 +435,14 @@ async fn provision_mise(
     }
     if let Some(command) = &session.host.bootstrap_command {
         if dry_run {
-            let mise = resolve_remote_mise(session).wrap_err_with(|| {
+            let executable = resolve_remote_mise(session).wrap_err_with(|| {
                 format!(
                     "remote host '{}' has no existing mise executable; --dry-run does not execute bootstrap_command, so install mise first or set remote_mise or mise_bin",
                     session.host.name
                 )
             })?;
-            session.status(&[&mise, "version"], false)?;
-            return Ok(mise);
+            session.status(&[&executable, "version"], false)?;
+            return Ok(executable);
         }
         let before = discover_remote_mise_candidates(session)?;
         let before_identities = remote_mise_candidate_identities(session, &before);
@@ -456,10 +456,10 @@ async fn provision_mise(
         let candidates = session.output(&["cat", &candidates_file])?;
         let candidates = parse_remote_mise_candidates(&candidates)?;
         let after_identities = remote_mise_candidate_identities(session, &candidates);
-        let mise =
+        let executable =
             select_bootstrapped_mise(&before, &before_identities, &candidates, &after_identities)?;
-        session.status(&[&mise, "version"], false)?;
-        return Ok(mise);
+        session.status(&[&executable, "version"], false)?;
+        return Ok(executable);
     }
     let binary = if let Some(binary) = &session.host.mise_bin {
         binary.clone()

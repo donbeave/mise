@@ -266,7 +266,7 @@ ALL must hold:
 - [ ] `mise run lint` exits 0 (run `mise run lint-fix` first if needed).
 - [ ] `grep -rn "deny_unknown_fields" src/system/packages/brew/receipt.rs`
       → no matches.
-- [ ] `grep -rn "6\.0\.17" src/system/packages/brew/ | grep -v receipt.rs`
+- [ ] `grep -rn "6\.0\.17" src/system/packages/brew/ --exclude-dir=testdata | grep -v receipt.rs`
       → no matches (pin lives only in the module).
 - [ ] `git status --short` shows only the in-scope files modified/created.
 - [ ] `plans/README.md` row 001 updated.
@@ -284,6 +284,13 @@ Stop and report (do not improvise) if:
   deliberately, not guessed).
 - `mod.rs` module registration conflicts with a rebase-introduced module of
   the same name.
+
+## Blocker resolution — 2026-08-12 verification review
+
+- **Condition:** the single-pin grep also matched the required fixture provenance README.
+- **Evidence:** production writers reference `receipt::EMULATED_BREW_VERSION`; the fixture README must preserve exact generating `brew --version` output.
+- **Options:** delete provenance (violates fixture requirements), obscure the recorded version (untruthful), or scope the producer-constant gate outside `testdata/`.
+- **Choice:** exclude `testdata/`; fixture provenance is evidence, not a producer-identity source.
 
 ## Maintenance notes
 

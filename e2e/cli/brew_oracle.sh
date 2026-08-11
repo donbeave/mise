@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Differential Homebrew state oracle. Values normalized here are inherently
-# install-time/machine-specific; key presence remains mandatory so structural
-# divergence cannot be hidden.
+# Differential Homebrew state oracle. Normalize only producer identity,
+# wall-clock values, and producer-local source paths. Immutable package facts
+# (including built_on, tap_git_head, and source_modified_time) remain exact.
 
 brew_oracle_mode() {
   if [[ $(uname) == Darwin ]]; then
@@ -23,10 +23,7 @@ brew_oracle_normalize_json() {
     jq -S '
       .homebrew_version = "<NORMALIZED>" |
       .time = "<NORMALIZED>" |
-      .built_on = "<NORMALIZED>" |
-      .source.path = "<NORMALIZED>" |
-      .source.tap_git_head = "<NORMALIZED>" |
-      if has("source_modified_time") then .source_modified_time = "<NORMALIZED>" else . end
+      .source.path = "<NORMALIZED>"
     ' "$input" >"$output"
   elif [[ $input == */sbom.spdx.json ]]; then
     jq -e '

@@ -234,7 +234,7 @@ mod dedup_tests {
     #[test]
     fn to_vec_drops_later_exact_duplicates() {
         // The reactivation residue shape from #5397: a stale copy of a mise-managed dir
-        // sits in the inherited PATH (post), and mise adds a fresh copy (mise). The fresh
+        // sits in the inherited PATH (post), and mise adds a fresh managed copy. The fresh
         // copy comes first in pre+mise+post order, so it wins and the stale one drops.
         let mut path_env = PathEnv::from_iter(
             ["/stale-extra", "/usr/bin", "/stale-extra", "/bin"].map(PathBuf::from),
