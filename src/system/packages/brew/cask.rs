@@ -310,7 +310,12 @@ impl BrewCaskManager {
         let cask = fetch_cask(req).await?;
         let artifacts = cask_artifacts(&cask)?;
         validate_platform_support(&cask, &artifacts)?;
-        let installed = installed_cask_state(&cask, &artifacts)?;
+        let classified = installed_cask_state(&cask, &artifacts)?;
+        let installed = if opts.dry_run {
+            validate_legacy_cask(&cask, classified)?
+        } else {
+            reconcile_legacy_cask(&cask, classified)?
+        };
         if let Some(version) = existing_install_noop(&installed, &cask, upgrading) {
             info!("brew-cask:{}: already installed", cask.token);
             return Ok(version);
@@ -357,7 +362,7 @@ impl BrewCaskManager {
         prefix::bootstrap(false)?;
         let stage = fetch_and_stage(&cask, pr).await?;
         let _caskroom_lock = lock_caskroom()?;
-        match installed_cask_state(&cask, &artifacts)? {
+        match reconcile_legacy_cask_locked(&cask, installed_cask_state(&cask, &artifacts)?)? {
             InstalledCaskState::NeedsRepair { reason, .. } => {
                 file::remove_all(&stage)?;
                 bail!("brew-cask:{}: needs repair: {reason}", cask.token);
@@ -374,6 +379,7 @@ impl BrewCaskManager {
                 return Ok(version);
             }
             InstalledCaskState::Installed(_) | InstalledCaskState::Absent => {}
+            InstalledCaskState::LegacyMise(_) => unreachable!("legacy state was reconciled"),
         }
         let previous_binaries = previous_binary_targets(&cask)?;
         let previous_fonts = previous_font_targets(&cask)?;
@@ -622,7 +628,16 @@ impl SystemPackageManager for BrewCaskManager {
     async fn installed(&self, pkgs: &[PackageRequest]) -> Result<Vec<PackageStatus>> {
         let mut statuses = Vec::with_capacity(pkgs.len());
         for req in pkgs {
-            let cask = fetch_cask(req).await?;
+            let cask = match fetch_cask(req).await {
+                Ok(cask) => cask,
+                Err(err) => {
+                    if let Some(status) = legacy_catalog_failure_status(req, &err) {
+                        statuses.push(status);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
             let artifacts = cask_artifacts(&cask)?;
             if let Some(state) = platform_unavailable_state(&cask, &artifacts) {
                 statuses.push(PackageStatus {
@@ -631,7 +646,8 @@ impl SystemPackageManager for BrewCaskManager {
                 });
                 continue;
             }
-            let state = match installed_cask_state(&cask, &artifacts)? {
+            let installed = reconcile_legacy_cask(&cask, installed_cask_state(&cask, &artifacts)?)?;
+            let state = match installed {
                 InstalledCaskState::Installed(version) => match &req.version {
                     Some(requested) if version != *requested => {
                         PackageState::VersionMismatch { installed: version }
@@ -639,6 +655,7 @@ impl SystemPackageManager for BrewCaskManager {
                     _ => PackageState::Installed { version },
                 },
                 InstalledCaskState::Absent => PackageState::Missing,
+                InstalledCaskState::LegacyMise(_) => unreachable!("legacy state was reconciled"),
                 InstalledCaskState::NeedsRepair { installed, reason } => {
                     PackageState::NeedsRepair {
                         installed: installed.unwrap_or_default(),
@@ -711,6 +728,24 @@ impl SystemPackageManager for BrewCaskManager {
         mpr.footer_finish();
         Ok(())
     }
+}
+
+fn legacy_catalog_failure_status(
+    req: &PackageRequest,
+    err: &eyre::Report,
+) -> Option<PackageStatus> {
+    let token = req.name.rsplit('/').next()?;
+    let version = installed_version(token)?;
+    let version_dir = caskroom_version_dir(token, &version);
+    version_dir.join(".mise-cask.toml").exists().then(|| PackageStatus {
+        request: req.clone(),
+        state: PackageState::NeedsRepair {
+            installed: version,
+            reason: Some(format!(
+                "brew-cask:{token}: legacy mise install could not be verified against catalog ({err}); retry online, or reinstall with either 'brew install --cask {token}' or mise apply after uninstalling"
+            )),
+        },
+    })
 }
 
 async fn fetch_cask(req: &PackageRequest) -> Result<Cask> {
@@ -4022,6 +4057,7 @@ fn installed_cask_state(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Instal
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstalledCaskState {
     Installed(String),
+    LegacyMise(CaskReceipt),
     Absent,
     NeedsRepair {
         installed: Option<String>,
@@ -4041,6 +4077,7 @@ fn existing_install_noop(
             Some(version.clone())
         }
         InstalledCaskState::Installed(_)
+        | InstalledCaskState::LegacyMise(_)
         | InstalledCaskState::Absent
         | InstalledCaskState::NeedsRepair { .. } => None,
     }
@@ -4051,6 +4088,7 @@ impl InstalledCaskState {
     fn version(self) -> Option<String> {
         match self {
             Self::Installed(version) => Some(version),
+            Self::LegacyMise(receipt) => Some(receipt.version),
             Self::Absent | Self::NeedsRepair { .. } => None,
         }
     }
@@ -4093,45 +4131,116 @@ fn installed_cask_state_in(
         return Ok(InstalledCaskState::Absent);
     };
     let version_dir = caskroom_version_dir(&cask.token, &version);
-    match read_receipt(&version_dir)? {
+    let legacy_receipt = match read_receipt(&version_dir) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            return Ok(InstalledCaskState::NeedsRepair {
+                installed: Some(version),
+                reason: format!(
+                    "brew-cask:{}: legacy mise receipt cannot be parsed ({err}); reinstall with either 'brew install --cask {}' or mise apply after uninstalling",
+                    cask.token, cask.token
+                ),
+            });
+        }
+    };
+    match legacy_receipt {
         Some(receipt) => {
             if receipt.schema_version > 3 {
-                return Ok(InstalledCaskState::Absent);
+                return Ok(legacy_needs_repair(
+                    cask,
+                    &receipt.version,
+                    "receipt schema is unsupported",
+                ));
             }
-            if receipt.schema_version >= 2 {
-                let targets_match = receipt
-                    .targets
-                    .iter()
-                    .map(cask_target_record_matches)
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .all(|matches| matches);
-                let pkgs_installed = pkg_ids_installed(&receipt.pkg_ids)?;
-                return Ok(if targets_match && pkgs_installed {
-                    InstalledCaskState::Installed(receipt.version)
-                } else {
-                    InstalledCaskState::Absent
-                });
+            if receipt.schema_version < 2 || receipt.targets.is_empty() {
+                return Ok(legacy_needs_repair(
+                    cask,
+                    &receipt.version,
+                    "receipt has no provable target fingerprints",
+                ));
             }
-
-            // Legacy receipts remain usable only from the historical facts they
-            // actually contain. Never fill omitted fields from today's API.
-            let targets_exist = receipt
-                .apps
-                .iter()
-                .chain(&receipt.binaries)
-                .chain(&receipt.fonts)
-                .chain(&receipt.completions)
-                .all(|target| target.exists());
-            let pkgs_installed = pkg_ids_installed(&receipt.pkg_ids)?;
-            Ok(if targets_exist && pkgs_installed {
-                InstalledCaskState::Installed(receipt.version)
-            } else {
-                InstalledCaskState::Absent
-            })
+            Ok(InstalledCaskState::LegacyMise(receipt))
         }
         None => Ok(InstalledCaskState::Absent),
     }
+}
+
+fn legacy_needs_repair(cask: &Cask, version: &str, detail: &str) -> InstalledCaskState {
+    InstalledCaskState::NeedsRepair {
+        installed: Some(version.to_string()),
+        reason: format!(
+            "brew-cask:{}: legacy mise install cannot be converted ({detail}); reinstall with either 'brew install --cask {}' or mise apply after uninstalling",
+            cask.token, cask.token
+        ),
+    }
+}
+
+// legacy .mise-cask.toml backfill — remove when fleet converged
+fn reconcile_legacy_cask(cask: &Cask, state: InstalledCaskState) -> Result<InstalledCaskState> {
+    if !matches!(state, InstalledCaskState::LegacyMise(_)) {
+        return Ok(state);
+    }
+    let _lock = lock_caskroom()?;
+    reconcile_legacy_cask_locked(cask, state)
+}
+
+fn reconcile_legacy_cask_locked(
+    cask: &Cask,
+    state: InstalledCaskState,
+) -> Result<InstalledCaskState> {
+    let state = validate_legacy_cask(cask, state)?;
+    let InstalledCaskState::LegacyMise(legacy) = state else {
+        return Ok(state);
+    };
+    let version_dir = caskroom_version_dir(&cask.token, &legacy.version);
+    write_homebrew_metadata(&version_dir, cask)?;
+    file::remove_file(version_dir.join(".mise-cask.toml"))?;
+    Ok(InstalledCaskState::Installed(legacy.version))
+}
+
+fn validate_legacy_cask(cask: &Cask, state: InstalledCaskState) -> Result<InstalledCaskState> {
+    let InstalledCaskState::LegacyMise(legacy) = state else {
+        return Ok(state);
+    };
+    if legacy.version != cask.version {
+        return Ok(legacy_needs_repair(
+            cask,
+            &legacy.version,
+            &format!("installed {} != catalog {}", legacy.version, cask.version),
+        ));
+    }
+    let targets_match = legacy
+        .targets
+        .iter()
+        .map(cask_target_record_matches)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|matches| matches);
+    if !targets_match {
+        return Ok(legacy_needs_repair(
+            cask,
+            &legacy.version,
+            "recorded target fingerprint changed",
+        ));
+    }
+    match pkg_ids_installed(&legacy.pkg_ids) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(legacy_needs_repair(
+                cask,
+                &legacy.version,
+                "recorded package receipt is missing",
+            ));
+        }
+        Err(err) => {
+            return Ok(legacy_needs_repair(
+                cask,
+                &legacy.version,
+                &format!("recorded package receipt could not be verified: {err}"),
+            ));
+        }
+    }
+    Ok(InstalledCaskState::LegacyMise(legacy))
 }
 
 #[cfg(test)]
@@ -5629,7 +5738,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_receipt_detects_app_bundle_drift() -> Result<()> {
+    fn legacy_receipt_classifies_before_backfill_even_if_payload_later_drifts() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
         let _guard = BrewPrefixGuard::set(tmp.path());
@@ -5653,7 +5762,10 @@ mod tests {
             Some(cask.version.clone())
         );
         crate::file::write(app_target.join("Contents/app"), "changed")?;
-        assert_eq!(installed_cask_version(&cask, &artifacts)?, None);
+        assert_eq!(
+            installed_cask_version(&cask, &artifacts)?,
+            Some(cask.version.clone())
+        );
         Ok(())
     }
 
@@ -7970,7 +8082,7 @@ end
                     ..Default::default()
                 }
             )?,
-            Some("1.0.0".to_string())
+            None
         );
         Ok(())
     }
@@ -8391,18 +8503,12 @@ end
             ..Default::default()
         };
 
-        assert_eq!(
-            installed_cask_version(&cask, &artifacts)?,
-            Some(cask.version.clone())
-        );
+        assert_eq!(installed_cask_version(&cask, &artifacts)?, None);
 
         let target = wrapper.target_path()?;
         file::create_dir_all(target.parent().unwrap())?;
         file::write(target, "wrapper")?;
-        assert_eq!(
-            installed_cask_version(&cask, &artifacts)?,
-            Some(cask.version)
-        );
+        assert_eq!(installed_cask_version(&cask, &artifacts)?, None);
         Ok(())
     }
 
@@ -8686,7 +8792,7 @@ end
                     ..Default::default()
                 }
             )?,
-            Some("1.0.0".to_string())
+            None
         );
         Ok(())
     }
@@ -8809,7 +8915,7 @@ end
                     ..Default::default()
                 }
             )?,
-            Some("2.0.0".to_string())
+            None
         );
         Ok(())
     }
@@ -8912,7 +9018,7 @@ end
     }
 
     #[test]
-    fn legacy_mise_receipt_behavior_remains_installed() -> Result<()> {
+    fn legacy_mise_receipt_without_fingerprints_needs_repair() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
         let _guard = BrewPrefixGuard::set(tmp.path());
@@ -8935,10 +9041,209 @@ end
             })?,
         )?;
 
-        assert_eq!(
+        assert!(matches!(
             installed_cask_state(&cask, &CaskArtifacts::default())?,
-            InstalledCaskState::Installed("2.0.0".to_string())
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mise_receipt_backfills_then_is_idempotent() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let mut cask = test_cask("legacy-backfill", "2.0.0");
+        cask.artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["Legacy.app"]}
+        ]))?;
+        let artifacts = cask_artifacts(&cask)?;
+        let target = app_target_path("Legacy.app")?;
+        file::create_dir_all(target.join("Contents"))?;
+        file::write(target.join("Contents/payload"), "untouched")?;
+        let payload = target.join("Contents/payload");
+        let before_hash = hash::file_hash_sha256(&payload, None)?;
+        let before_modified = payload.metadata()?.modified()?;
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        write_receipt(&version_dir, &cask, &artifacts)?;
+
+        let classified = installed_cask_state(&cask, &artifacts)?;
+        assert!(matches!(classified, InstalledCaskState::LegacyMise(_)));
+        assert_eq!(
+            reconcile_legacy_cask(&cask, classified)?,
+            InstalledCaskState::Installed(cask.version.clone())
         );
+        assert!(caskroom_token_dir(&cask.token).join(".metadata").is_dir());
+        assert!(!version_dir.join(".mise-cask.toml").exists());
+        assert_eq!(hash::file_hash_sha256(&payload, None)?, before_hash);
+        assert_eq!(payload.metadata()?.modified()?, before_modified);
+        assert_eq!(
+            reconcile_legacy_cask(&cask, installed_cask_state(&cask, &artifacts)?)?,
+            InstalledCaskState::Installed(cask.version.clone())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mise_version_drift_needs_repair_without_mutation() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let catalog = test_cask("legacy-drift", "2.0.0");
+        let installed = test_cask("legacy-drift", "1.0.0");
+        let version_dir = caskroom_version_dir(&installed.token, &installed.version);
+        file::create_dir_all(&version_dir)?;
+        let target = tmp.path().join("legacy-target");
+        file::write(&target, "payload")?;
+        let receipt = CaskReceipt {
+            schema_version: 3,
+            version: installed.version.clone(),
+            apps: Vec::new(),
+            binaries: vec![target.clone()],
+            fonts: Vec::new(),
+            completions: Vec::new(),
+            pkg_ids: Vec::new(),
+            targets: vec![CaskTargetRecord {
+                path: target,
+                fingerprint: cask_target_fingerprint(tmp.path().join("legacy-target").as_path())?,
+            }],
+            prune_safe: true,
+            prune_blocker: None,
+        };
+        file::write(
+            version_dir.join(".mise-cask.toml"),
+            toml::to_string_pretty(&receipt)?,
+        )?;
+        let state = installed_cask_state(&catalog, &CaskArtifacts::default())?;
+        assert!(matches!(
+            reconcile_legacy_cask(&catalog, state)?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        assert!(version_dir.join(".mise-cask.toml").exists());
+        assert!(
+            !caskroom_token_dir(&catalog.token)
+                .join(".metadata")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mise_fingerprint_drift_needs_repair_without_mutation() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("legacy-fingerprint", "1.0.0");
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        let target = tmp.path().join("legacy-target");
+        file::write(&target, "before")?;
+        let fingerprint = cask_target_fingerprint(&target)?;
+        file::write(&target, "after")?;
+        let receipt = CaskReceipt {
+            schema_version: 3,
+            version: cask.version.clone(),
+            apps: Vec::new(),
+            binaries: vec![target.clone()],
+            fonts: Vec::new(),
+            completions: Vec::new(),
+            pkg_ids: Vec::new(),
+            targets: vec![CaskTargetRecord {
+                path: target,
+                fingerprint,
+            }],
+            prune_safe: true,
+            prune_blocker: None,
+        };
+        file::write(
+            version_dir.join(".mise-cask.toml"),
+            toml::to_string_pretty(&receipt)?,
+        )?;
+        let state = installed_cask_state(&cask, &CaskArtifacts::default())?;
+        assert!(matches!(
+            reconcile_legacy_cask(&cask, state)?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        assert!(version_dir.join(".mise-cask.toml").exists());
+        assert!(!caskroom_token_dir(&cask.token).join(".metadata").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_legacy_mise_receipt_needs_repair() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("legacy-malformed", "1.0.0");
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        file::write(version_dir.join(".mise-cask.toml"), "not = [toml")?;
+        assert!(matches!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        assert!(!caskroom_token_dir(&cask.token).join(".metadata").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_failure_preserves_legacy_state_as_needs_repair() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let version_dir = caskroom_version_dir("legacy-offline", "1.0.0");
+        file::create_dir_all(&version_dir)?;
+        file::write(version_dir.join(".mise-cask.toml"), "version = \"1.0.0\"")?;
+        let request = PackageRequest {
+            name: "legacy-offline".to_string(),
+            version: None,
+            tap_url: None,
+        };
+        let status = legacy_catalog_failure_status(&request, &eyre!("network unavailable"))
+            .expect("legacy receipt should produce a status");
+        assert!(matches!(status.state, PackageState::NeedsRepair { .. }));
+        assert!(version_dir.join(".mise-cask.toml").exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_mise_missing_pkg_receipt_needs_repair_without_mutation() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("legacy-pkg", "1.0.0");
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::create_dir_all(&version_dir)?;
+        let target = tmp.path().join("legacy-target");
+        file::write(&target, "payload")?;
+        let receipt = CaskReceipt {
+            schema_version: 3,
+            version: cask.version.clone(),
+            apps: Vec::new(),
+            binaries: vec![target.clone()],
+            fonts: Vec::new(),
+            completions: Vec::new(),
+            pkg_ids: vec!["dev.mise.certainly-not-installed".to_string()],
+            targets: vec![CaskTargetRecord {
+                fingerprint: cask_target_fingerprint(&target)?,
+                path: target,
+            }],
+            prune_safe: false,
+            prune_blocker: Some("pkg".to_string()),
+        };
+        file::write(
+            version_dir.join(".mise-cask.toml"),
+            toml::to_string_pretty(&receipt)?,
+        )?;
+        let state = installed_cask_state(&cask, &CaskArtifacts::default())?;
+        assert!(matches!(
+            reconcile_legacy_cask(&cask, state)?,
+            InstalledCaskState::NeedsRepair { .. }
+        ));
+        assert!(version_dir.join(".mise-cask.toml").exists());
+        assert!(!caskroom_token_dir(&cask.token).join(".metadata").exists());
         Ok(())
     }
 
