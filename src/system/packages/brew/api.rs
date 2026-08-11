@@ -1,6 +1,7 @@
 //! Client for the formulae.brew.sh JSON API (static JSON, no auth).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use eyre::{WrapErr, bail, eyre};
 use serde::Deserialize;
@@ -49,6 +50,12 @@ pub struct Formula {
     pub post_install_steps: Vec<Value>,
     #[serde(default)]
     pub post_install_defined: bool,
+    #[serde(default)]
+    pub version_scheme: u64,
+    #[serde(skip)]
+    pub loaded_from_internal_api: bool,
+    #[serde(skip)]
+    pub internal_api_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +82,8 @@ pub struct Versions {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BottleSpec {
+    #[serde(default)]
+    pub rebuild: u64,
     #[serde(default)]
     pub files: HashMap<String, BottleFile>,
 }
@@ -143,11 +152,56 @@ impl Formula {
 /// Fetch formula metadata by name (or alias — brew's API redirects aliases
 /// to the canonical formula).
 pub async fn formula(name: &str) -> Result<Formula> {
+    let internal_source = internal_formula_source(name).await?;
     let url = format!("{API_BASE}/formula/{name}.json");
-    HTTP_FETCH
+    let mut formula = HTTP_FETCH
         .json_cached::<Formula, _>(url)
         .await
-        .wrap_err_with(|| format!("failed to fetch Homebrew formula '{name}'"))
+        .wrap_err_with(|| format!("failed to fetch Homebrew formula '{name}'"))?;
+    formula.loaded_from_internal_api = true;
+    formula.internal_api_source = Some(internal_source);
+    Ok(formula)
+}
+
+#[derive(Deserialize)]
+struct InternalApiEnvelope {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct InternalFormulaIndex {
+    formulae: HashMap<String, serde_json::Value>,
+}
+
+static INTERNAL_FORMULAE: tokio::sync::OnceCell<
+    std::result::Result<Arc<InternalFormulaIndex>, String>,
+> = tokio::sync::OnceCell::const_new();
+
+async fn internal_formula_source(name: &str) -> Result<String> {
+    let url = format!(
+        "{API_BASE}/internal/packages.{}.jws.json",
+        super::tag::host_tag()
+    );
+    let result = INTERNAL_FORMULAE
+        .get_or_init(|| async {
+            let text = HTTP_FETCH
+                .get_text_cached(&url)
+                .await
+                .map_err(|err| err.to_string())?;
+            let envelope: InternalApiEnvelope =
+                serde_json::from_str(&text).map_err(|err| err.to_string())?;
+            serde_json::from_str(&envelope.payload)
+                .map(Arc::new)
+                .map_err(|err| err.to_string())
+        })
+        .await;
+    let index = result
+        .as_ref()
+        .map_err(|err| eyre!("failed to load Homebrew internal formula API: {err}"))?;
+    if !index.formulae.contains_key(name) {
+        bail!("Homebrew internal API has no formula '{name}'");
+    }
+    Ok(url)
 }
 
 pub async fn formula_with_tap_name(

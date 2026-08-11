@@ -11,6 +11,7 @@ use super::api::BottleFile;
 use super::fetch::OciBottleMetadata;
 use super::lifecycle;
 use super::prefix;
+use super::receipt;
 use super::relocate;
 use super::resolve::ResolvedFormula;
 use crate::file::{ExtractOptions, ExtractionFormat};
@@ -21,7 +22,6 @@ use crate::ui::progress_report::SingleReport;
 /// minus etc/var which brew handles specially and we defer)
 pub(super) const LINK_DIRS: &[&str] = &["bin", "sbin", "include", "lib", "share", "Frameworks"];
 const KEG_ONLY_MARKER: &str = ".mise-keg-only";
-const EMULATED_BREW_VERSION: &str = "6.0.17";
 
 #[cfg(test)]
 struct RecordRepair {
@@ -44,7 +44,7 @@ pub(super) enum FormulaInstallProvenance {
     SourceBuild {
         formula_snapshot: PathBuf,
         compiler: String,
-        built_on: Value,
+        built_on: receipt::BuiltOn,
     },
 }
 
@@ -55,9 +55,9 @@ struct BottleFacts {
     source_modified_time: u64,
     compiler: String,
     #[serde(default)]
-    runtime_dependencies: Vec<Value>,
+    runtime_dependencies: Vec<receipt::RuntimeDependency>,
     #[serde(default)]
-    built_on: Option<Value>,
+    built_on: Option<receipt::BuiltOn>,
     #[serde(default)]
     poured_from_bottle: Option<bool>,
     #[serde(default)]
@@ -1084,7 +1084,7 @@ pub fn write_receipt(
     closure: &[ResolvedFormula],
     provenance: &FormulaInstallProvenance,
 ) -> Result<()> {
-    let derived_runtime_dependencies: Vec<Value> = closure
+    let derived_runtime_dependencies: Vec<receipt::RuntimeDependency> = closure
         .iter()
         .filter(|other| {
             rf.formula
@@ -1094,13 +1094,20 @@ pub fn write_receipt(
         })
         .filter_map(|dep| {
             let pkg_version = dep.formula.pkg_version().ok()?;
-            Some(json!({
-                "full_name": dep.formula.name,
-                "version": dep.formula.versions.stable,
-                "revision": dep.formula.revision,
-                "pkg_version": pkg_version,
-                "declared_directly": true,
-            }))
+            Some(receipt::RuntimeDependency {
+                full_name: dep.formula.name.clone(),
+                version: dep.formula.versions.stable.clone()?,
+                revision: u64::from(dep.formula.revision),
+                bottle_rebuild: dep
+                    .formula
+                    .bottle
+                    .get("stable")
+                    .map(|bottle| bottle.rebuild)
+                    .unwrap_or_default(),
+                pkg_version,
+                declared_directly: true,
+                extra: serde_json::Map::new(),
+            })
         })
         .collect();
     let relocated_files: Vec<String> = report
@@ -1155,43 +1162,50 @@ pub fn write_receipt(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let mut receipt = json!({
-        "homebrew_version": format!("{EMULATED_BREW_VERSION} (mise)"),
-        "used_options": [],
-        "unused_options": [],
-        "built_as_bottle": poured_from_bottle,
-        "poured_from_bottle": poured_from_bottle,
-        "loaded_from_api": true,
-        "installed_as_dependency": !rf.on_request,
-        "installed_on_request": rf.on_request,
-        "changed_files": facts.changed_files,
-        "time": now,
-        "source_modified_time": facts.source_modified_time,
-        "compiler": facts.compiler,
-        "aliases": rf.formula.aliases,
-        "runtime_dependencies": facts.runtime_dependencies,
-        "source": {
-            "spec": "stable",
-            "versions": {
-                "stable": rf.formula.versions.stable,
-                "head": null,
-                "version_scheme": 0,
+    let formula_receipt = receipt::FormulaReceipt {
+        homebrew_version: receipt::EMULATED_BREW_VERSION.to_string(),
+        used_options: Vec::new(),
+        unused_options: Vec::new(),
+        built_as_bottle: poured_from_bottle,
+        poured_from_bottle,
+        loaded_from_api: true,
+        loaded_from_internal_api: rf.formula.loaded_from_internal_api,
+        installed_on_request: rf.on_request,
+        changed_files: facts.changed_files,
+        time: now,
+        source_modified_time: facts.source_modified_time,
+        compiler: facts.compiler,
+        aliases: rf.formula.aliases.clone(),
+        runtime_dependencies: facts.runtime_dependencies,
+        source: receipt::FormulaSource {
+            spec: "stable".to_string(),
+            versions: receipt::FormulaVersions {
+                stable: rf.formula.versions.stable.clone(),
+                head: None,
+                version_scheme: rf.formula.version_scheme,
+                compatibility_version: None,
+                extra: serde_json::Map::new(),
             },
-            "path": rf.formula.ruby_source_path,
-            "tap": rf.formula.tap.as_deref().unwrap_or("homebrew/core"),
-            "tap_git_head": rf.formula.tap_git_head,
+            path: rf.formula.internal_api_source.clone(),
+            tap_git_head: None,
+            tap: rf
+                .formula
+                .tap
+                .clone()
+                .unwrap_or_else(|| "homebrew/core".to_string()),
+            extra: serde_json::Map::new(),
         },
-        "arch": if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" },
-    });
-    if let Some(built_on) = facts.built_on {
-        receipt
-            .as_object_mut()
-            .unwrap()
-            .insert("built_on".to_string(), built_on);
-    }
+        arch: if cfg!(target_arch = "aarch64") {
+            "arm64".to_string()
+        } else {
+            "x86_64".to_string()
+        },
+        built_on: facts.built_on,
+        extra: serde_json::Map::new(),
+    };
     crate::file::write(
         keg.join("INSTALL_RECEIPT.json"),
-        serde_json::to_string(&receipt)?,
+        formula_receipt.to_json_bytes()?,
     )?;
     match provenance {
         FormulaInstallProvenance::OciBottle {
@@ -1241,7 +1255,8 @@ fn update_sbom(keg: &Path, time: u64, supplement: Option<&Value>) -> Result<()> 
     creation.insert(
         "creators".to_string(),
         json!([format!(
-            "Tool: https://github.com/Homebrew/brew@{EMULATED_BREW_VERSION}"
+            "Tool: https://github.com/Homebrew/brew@{}",
+            receipt::EMULATED_BREW_VERSION
         )]),
     );
     if let Some(supplement) = supplement {
@@ -1678,6 +1693,18 @@ mod tests {
         Ok((tmp, path))
     }
 
+    fn test_built_on() -> receipt::BuiltOn {
+        receipt::BuiltOn {
+            os: "TestOS".to_string(),
+            os_version: "1".to_string(),
+            cpu_family: "test".to_string(),
+            xcode: None,
+            clt: None,
+            preferred_perl: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
     fn resolved_formula(name: &str, version: &str) -> ResolvedFormula {
         ResolvedFormula {
             formula: serde_json::from_value(json!({
@@ -1727,7 +1754,7 @@ mod tests {
         FormulaInstallProvenance::SourceBuild {
             formula_snapshot: snapshot,
             compiler: "clang".to_string(),
-            built_on: json!({"os": "TestOS", "os_version": "1", "cpu_family": "test"}),
+            built_on: test_built_on(),
         }
     }
 
@@ -1819,7 +1846,7 @@ mod tests {
         let provenance = FormulaInstallProvenance::SourceBuild {
             formula_snapshot: snapshot.clone(),
             compiler: "clang".to_string(),
-            built_on: json!({"os": "TestOS", "os_version": "1", "cpu_family": "test"}),
+            built_on: test_built_on(),
         };
         assert!(
             write_receipt(&rf, "test", &keg, &Default::default(), &[], &provenance)
@@ -1888,6 +1915,101 @@ mod tests {
         oci_sbom.as_object_mut().unwrap().remove("creationInfo");
         archive_sbom.as_object_mut().unwrap().remove("creationInfo");
         assert_eq!(oci_sbom, archive_sbom);
+        Ok(())
+    }
+
+    #[test]
+    fn formula_receipt_matches_real_brew_fixture() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut expected: receipt::FormulaReceipt =
+            serde_json::from_str(include_str!("testdata/ada-url-INSTALL_RECEIPT.json"))?;
+        let mut rf = resolved_formula("ada-url", "4.0.0");
+        rf.formula.tap = Some("homebrew/core".to_string());
+        rf.formula.aliases = expected.aliases.clone();
+        rf.formula.dependencies = vec!["fmt".to_string()];
+        rf.formula.version_scheme = expected.source.versions.version_scheme;
+        rf.formula.loaded_from_internal_api = true;
+        rf.formula.internal_api_source = Some("internal-api-fixture".to_string());
+        rf.on_request = false;
+        let tab = json!({
+            "homebrew_version": receipt::EMULATED_BREW_VERSION,
+            "poured_from_bottle": true,
+            "changed_files": expected.changed_files,
+            "source_modified_time": expected.source_modified_time,
+            "compiler": expected.compiler,
+            "runtime_dependencies": expected.runtime_dependencies,
+            "built_on": expected.built_on,
+            "source": {"versions": {"stable": "4.0.0"}}
+        });
+        let sbom = bottle_sbom("ada-url", "4.0.0");
+        crate::file::write(
+            tmp.path().join("sbom.spdx.json"),
+            serde_json::to_vec(&sbom)?,
+        )?;
+
+        write_receipt(
+            &rf,
+            "arm64_tahoe",
+            tmp.path(),
+            &Default::default(),
+            &[],
+            &FormulaInstallProvenance::OciBottle {
+                tab,
+                sbom,
+                sbom_supplement: None,
+            },
+        )?;
+
+        let actual = receipt::read_formula_receipt(tmp.path())?;
+        expected.homebrew_version = receipt::EMULATED_BREW_VERSION.to_string();
+        expected.time = actual.time;
+        expected.source.path = actual.source.path.clone();
+        expected.arch = actual.arch.clone();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn old_mise_receipt_keeps_linux_relocation_compatibility() {
+        let provenance = FormulaInstallProvenance::ArchiveBottle {
+            tab: json!({"homebrew_version": "5.1.15 (mise)"}),
+            sbom: Value::Null,
+        };
+        assert!(bottled_by_homebrew_at_least(&provenance, (5, 1, 15)));
+    }
+
+    #[test]
+    fn sbom_pour_metadata_matches_homebrew_merge_order() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        crate::file::write(
+            tmp.path().join("sbom.spdx.json"),
+            json!({
+                "creationInfo": {"created": "build-time", "creators": ["build-tool"]},
+                "documentDescribes": ["bottle"],
+                "packages": [{"SPDXID": "bottle"}],
+                "relationships": [{"spdxElementId": "bottle"}]
+            })
+            .to_string(),
+        )?;
+        let supplement = json!({
+            "documentDescribes": ["source"],
+            "packages": [{"SPDXID": "source"}],
+            "relationships": [{"spdxElementId": "source"}]
+        });
+        update_sbom(tmp.path(), 0, Some(&supplement))?;
+        let actual: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("sbom.spdx.json"))?)?;
+        assert_eq!(actual["creationInfo"]["created"], "1970-01-01T00:00:00Z");
+        assert_eq!(
+            actual["creationInfo"]["creators"],
+            json!([format!(
+                "Tool: https://github.com/Homebrew/brew@{}",
+                receipt::EMULATED_BREW_VERSION
+            )])
+        );
+        assert_eq!(actual["documentDescribes"], json!(["bottle", "source"]));
+        assert_eq!(actual["packages"].as_array().unwrap().len(), 2);
+        assert_eq!(actual["relationships"].as_array().unwrap().len(), 2);
         Ok(())
     }
 

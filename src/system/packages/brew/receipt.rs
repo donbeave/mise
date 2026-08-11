@@ -15,6 +15,8 @@ pub const EMULATED_BREW_VERSION: &str = "6.0.17";
 
 #[derive(Debug, Error)]
 pub enum ReceiptError {
+    #[error("cannot establish Homebrew receipt fact: {0}")]
+    MissingFact(String),
     #[error("malformed Homebrew receipt at {path}: {source}")]
     Malformed {
         path: PathBuf,
@@ -36,9 +38,12 @@ pub struct BuiltOn {
     pub os: String,
     pub os_version: String,
     pub cpu_family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub xcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub clt: Option<String>,
-    pub preferred_perl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_perl: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -94,7 +99,8 @@ pub struct FormulaReceipt {
     pub runtime_dependencies: Vec<RuntimeDependency>,
     pub source: FormulaSource,
     pub arch: String,
-    pub built_on: BuiltOn,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_on: Option<BuiltOn>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -195,6 +201,102 @@ pub fn read_cask_receipt(caskroom_token_dir: &Path) -> Result<CaskReceipt, Recei
 
 pub fn read_cask_config(caskroom_token_dir: &Path) -> Result<CaskConfig, ReceiptError> {
     parse_file(&caskroom_token_dir.join(".metadata/config.json"))
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
+    let product_version = command_output("/usr/bin/sw_vers", &["-productVersion"])
+        .ok_or_else(|| ReceiptError::MissingFact("macOS product version".to_string()))?;
+    let mut parts = product_version.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let os_version = if minor == "0" || minor.is_empty() {
+        format!("macOS {major}")
+    } else {
+        format!("macOS {major}.{minor}")
+    };
+    let family = command_output("/usr/sbin/sysctl", &["-n", "hw.cpufamily"])
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(|value| value as u32)
+        .map(|value| match value {
+            0x2c91a47e => "arm_typhoon",
+            0x92fb37c8 => "arm_twister",
+            0x67ceee93 => "arm_hurricane_zephyr",
+            0xe81e7ef6 => "arm_monsoon_mistral",
+            0x07d34b9f => "arm_vortex_tempest",
+            0x462504d2 => "arm_lightning_thunder",
+            0x573b5eec => "arm_firestorm_icestorm",
+            0xda33d83d => "arm_blizzard_avalanche",
+            0xfa33415e => "arm_ibiza",
+            0x5f4dea93 => "arm_lobos",
+            0x72015832 => "arm_palma",
+            0x6f5129ac => "arm_donan",
+            0x17d5b93a => "arm_brava",
+            0x1d5a87e8 => "arm_hidra",
+            0xf76c5b1a => "arm_sotra",
+            _ => "dunno",
+        })
+        .unwrap_or("dunno")
+        .to_string();
+    let xcode = command_output("/usr/bin/xcodebuild", &["-version"]).and_then(|value| {
+        value
+            .lines()
+            .next()?
+            .strip_prefix("Xcode ")
+            .map(str::to_string)
+    });
+    let clt = command_output(
+        "/usr/sbin/pkgutil",
+        &["--pkg-info=com.apple.pkg.CLTools_Executables"],
+    )
+    .and_then(|value| {
+        value
+            .lines()
+            .find_map(|line| line.strip_prefix("version: ").map(str::to_string))
+    });
+    let preferred_perl = command_output("/usr/bin/perl", &["-e", "printf \"%vd\\n\", $^V"])
+        .and_then(|value| {
+            value
+                .rsplit_once('.')
+                .map(|(version, _)| version.to_string())
+        })
+        .ok_or_else(|| ReceiptError::MissingFact("preferred system Perl".to_string()))?;
+    Ok(BuiltOn {
+        os: "Macintosh".to_string(),
+        os_version,
+        cpu_family: family,
+        xcode,
+        clt,
+        preferred_perl: Some(preferred_perl),
+        extra: Map::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
+    let os_version = command_output("uname", &["-r"])
+        .ok_or_else(|| ReceiptError::MissingFact("Linux version".to_string()))?;
+    Ok(BuiltOn {
+        os: "Linux".to_string(),
+        os_version,
+        cpu_family: std::env::consts::ARCH.to_string(),
+        xcode: None,
+        clt: None,
+        preferred_perl: None,
+        extra: Map::new(),
+    })
 }
 
 /// Finds the most recent metadata snapshot by Homebrew's sortable timestamp

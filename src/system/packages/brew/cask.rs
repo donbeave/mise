@@ -4483,7 +4483,7 @@ fn native_build_system_info() -> Result<receipt::BuiltOn> {
         cpu_family: family,
         xcode,
         clt,
-        preferred_perl,
+        preferred_perl: Some(preferred_perl),
         extra: serde_json::Map::new(),
     })
 }
@@ -4498,8 +4498,7 @@ fn native_build_system_info() -> Result<receipt::BuiltOn> {
         cpu_family: std::env::consts::ARCH.to_string(),
         xcode: None,
         clt: None,
-        preferred_perl: command_output("perl", &["-e", "printf \"%vd\\n\", $^V"])
-            .unwrap_or_default(),
+        preferred_perl: command_output("perl", &["-e", "printf \"%vd\\n\", $^V"]),
         extra: serde_json::Map::new(),
     })
 }
