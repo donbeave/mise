@@ -109,13 +109,17 @@ choices, services, unsupported hook DSL, unsupported structured lifecycle
 steps, or other cask artifact types fail with a clear unsupported artifact
 error instead of delegating to Homebrew.
 
-Direct cask pours remain mise-owned. Their completed state is recorded in
-`.mise-cask.toml`; mise does not synthesize Homebrew's private `.metadata`
-receipts. If Homebrew metadata already exists for a cask, mise preserves it and
-fails before mutation rather than taking over Homebrew's lifecycle state.
-Status uses recorded installation facts rather than reconstructing them from a
-newer cask definition; missing or unknown receipts and pending transactions are
-reported as unhealthy so the next apply can reconcile them.
+Cask installs write the same Caskroom metadata, receipt, configuration, and
+installed-cask snapshot as Homebrew. The format is differential-tested against
+the Homebrew version pinned by the brew receipt module. A cask installed by
+Homebrew therefore satisfies the same mise declaration: status reports it as
+installed and apply does not modify it.
+
+Legacy casks installed by older mise versions are converted automatically when
+their recorded version, package receipts, and payload fingerprints prove the
+installed state. When that history cannot be proven, status reports
+`brew-cask:<token>: legacy mise install cannot be converted (<reason>); reinstall with either 'brew install --cask <token>' or mise apply after uninstalling`.
+It never invents missing ownership facts.
 
 This exists because shared-library packages — postgres, ffmpeg, imagemagick,
 php — fundamentally can't be served by mise's per-project backends like
@@ -143,14 +147,21 @@ only time the brew manager uses sudo, mirroring what Homebrew's own installer
 does (`mkdir` + `chown` to your user). After that, installs are plain file
 operations as your user; nothing runs as root.
 
+Only the canonical prefixes above are supported. `MISE_SYSTEM_BREW_PREFIX`
+exists solely for isolated tests and is not a custom-prefix feature.
+
 ## Coexistence with a real Homebrew
 
-mise pours bottles into the Cellar exactly the way brew does and writes
-brew-compatible `INSTALL_RECEIPT.json` files into every keg. To a real
-Homebrew installation, mise-poured kegs look like its own: `brew list`,
-`brew upgrade`, and `brew uninstall` all work on them. Conversely, mise's
-status checks read the Cellar directly, so formulae installed by brew count
-as installed.
+Homebrew does not need to be installed for either engine to work. When it is
+present, both tools intentionally share the canonical prefix and lifecycle
+state. mise writes formula receipts, SBOMs, cask metadata, and links in the
+same format as Homebrew, verified by a differential oracle against the version
+pinned in `receipt::EMULATED_BREW_VERSION`.
+
+Mixing the tools is supported in both directions. Either tool may install,
+list, upgrade, or uninstall a formula or cask regardless of which tool created
+it. A package already installed by Homebrew satisfies its mise declaration:
+status reports `installed`, and apply is a no-op.
 
 For non-keg-only formulae, mise maintains Homebrew's
 `<prefix>/var/homebrew/linked/<name>` record alongside the `opt` record. For a
@@ -205,20 +216,11 @@ This command is mise's declarative cleanup for bootstrap packages, similar to
 `brew prune`, which Homebrew removed in favor of cleanup commands.
 
 `mise bootstrap packages prune --manager brew-cask` applies the same merged
-config model to direct cask artifacts, with a deliberately narrower ownership
-boundary. A cask is removed only when its install-time `.mise-cask.toml`
-receipt explicitly marks it safe to prune and every recorded target still has
-the exact content fingerprint mise recorded after installation. The command
-removes those targets and the cask's Caskroom entry; `--dry-run` previews the
-plan and `--yes` skips confirmation.
-
-Casks installed before their receipt included prune metadata are skipped until
-a later upgrade or reinstall refreshes the receipt. Casks with pkg or command
-wrapper artifacts, install or uninstall lifecycle actions, pending
-transactions, Homebrew `.metadata`, changed targets, or targets shared with
-another mise cask are also skipped with a reason. Prune never runs `zap`
-metadata and never reconstructs historical uninstall behavior from the current
-Homebrew API.
+config model to casks installed by either engine. It consumes the installed
+version's recorded artifacts, removes the same payload and Caskroom metadata
+as `brew uninstall`, and refuses unreadable or unclassified state before any
+mutation. `--dry-run` previews the plan and `--yes` skips confirmation. Plain
+prune never executes `zap` directives.
 
 ## How pouring works
 
@@ -291,6 +293,11 @@ the same dance `brew upgrade` does. Since bottles only exist for a formula's
 current version, "upgrade" and "install the current bottle" are the same
 operation.
 
+Apply ensures presence; it does not implicitly upgrade an already installed
+package. Upgrade is explicit and follows Homebrew semantics. In particular,
+`auto_updates` casks are skipped rather than receiving brew's greedy upgrade
+behavior.
+
 ## Limitations
 
 - **Cask artifact coverage is intentionally narrow.** On macOS, `brew-cask`
@@ -300,10 +307,9 @@ operation.
   `postflight_steps`. Other artifact types, pkg installers without `pkgutil`
   IDs, and pkg installers with custom choices fail explicitly.
 - **`brew services` is not implemented.**
-- **Cask import is not implemented.** Cask prune is limited to mise-owned direct
-  artifacts whose install-time receipt proves they can be removed safely. Pkg
-  artifacts and casks with lifecycle actions are skipped until their uninstall
-  semantics are supported.
+- **Cask import is not implemented.** Cask prune reads the installed receipt and
+  refuses unknown uninstall directives; it never substitutes today's catalog
+  definition for historical lifecycle facts.
 - **Source builds cover the common formula shapes.** mise's formula shim
   implements the widely-used subset of the DSL (see
   [Source formulae](#source-formulae)); formulae that reach beyond it fail

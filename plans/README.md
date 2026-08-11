@@ -33,7 +33,7 @@ branch. Push to `fork` after each completed plan.
 | 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | DONE   |
 | 006  | Removal parity with brew uninstall                       | P1       | L      | 001, 003, 004 | DONE   |
 | 007  | Differential brew-vs-mise e2e oracle                     | P1       | L      | 003, 004, 006 | DONE   |
-| 008  | Documentation: 1:1 Homebrew-compatible bootstrap         | P2       | S      | 001–007       | TODO   |
+| 008  | Documentation: 1:1 Homebrew-compatible bootstrap         | P2       | S      | 001–007       | DONE   |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale).
