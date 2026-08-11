@@ -30,7 +30,7 @@ branch. Push to `fork` after each completed plan.
 | 002  | Cask read-side recognition of Homebrew-installed state   | P1       | M      | 001           | DONE   |
 | 003  | Cask write-side 1:1 Homebrew metadata                    | P1       | L      | 001, 002      | DONE   |
 | 004  | Truthful formula receipts with pinned producer version   | P1       | L      | 001           | DONE   |
-| 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | TODO   |
+| 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | DONE   |
 | 006  | Removal parity with brew uninstall                       | P1       | L      | 001, 003, 004 | TODO   |
 | 007  | Differential brew-vs-mise e2e oracle                     | P1       | L      | 003, 004, 006 | TODO   |
 | 008  | Documentation: 1:1 Homebrew-compatible bootstrap         | P2       | S      | 001–007       | TODO   |

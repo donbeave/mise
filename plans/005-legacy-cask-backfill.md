@@ -194,3 +194,23 @@ converged`) so a future cleanup can delete reading+backfill together.
 - Deferred: operator-facing aggregate report of all NeedsRepair casks in
   one run — existing status output already lists every package; no new
   surface.
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** schema 0/1 receipts and schema 2/3 receipts with no target
+  records cannot prove payload identity; catalog lookup can also fail
+  before the current definition is available.
+- **Evidence:** the legacy schema defaults `targets` to empty, so neither
+  current catalog artifacts nor mere path existence can reconstruct the
+  historical installed bytes. The existing fingerprint function can prove
+  only recorded targets. Package receipts remain independently verifiable
+  through `pkgutil` on macOS.
+- **Options:** (1) infer targets from today's catalog — rejected because it
+  invents history; (2) accept target existence — rejected because edited
+  payloads pass; (3) classify all legacy receipts, convert only schema 2/3
+  records with non-empty matching fingerprints, matching package receipts,
+  and an equal catalog version; otherwise return one-line `NeedsRepair`.
+- **Choice:** option 3. Offline catalog failure also returns `NeedsRepair`
+  without mutation. Successful conversion atomically writes the complete
+  Homebrew metadata set before deleting the legacy receipt, and tests prove
+  payload hash and mtime remain unchanged.
