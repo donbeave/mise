@@ -191,6 +191,13 @@ pass.
 - **Options:** trust the partial receipt, derive metadata from catalog alone, or require exact per-class target and package-id equality before backfill.
 - **Choice:** require exact inventory equality plus existing fingerprints/version/package checks; mismatch remains untouched as `NeedsRepair`.
 
+## Blocker resolution — 2026-08-12 read-only status audit
+
+- **Condition:** status called the mutating reconciliation path, contradicting controlling invariant 4 and the required non-mutating live validation.
+- **Evidence:** `installed()` reached `write_homebrew_metadata` and removed `.mise-cask.toml`; apply already has a distinct reconciliation path.
+- **Options:** keep mutating status, suppress live validation, or validate truth read-only in status and reserve conversion for apply.
+- **Choice:** status validates and reports a provable legacy install as installed without mutation; apply performs the gated metadata conversion. Decision 2 is clarified accordingly.
+
 ## Maintenance notes
 
 - This path becomes dead code once the legacy fleet converges; mark it

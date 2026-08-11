@@ -448,9 +448,10 @@ differential pass.
    emulation (see decision record above).
 1. _(Closed as moot 2026-08-12 — no delegated mutations remain in the chosen
    architecture.)_ Homebrew ask-mode suppression for delegated mutations.
-2. ~~Legacy mise-only casks~~ — **decided 2026-08-12: gated backfill on
-   apply.** A legacy cask (`.mise-cask.toml`, no `.metadata`) is converted
-   to full truthful Homebrew receipts during status/apply only when truth is
+2. ~~Legacy mise-only casks~~ — **decided 2026-08-12; clarified after
+   verification: read-only validation on status, gated backfill on apply.**
+   A legacy cask (`.mise-cask.toml`, no `.metadata`) is converted
+   to full truthful Homebrew receipts during apply only when truth is
    provable: the mise receipt exists, artifact fingerprints still match the
    installed payload, and the cask definition for the installed version is
    obtainable (installed version equals current catalog version — uninstall

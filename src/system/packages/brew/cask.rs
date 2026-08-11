@@ -665,7 +665,7 @@ impl SystemPackageManager for BrewCaskManager {
                 });
                 continue;
             }
-            let installed = reconcile_legacy_cask(&cask, installed_cask_state(&cask, &artifacts)?)?;
+            let installed = validate_legacy_cask(&cask, installed_cask_state(&cask, &artifacts)?)?;
             let state = match installed {
                 InstalledCaskState::Installed(version) => match &req.version {
                     Some(requested) if version != *requested => {
@@ -674,7 +674,9 @@ impl SystemPackageManager for BrewCaskManager {
                     _ => PackageState::Installed { version },
                 },
                 InstalledCaskState::Absent => PackageState::Missing,
-                InstalledCaskState::LegacyMise(_) => unreachable!("legacy state was reconciled"),
+                InstalledCaskState::LegacyMise(legacy) => PackageState::Installed {
+                    version: legacy.version,
+                },
                 InstalledCaskState::NeedsRepair { installed, reason } => {
                     PackageState::NeedsRepair {
                         installed: installed.unwrap_or_default(),
