@@ -159,7 +159,7 @@ pub async fn build(
         Ok(pour::FormulaInstallProvenance::SourceBuild {
             formula_snapshot,
             compiler: source_compiler()?,
-            built_on: native_build_system_info()?,
+            built_on: super::receipt::native_build_system_info()?,
         })
     })();
     let provenance = match provenance {
@@ -216,46 +216,6 @@ fn parse_source_compiler(version_output: &str, dumped_version: Option<&str>) -> 
         return Ok(format!("gcc-{major}"));
     }
     bail!("unrecognized source-build compiler")
-}
-
-fn native_build_system_info() -> Result<serde_json::Value> {
-    let os = if cfg!(target_os = "macos") {
-        "macOS"
-    } else {
-        "Linux"
-    };
-    let os_version = if cfg!(target_os = "macos") {
-        command_output("/usr/bin/sw_vers", &["-productVersion"])
-    } else {
-        std::fs::read_to_string("/etc/os-release")
-            .ok()
-            .and_then(|contents| {
-                contents.lines().find_map(|line| {
-                    line.strip_prefix("PRETTY_NAME=")
-                        .map(|value| value.trim_matches('"').to_string())
-                })
-            })
-    }
-    .ok_or_else(|| eyre::eyre!("cannot determine source-build operating system version"))?;
-    let cpu_family = command_output("uname", &["-m"])
-        .ok_or_else(|| eyre::eyre!("cannot determine source-build CPU family"))?;
-    Ok(serde_json::json!({
-        "os": os,
-        "os_version": os_version,
-        "cpu_family": cpu_family,
-    }))
-}
-
-fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Ensure a mise-managed ruby is installed (precompiled by default) and
@@ -536,7 +496,7 @@ mod tests {
             .collect();
         let mut bottle = HashMap::new();
         if !tags.is_empty() {
-            bottle.insert("stable".to_string(), BottleSpec { files });
+            bottle.insert("stable".to_string(), BottleSpec { rebuild: 0, files });
         }
         Formula {
             name: "test".to_string(),
@@ -566,6 +526,9 @@ mod tests {
             tap_git_head: Some("abc123".to_string()),
             post_install_steps: vec![],
             post_install_defined: false,
+            version_scheme: 0,
+            loaded_from_internal_api: false,
+            internal_api_source: None,
         }
     }
 

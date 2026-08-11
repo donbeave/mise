@@ -214,3 +214,25 @@ be updated, not preserved).
   required (a literal that matches today's fixture but isn't derived is a
   future lie).
 - Deferred: differential Linux e2e proof (plan 007).
+
+## Blocker resolution — 2026-08-12
+
+- **Condition:** truthful bottle build facts and the installed SBOM cannot
+  be reconstructed from the public formula API or invented; the required
+  data also had to cross the API/fetch/install plumbing outside the plan's
+  narrow file list.
+- **Evidence:** Homebrew's OCI bottle descriptor supplies `sh.brew.tab`
+  (the poured receipt's build facts) and `sh.brew.sbom.supplement`.
+  Homebrew preserves the bottle's base `sbom.spdx.json`, replaces its
+  install-time `creationInfo`, then appends the supplement's
+  `documentDescribes`, `packages`, and `relationships`. The internal
+  packages API is the source mode reflected by real API-pour receipts.
+- **Options:** (1) copy fixture literals — rejected as untruthful; (2)
+  approximate missing values from the public formula API — rejected
+  because compiler, build host, modified time, and SPDX graph are absent;
+  (3) consume the same OCI annotations and base SBOM as Homebrew, and
+  validate official formula resolution through the internal packages API.
+- **Choice:** option 3. It satisfies the receipt invariants and follows
+  Homebrew's own sources. Minimal plumbing changes in `api.rs`, `mod.rs`,
+  and `source.rs`, plus the shared `BuiltOn` option adaptation in `cask.rs`,
+  are therefore part of this resolution rather than silent scope growth.
