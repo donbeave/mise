@@ -20,12 +20,10 @@ assert_fail "test -f $HOME/.config/mise/config.toml"
 # the drop-in is loaded — the filter is about writing, not reading
 assert_contains "mise env -s bash" "FROM_CONFD"
 
-# A `.tool-versions` global config still wins over a drop-in, and skipping
-# drop-ins must not divert those writes. This holds because
-# `global_config_files()` inserts ~/.tool-versions ahead of the conf.d entries,
-# so it — not a drop-in — is what the fallback returns; pin that ordering here.
+# An explicitly selected `.tool-versions` global config still wins over a
+# drop-in, and skipping drop-ins must not divert those writes.
 printf 'dummy 1.0.0\n' >"$HOME/.tool-versions"
-MISE_USE_TOML=false mise use -g dummy@system
+MISE_GLOBAL_CONFIG_FILE="$HOME/.tool-versions" mise use -g dummy@system
 assert_contains "cat $HOME/.tool-versions" "dummy"
 assert_not_contains "cat $HOME/.config/mise/conf.d/10-drop-in.toml" "dummy"
 assert_fail "test -f $HOME/.config/mise/config.toml"
