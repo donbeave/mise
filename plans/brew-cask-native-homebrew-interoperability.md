@@ -8,7 +8,7 @@
 > `plans/README.md` are the controlling corrective graph. They override older
 > branch, completion, and acceptance statements in this design. Do not merge
 > either PR until plan 019 passes on one combined exact head.
-
+>
 > **Executor instructions:** Read this plan completely before editing code.
 > The internal brew/brew-cask engine is retained and must produce on-disk
 > state byte-identical to what real Homebrew produces. Production mise never

@@ -117,8 +117,8 @@ Completed proof:
   source SBOM.
 - The exact-head macOS canonical lifecycle job above exercised OCI bottle
   finalization through receipt/link/shared-state/post-install/health. The full
-Linux e2e job owns the forced-source script; pre-integration branch CI is not
-final combined proof.
+  Linux e2e job owns the forced-source script; pre-integration branch CI is not
+  final combined proof.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew

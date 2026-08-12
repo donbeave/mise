@@ -58,32 +58,32 @@ content written with AI help must append the repository-required disclosure.
 
 Historical rows retain what was built while explicitly losing acceptance:
 
-| Plan | Historical scope | Current status |
-| --- | --- | --- |
-| 001 | Shared receipt schema and emulation pin | IMPLEMENTED; REVERIFY ON COMBINED HEAD |
-| 002 | Read Homebrew-installed cask state | IMPLEMENTED; REVERIFY ON COMBINED HEAD |
-| 003 | Write native cask metadata | ACCEPTANCE INVALIDATED; see 013, 015, 018 |
-| 004 | Formula receipts and SBOM | ACCEPTANCE INVALIDATED; see 011, 012, 018 |
-| 005 | Legacy cask conversion | ACCEPTANCE INVALIDATED; see 013, 018 |
-| 006 | Removal parity | ACCEPTANCE INVALIDATED; see 014, 018 |
-| 007 | Differential oracle | FALSE-GREEN; see 009 and 018 |
-| 008 | Full-interoperability documentation | CLAIMS UNSUPPORTED; see 019 |
+| Plan | Historical scope                        | Current status                            |
+| ---- | --------------------------------------- | ----------------------------------------- |
+| 001  | Shared receipt schema and emulation pin | IMPLEMENTED; REVERIFY ON COMBINED HEAD    |
+| 002  | Read Homebrew-installed cask state      | IMPLEMENTED; REVERIFY ON COMBINED HEAD    |
+| 003  | Write native cask metadata              | ACCEPTANCE INVALIDATED; see 013, 015, 018 |
+| 004  | Formula receipts and SBOM               | ACCEPTANCE INVALIDATED; see 011, 012, 018 |
+| 005  | Legacy cask conversion                  | ACCEPTANCE INVALIDATED; see 013, 018      |
+| 006  | Removal parity                          | ACCEPTANCE INVALIDATED; see 014, 018      |
+| 007  | Differential oracle                     | FALSE-GREEN; see 009 and 018              |
+| 008  | Full-interoperability documentation     | CLAIMS UNSUPPORTED; see 019               |
 
 Corrective plans:
 
-| Plan | Title | Priority | Effort | Depends on | Status |
-| --- | --- | --- | --- | --- | --- |
-| 009 | Make destructive oracles safe and non-skippable | P0 | M | — | DONE |
-| 010 | Compile formula lifecycle once; preflight and confine it | P0 | L | 009 | DONE |
-| 011 | Unify bottle/source finalization and truthful provenance | P0 | L | 010 | DONE |
-| 012 | Add closure-aware formula health and lifecycle-only repair | P0 | L | 010, 011 | DONE |
-| 013 | Make cask activation owned, transactional, and recoverable | P0 | L | 009 | IN PROGRESS |
-| 014 | Execute replayable predecessor teardown on upgrade/reinstall | P0 | L | 013 | IN PROGRESS |
-| 015 | Implement mixed cask artifacts and platform-correct config | P0 | M | 013, 014 | IN PROGRESS |
-| 016 | Coordinate cask mutations with Homebrew locks | P1 | M | 013 | IN PROGRESS |
-| 017 | Build one semantically integrated stack | P0 | M | 012, 014, 015, 016 | IN PROGRESS |
-| 018 | Prove operational parity with real differential oracles | P0 | L | 017 | TODO |
-| 019 | Reconcile claims, review state, and final merge gate | P0 | S | 018 | TODO |
+| Plan | Title                                                        | Priority | Effort | Depends on         | Status      |
+| ---- | ------------------------------------------------------------ | -------- | ------ | ------------------ | ----------- |
+| 009  | Make destructive oracles safe and non-skippable              | P0       | M      | —                  | DONE        |
+| 010  | Compile formula lifecycle once; preflight and confine it     | P0       | L      | 009                | DONE        |
+| 011  | Unify bottle/source finalization and truthful provenance     | P0       | L      | 010                | DONE        |
+| 012  | Add closure-aware formula health and lifecycle-only repair   | P0       | L      | 010, 011           | DONE        |
+| 013  | Make cask activation owned, transactional, and recoverable   | P0       | L      | 009                | IN PROGRESS |
+| 014  | Execute replayable predecessor teardown on upgrade/reinstall | P0       | L      | 013                | IN PROGRESS |
+| 015  | Implement mixed cask artifacts and platform-correct config   | P0       | M      | 013, 014           | IN PROGRESS |
+| 016  | Coordinate cask mutations with Homebrew locks                | P1       | M      | 013                | IN PROGRESS |
+| 017  | Build one semantically integrated stack                      | P0       | M      | 012, 014, 015, 016 | IN PROGRESS |
+| 018  | Prove operational parity with real differential oracles      | P0       | L      | 017                | TODO        |
+| 019  | Reconcile claims, review state, and final merge gate         | P0       | S      | 018                | TODO        |
 
 Independent formula and cask work may proceed in parallel after plan 009.
 Plan 017 is the hard join. Never infer combined correctness from two separate
@@ -91,31 +91,31 @@ green heads.
 
 ## Finding disposition
 
-| Finding | Impact | Effort | Risk | Evidence | Owner plan |
-| --- | --- | --- | --- | --- | --- |
-| App activation target is backed up but never recreated | P0: successful app install can end without the app | S | High | `cask.rs:427-504` | 013 |
-| Existing app/binary/font targets lack an ownership claim | Foreign user state can be destroyed | M | High | `cask.rs:1310-1328,5731-5802` | 013 |
-| Mise duplicates moved artifacts instead of Homebrew topology | Brew adoption/prune parity is false | L | High | `cask.rs:1275-1291,1505-1543,5599-5642` | 013 |
-| Pending cask journal is never recovered | Irreversible actions may replay after crash | L | High | `cask.rs:263-269,402-465,4141-4143` | 013 |
-| Upgrade skips predecessor uninstall actions | Helper/pkg/process residue survives | L | High | `cask.rs:387-395,5280-5282` | 014 |
-| Unsupported recorded teardown actions are accepted | Mise can install state it cannot later remove | L | High | `cask.rs:313-335,4413-4449,5405-5412` | 014 |
-| `manpage` is silently non-installing | Ghostty mixed artifacts are incomplete | M | Medium | `cask.rs:2846-2849,4864-4910,5882` | 015 |
-| Linux receipt config contains macOS directories | Real brew removes/reads wrong Linux targets | S | Medium | `cask.rs:4539-4567` | 015 |
-| Mise lock does not contend with Homebrew CaskLock | Concurrent brew/mise mutations race | M | Medium | `cask.rs:5302-5311` | 016 |
-| Oracle loses `CI` under `env -i` and exits success | Central parity proof is false-green | M | High | `e2e/run_test:74-126`; zero-second jobs | 009 |
-| Generic `CI=true` authorizes destructive cleanup | A naive harness fix can destroy host state | M | High | mac/Linux oracle guards and cleanup | 009 |
-| New formula lifecycle test is unwired and skippable | Essential-mac regression has no canonical proof | M | High | #11915 workflow/test/harness | 009, 018 |
-| Whole closure is validated before mutation classification | Current installed formula can block unrelated work | S | Medium | #11915 `brew/mod.rs:88-110` | 010 |
-| Lifecycle raw JSON is validated and reparsed separately | Unsupported details fail after mutation | L | High | #11915 `lifecycle.rs:32-88,351-647` | 010 |
-| Generic lifecycle `run` lacks Homebrew confinement | Metadata command inherits mise authority | L | High | #11915 `lifecycle.rs:451-463` | 010 |
-| Source install skips lifecycle | Source formula can report installed incomplete | M | High | #11915 `source.rs:156-177` | 011 |
-| Source receipt requires a snapshot never written | #11910 source builds fail at receipt generation | S | Low | `source.rs:157-166`; `pour.rs:443-456` | 011 |
-| Archive bottle is treated as a source build | False provenance and unnecessary compiler dependency | M | Medium | `fetch.rs:49-59`; `pour.rs:350-474` | 011 |
-| Lifecycle damage triggers full repour | Repair replaces valid keg and loses provenance | L | High | #11915 `pour.rs:35-40,149-193` | 012 |
-| Status checks only configured root, not dependency closure | Root-only Kimi config can remain falsely healthy | L | Medium | `resources.rs:270-298`; `brew/mod.rs:240-255` | 012 |
-| Two heads conflict in formula state-machine files | No mergeable or tested product exists | M | High | merge-tree conflicts in `api.rs`, `pour.rs`, `source.rs` | 017 |
-| Corpus uses one label per cask and six classes are unverified | 37 names do not prove 37 behaviors | M | Medium | `007-corpus-results.md` | 018 |
-| Docs and PR bodies claim full parity | Users receive guarantees code does not meet | S | Low | brew docs and plans 007–008 | 019 |
+| Finding                                                       | Impact                                               | Effort | Risk   | Evidence                                                 | Owner plan |
+| ------------------------------------------------------------- | ---------------------------------------------------- | ------ | ------ | -------------------------------------------------------- | ---------- |
+| App activation target is backed up but never recreated        | P0: successful app install can end without the app   | S      | High   | `cask.rs:427-504`                                        | 013        |
+| Existing app/binary/font targets lack an ownership claim      | Foreign user state can be destroyed                  | M      | High   | `cask.rs:1310-1328,5731-5802`                            | 013        |
+| Mise duplicates moved artifacts instead of Homebrew topology  | Brew adoption/prune parity is false                  | L      | High   | `cask.rs:1275-1291,1505-1543,5599-5642`                  | 013        |
+| Pending cask journal is never recovered                       | Irreversible actions may replay after crash          | L      | High   | `cask.rs:263-269,402-465,4141-4143`                      | 013        |
+| Upgrade skips predecessor uninstall actions                   | Helper/pkg/process residue survives                  | L      | High   | `cask.rs:387-395,5280-5282`                              | 014        |
+| Unsupported recorded teardown actions are accepted            | Mise can install state it cannot later remove        | L      | High   | `cask.rs:313-335,4413-4449,5405-5412`                    | 014        |
+| `manpage` is silently non-installing                          | Ghostty mixed artifacts are incomplete               | M      | Medium | `cask.rs:2846-2849,4864-4910,5882`                       | 015        |
+| Linux receipt config contains macOS directories               | Real brew removes/reads wrong Linux targets          | S      | Medium | `cask.rs:4539-4567`                                      | 015        |
+| Mise lock does not contend with Homebrew CaskLock             | Concurrent brew/mise mutations race                  | M      | Medium | `cask.rs:5302-5311`                                      | 016        |
+| Oracle loses `CI` under `env -i` and exits success            | Central parity proof is false-green                  | M      | High   | `e2e/run_test:74-126`; zero-second jobs                  | 009        |
+| Generic `CI=true` authorizes destructive cleanup              | A naive harness fix can destroy host state           | M      | High   | mac/Linux oracle guards and cleanup                      | 009        |
+| New formula lifecycle test is unwired and skippable           | Essential-mac regression has no canonical proof      | M      | High   | #11915 workflow/test/harness                             | 009, 018   |
+| Whole closure is validated before mutation classification     | Current installed formula can block unrelated work   | S      | Medium | #11915 `brew/mod.rs:88-110`                              | 010        |
+| Lifecycle raw JSON is validated and reparsed separately       | Unsupported details fail after mutation              | L      | High   | #11915 `lifecycle.rs:32-88,351-647`                      | 010        |
+| Generic lifecycle `run` lacks Homebrew confinement            | Metadata command inherits mise authority             | L      | High   | #11915 `lifecycle.rs:451-463`                            | 010        |
+| Source install skips lifecycle                                | Source formula can report installed incomplete       | M      | High   | #11915 `source.rs:156-177`                               | 011        |
+| Source receipt requires a snapshot never written              | #11910 source builds fail at receipt generation      | S      | Low    | `source.rs:157-166`; `pour.rs:443-456`                   | 011        |
+| Archive bottle is treated as a source build                   | False provenance and unnecessary compiler dependency | M      | Medium | `fetch.rs:49-59`; `pour.rs:350-474`                      | 011        |
+| Lifecycle damage triggers full repour                         | Repair replaces valid keg and loses provenance       | L      | High   | #11915 `pour.rs:35-40,149-193`                           | 012        |
+| Status checks only configured root, not dependency closure    | Root-only Kimi config can remain falsely healthy     | L      | Medium | `resources.rs:270-298`; `brew/mod.rs:240-255`            | 012        |
+| Two heads conflict in formula state-machine files             | No mergeable or tested product exists                | M      | High   | merge-tree conflicts in `api.rs`, `pour.rs`, `source.rs` | 017        |
+| Corpus uses one label per cask and six classes are unverified | 37 names do not prove 37 behaviors                   | M      | Medium | `007-corpus-results.md`                                  | 018        |
+| Docs and PR bodies claim full parity                          | Users receive guarantees code does not meet          | S      | Low    | brew docs and plans 007–008                              | 019        |
 
 ## Essential-mac acceptance thread
 

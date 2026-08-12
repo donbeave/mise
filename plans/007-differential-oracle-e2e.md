@@ -5,7 +5,7 @@
 > cited zero-second jobs are not evidence. The corpus also conflated names with
 > mechanisms. Use plans 009, 017, and 018. Their safety, completion-marker,
 > branch, drift, and done criteria override this document.
-
+>
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
