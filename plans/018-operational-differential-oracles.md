@@ -22,18 +22,23 @@ Execution start (2026-08-13):
 Execution continuation (2026-08-13):
 
 - formula prerequisite advanced to
-  `300551418f7a4fc2b4579eac2993eff7f62c8aa5` after exact-head source proof
+  `667866575b92c19f5f8ba07646f52cfbbcf330fb` after exact-head source proof
   exposed an Ubuntu GCC provenance parser defect and the general container E2E
   exposed an unsafe-directory Git identity probe; the pinned macOS oracle then
   exposed the isolated harness omitting fixed `/usr/sbin` and `/sbin`, which
   prevented its package-receipt no-mutation probe from invoking `pkgutil`;
 - combined stack was restacked without conflict; current code-proof SHA is
-  `0fd2adeae546d4ae9f5cd2cabfcd63960342b039`. The previous exact evidence head
+  `74d9817b17ada28ade9629eefdf7a9cd64df1a1d`. The previous exact evidence head
   `7db9c28bb62e7868930227f03f6c7793c8ac675d` failed before cask mutation because
   the isolated harness omitted the fixed system path containing `pkgutil`;
 - first pinned macOS execution proved runtime `6.0.17` at exact SHA
   `4dacfe77a24dead72de749c0876028b77b99cd04`, then correctly failed because
   `brew uninstall` in 6.0.17 does not accept the stale oracle's `--yes` flag.
+- the root-only Kimi fixture now invokes the same top-level `mise bootstrap
+  --yes` entry point as essential-mac. Its legacy phase removes OpenSSL's
+  linked-keg, shared etc, and lifecycle record while retaining the keg,
+  receipt, opt, formula snapshot, and `.bottle/etc`; it proves offline exact
+  diagnosis, inode-preserving repair, and fail-closed checksum ambiguity.
 
 ## Objective
 
