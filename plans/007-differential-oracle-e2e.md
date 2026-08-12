@@ -327,3 +327,18 @@ engine state, corpus class table.
 - **Choice:** retrigger unchanged. The failure occurred before project tests;
   changing timeout policy is outside this plan, while weakening coverage would
   violate the differential-oracle invariant.
+
+## Blocker resolution — 2026-08-12 unrelated global-config gate
+
+- **Condition:** after both current-head differential oracles passed, full CI
+  failed only in `cli/test_global_config_confd`; the failure reproduced alone
+  on macOS.
+- **Evidence:** `MISE_USE_TOML=false` caused the test's `.tool-versions` file to
+  be parsed as TOML, then `mise use -g` created the default `config.toml` that
+  the test asserted must not exist. No branch diff touched config selection.
+- **Options:** keep retriggering a deterministic failure, alter production
+  config selection, or make the fixture explicitly select the legacy global
+  file through the supported `MISE_GLOBAL_CONFIG_FILE` override.
+- **Choice:** explicitly select `.tool-versions` in the test fixture. This
+  preserves the intended drop-in write-target assertion, changes no production
+  behavior, and removes dependence on an unrelated format-preference setting.
