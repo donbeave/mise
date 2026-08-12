@@ -2906,6 +2906,22 @@ fn cask_artifacts(cask: &Cask) -> Result<CaskArtifacts> {
 }
 
 fn validate_platform_support(cask: &Cask, artifacts: &CaskArtifacts) -> Result<()> {
+    if let Some(kind) = cask.artifacts.iter().find_map(|artifact| {
+        let kind = artifact_type(artifact);
+        matches!(
+            kind.as_str(),
+            "uninstall_preflight"
+                | "uninstall_preflight_steps"
+                | "uninstall_postflight"
+                | "uninstall_postflight_steps"
+        )
+        .then_some(kind)
+    }) {
+        bail!(
+            "brew-cask:{}: {kind} cannot be replayed from Homebrew JSON metadata",
+            cask.token
+        );
+    }
     #[cfg(target_os = "linux")]
     {
         let font_only = !artifacts.fonts.is_empty()
@@ -5347,6 +5363,16 @@ fn homebrew_uninstall_actions(
 ) -> Result<Vec<HomebrewUninstallAction>> {
     let mut actions = Vec::new();
     for artifact in &homebrew.uninstall_artifacts {
+        if let Some(kind) = artifact.as_object().and_then(|object| {
+            object.keys().find(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "uninstall_preflight_steps" | "uninstall_postflight_steps"
+                )
+            })
+        }) {
+            bail!("brew-cask:{token}: unsupported recorded uninstall directive {kind}");
+        }
         let Some(uninstall) = artifact.get("uninstall") else {
             continue;
         };
@@ -8276,6 +8302,30 @@ end
     }
 
     #[test]
+    fn rejects_uninstall_hooks_before_activation() -> Result<()> {
+        for kind in [
+            "uninstall_preflight",
+            "uninstall_preflight_steps",
+            "uninstall_postflight",
+            "uninstall_postflight_steps",
+        ] {
+            let mut cask = test_cask("unsupported-hook", "1.0.0");
+            cask.artifacts = vec![
+                serde_json::json!({"app": "Example.app"}),
+                serde_json::json!({(kind): []}),
+            ];
+            let artifacts = cask_artifacts(&cask)?;
+            assert!(
+                validate_platform_support(&cask, &artifacts)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot be replayed")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn app_only_casks_ignore_pkgutil_ids() -> Result<()> {
         let mut cask = test_cask("example", "1.0.0");
         cask.artifacts = vec![
@@ -8813,6 +8863,18 @@ end
                 .unwrap_err()
                 .to_string()
                 .contains("absolute normalized path")
+        );
+
+        value = serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
+        value["uninstall_artifacts"] = serde_json::json!([
+            {"uninstall_preflight_steps": [{"system_command": ["/usr/bin/true"]}]}
+        ]);
+        let receipt: receipt::CaskReceipt = serde_json::from_value(value)?;
+        assert!(
+            validate_homebrew_uninstall_artifacts("example", &receipt)
+                .unwrap_err()
+                .to_string()
+                .contains("uninstall_preflight_steps")
         );
         Ok(())
     }

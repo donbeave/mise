@@ -225,3 +225,18 @@ exit 0.
 - **Evidence:** Homebrew stores the Ruby cask source when flight blocks exist (`cask/installer.rb`), so JSON cannot replay them; receipt paths are destructive authority.
 - **Options:** silently skip unsupported facts, fetch today's catalog, or fail closed before mutation and run validated installed-receipt actions before direct targets.
 - **Choice:** fail closed for flight blocks and non-absolute/non-normalized delete paths; validate every candidate first; execute recorded actions before direct target removal.
+
+## Blocker resolution — 2026-08-12 PR review
+
+- **Condition:** uninstall pre/postflight hooks were detected only during
+  removal, and structured `*_steps` receipt keys were not classified as
+  unsupported, allowing install side effects before an inevitable refusal.
+- **Evidence:** Homebrew represents these hooks separately from replayable
+  uninstall artifacts; native execution would require unsupported script
+  semantics or invoking brew.
+- **Options:** ignore the hooks; implement a partial interpreter; or reject
+  every flight-hook representation during pre-install validation and again
+  when consuming installed receipts.
+- **Choice:** fail closed at both boundaries. Catalog validation now rejects
+  singular and structured pre/postflight keys before mutation; receipt
+  teardown independently rejects structured step keys before removal.
