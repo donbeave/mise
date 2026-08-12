@@ -270,3 +270,16 @@ started, but the full oracle remains 007's deliverable.
   API path. The snapshot writer follows `save_caskfile`, and receipt artifact
   ordering follows `ArtifactSet`. This is the only option satisfying truthful
   provenance and the differential oracle.
+
+## Blocker resolution — 2026-08-12 PR fidelity review
+
+- **Condition:** a fixture-derived eight-item endpoint swap had no stable
+  Homebrew semantic basis, and unresolved dependencies were rejected only
+  after payload download.
+- **Evidence:** `ArtifactSet` defines class ordering but no endpoint rule;
+  equal-class API order is already deterministic. Runtime dependencies are a
+  receipt prerequisite and need no payload facts.
+- **Options:** retain the heuristic; emulate Ruby implementation accidents; or
+  preserve API order and validate dependencies before fetch.
+- **Choice:** preserve source order and reject unresolved dependencies before
+  any download or install side effect. The differential oracle remains arbiter.

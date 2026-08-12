@@ -44,6 +44,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+snapshot_cask() {
+  local token=$1 output=$2 room="$prefix/Caskroom/$1"
+  local roots=("caskroom=$room")
+  if [[ $token == hiddenbar ]]; then
+    roots+=("app=$hiddenbar_app")
+  else
+    local font
+    while IFS= read -r font; do
+      roots+=("font-$(basename "$font")=$font")
+    done < <(find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print | LC_ALL=C sort)
+  fi
+  brew_oracle_snapshot "$output" "${roots[@]}"
+}
+
 oracle_cask() {
   local token=$1 room="$prefix/Caskroom/$1"
   cat <<EOF >mise.toml
@@ -52,12 +66,12 @@ oracle_cask() {
 EOF
 
   "$brew" install --cask "$token" --yes
-  brew_oracle_snapshot "$room" "brew-$token.snapshot"
+  snapshot_cask "$token" "brew-$token.snapshot"
   "$brew" uninstall --cask "$token" --yes
   assert_fail "test -e '$room'"
 
   mise bootstrap packages apply --yes
-  brew_oracle_snapshot "$room" "mise-$token.snapshot"
+  snapshot_cask "$token" "mise-$token.snapshot"
   brew_oracle_diff "brew-$token.snapshot" "mise-$token.snapshot"
   assert_contains "'$brew' list --cask" "$token"
   assert_succeed "'$brew' info --cask '$token'"
@@ -65,10 +79,10 @@ EOF
   assert_fail "test -e '$room'"
 
   "$brew" install --cask "$token" --yes
-  brew_oracle_snapshot "$room" "before-$token-noop.snapshot"
+  snapshot_cask "$token" "before-$token-noop.snapshot"
   assert_contains "mise bootstrap packages status" "installed"
   assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
-  brew_oracle_snapshot "$room" "after-$token-noop.snapshot"
+  snapshot_cask "$token" "after-$token-noop.snapshot"
   brew_oracle_diff "before-$token-noop.snapshot" "after-$token-noop.snapshot"
   "$brew" uninstall --cask "$token" --yes
 }

@@ -146,3 +146,14 @@ Docs-only; verification is the two grep gates plus lint.
   avoids the literal number by design).
 - Reviewer focus: no overclaim — the page must not promise support for
   taps without published API metadata or `brew services`.
+
+## Blocker resolution — 2026-08-12 PR documentation review
+
+- **Condition:** legacy conversion wording implied status mutation and the
+  coexistence promise did not explicitly require valid compatible state.
+- **Evidence:** design decision 2 makes status read-only; corrupt or unprovable
+  state is classified NeedsRepair without mutation.
+- **Options:** retain ambiguous prose, weaken the implementation contract, or
+  state validation-on-status and conversion-on-apply precisely.
+- **Choice:** align design and user docs with the implemented read-only status
+  boundary and qualify interoperability by valid Homebrew-compatible state.

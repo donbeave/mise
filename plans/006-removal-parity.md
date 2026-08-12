@@ -240,3 +240,14 @@ exit 0.
 - **Choice:** fail closed at both boundaries. Catalog validation now rejects
   singular and structured pre/postflight keys before mutation; receipt
   teardown independently rejects structured step keys before removal.
+
+## Blocker resolution — 2026-08-12 PR teardown review
+
+- **Condition:** Homebrew-origin prune bypassed pending journals; direct hook
+  keys, expanded delete paths, and AppleScript identifiers needed final-form
+  validation.
+- **Evidence:** journals denote incomplete ownership transactions, templates
+  change executed paths, and bundle identifiers enter executable script text.
+- **Options:** trust recorded raw values, skip unknown forms, or validate both
+  planning and execution boundaries and refuse pending state.
+- **Choice:** fail closed at both boundaries; never prune pending transactions.

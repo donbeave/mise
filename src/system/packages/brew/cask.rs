@@ -331,6 +331,8 @@ impl BrewCaskManager {
             info!("brew-cask:{}: already installed", cask.token);
             return Ok(cask.version);
         }
+        // Establish every receipt fact before downloading or mutating payload state.
+        cask_runtime_dependencies(&cask)?;
         if opts.dry_run {
             miseprintln!("install cask {}/{}", cask.token, cask.version);
             for app in &artifacts.apps {
@@ -4495,8 +4497,7 @@ fn installed_cask_snapshot(cask: &Cask, uninstall_artifacts: &[Value]) -> Result
 }
 
 fn cask_uninstall_artifacts(cask: &Cask) -> Vec<Value> {
-    let mut artifacts = cask
-        .artifacts
+    cask.artifacts
         .iter()
         .filter_map(|artifact| {
             let object = artifact.as_object()?;
@@ -4508,24 +4509,7 @@ fn cask_uninstall_artifacts(cask: &Cask) -> Vec<Value> {
             entry.insert(key.clone(), object.get(key).cloned().unwrap_or(Value::Null));
             Some(Value::Object(entry))
         })
-        .collect::<Vec<_>>();
-    // The public API serializes Homebrew's ArtifactSet after MRI has sorted it.
-    // Loading it for install sorts it again. For equal-class runs MRI's qsort
-    // swaps the endpoints once the run reaches eight entries; applying the same
-    // involution recovers the order real brew records (notably font casks).
-    let mut start = 0;
-    while start < artifacts.len() {
-        let key = artifact_type(&artifacts[start]);
-        let mut end = start + 1;
-        while end < artifacts.len() && artifact_type(&artifacts[end]) == key {
-            end += 1;
-        }
-        if end - start >= 8 {
-            artifacts.swap(start, end - 1);
-        }
-        start = end;
-    }
-    artifacts
+        .collect()
 }
 
 fn cask_runtime_dependencies(cask: &Cask) -> Result<serde_json::Map<String, Value>> {
@@ -4681,6 +4665,14 @@ fn native_build_system_info() -> Result<receipt::BuiltOn> {
         preferred_perl: command_output("perl", &["-e", "printf \"%vd\\n\", $^V"]),
         extra: serde_json::Map::new(),
     })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_build_system_info() -> Result<receipt::BuiltOn> {
+    bail!(
+        "brew-cask: build-system metadata is unsupported on {}",
+        std::env::consts::OS
+    )
 }
 
 fn cask_target_record_matches(record: &CaskTargetRecord) -> Result<bool> {
@@ -5105,6 +5097,13 @@ fn cask_prune_plan_from_tokens(keep: &BTreeSet<String>, state_dir: &Path) -> Res
             if configured {
                 continue;
             }
+            if cask_journal_pending_in(state_dir, &token) {
+                plan.skipped.push(CaskPruneSkip {
+                    token,
+                    reason: "an incomplete cask transaction is pending".to_string(),
+                });
+                continue;
+            }
             let homebrew = match receipt::read_cask_receipt(&entry.path()) {
                 Ok(receipt) => receipt,
                 Err(err) => {
@@ -5357,6 +5356,13 @@ enum HomebrewUninstallAction {
     Launchctl(String),
 }
 
+fn valid_bundle_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
 fn homebrew_uninstall_actions(
     token: &str,
     homebrew: &receipt::CaskReceipt,
@@ -5367,7 +5373,10 @@ fn homebrew_uninstall_actions(
             object.keys().find(|kind| {
                 matches!(
                     kind.as_str(),
-                    "uninstall_preflight_steps" | "uninstall_postflight_steps"
+                    "uninstall_preflight"
+                        | "uninstall_preflight_steps"
+                        | "uninstall_postflight"
+                        | "uninstall_postflight_steps"
                 )
             })
         }) {
@@ -5420,17 +5429,23 @@ fn validate_homebrew_uninstall_artifacts(
     }
     let actions = homebrew_uninstall_actions(token, homebrew)?;
     for action in &actions {
-        if let HomebrewUninstallAction::Delete(path) = action {
-            if !path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                bail!(
-                    "brew-cask:{token}: recorded uninstall delete path is not an absolute normalized path: {}",
-                    path.display()
-                );
+        match action {
+            HomebrewUninstallAction::Delete(path) => {
+                if !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    bail!(
+                        "brew-cask:{token}: recorded uninstall delete path is not an absolute normalized path: {}",
+                        path.display()
+                    );
+                }
             }
+            HomebrewUninstallAction::Quit(bundle_id) if !valid_bundle_identifier(bundle_id) => {
+                bail!("brew-cask:{token}: recorded quit bundle identifier is invalid: {bundle_id}");
+            }
+            _ => {}
         }
     }
     #[cfg(target_os = "macos")]
@@ -5472,7 +5487,19 @@ fn execute_homebrew_uninstall_artifacts(
                     &cask_appdir(&[])?,
                     Some(&candidate.version),
                 );
-                remove_artifact_target_elevating(Path::new(&expanded))?;
+                let expanded = Path::new(&expanded);
+                if !expanded.is_absolute()
+                    || expanded
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    bail!(
+                        "brew-cask:{}: expanded uninstall delete path is not an absolute normalized path: {}",
+                        candidate.token,
+                        expanded.display()
+                    );
+                }
+                remove_artifact_target_elevating(expanded)?;
             }
             HomebrewUninstallAction::Quit(bundle_id) => {
                 #[cfg(not(target_os = "macos"))]
@@ -5481,14 +5508,22 @@ fn execute_homebrew_uninstall_artifacts(
                     candidate.token
                 );
                 #[cfg(target_os = "macos")]
-                run_uninstall_command(
-                    "/usr/bin/osascript",
-                    &[
-                        "-e",
-                        &format!("tell application id \"{bundle_id}\" to quit"),
-                    ],
-                    &candidate.token,
-                )?;
+                {
+                    if !valid_bundle_identifier(&bundle_id) {
+                        bail!(
+                            "brew-cask:{}: recorded quit bundle identifier is invalid: {bundle_id}",
+                            candidate.token
+                        );
+                    }
+                    run_uninstall_command(
+                        "/usr/bin/osascript",
+                        &[
+                            "-e",
+                            &format!("tell application id \"{bundle_id}\" to quit"),
+                        ],
+                        &candidate.token,
+                    )?;
+                }
             }
             HomebrewUninstallAction::Launchctl(label) => {
                 #[cfg(not(target_os = "macos"))]
@@ -6003,12 +6038,13 @@ mod tests {
         );
 
         let mut font = test_cask("font-example", "1.0");
-        font.artifacts = (0..8)
+        font.artifacts = (0..16)
             .map(|index| serde_json::json!({"font": [format!("font-{index}.ttf")]}))
             .collect();
         let ordered = cask_uninstall_artifacts(&font);
-        assert_eq!(ordered[0]["font"][0], "font-7.ttf");
-        assert_eq!(ordered[7]["font"][0], "font-0.ttf");
+        for (index, artifact) in ordered.iter().enumerate() {
+            assert_eq!(artifact["font"][0], format!("font-{index}.ttf"));
+        }
     }
 
     #[test]
@@ -8778,6 +8814,29 @@ end
     }
 
     #[test]
+    fn cask_prune_skips_homebrew_metadata_with_pending_transaction() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let state_dir = tmp.path().join("state");
+        write_homebrew_cask_receipt("codex", "1.2.3", |_| {});
+        let journal_dir = state_dir.join("brew-cask/codex");
+        file::create_dir_all(&journal_dir)?;
+        file::write(journal_dir.join("1.2.3.json"), "{}")?;
+
+        let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
+
+        assert!(plan.remove.is_empty());
+        assert!(plan.skipped.iter().any(|skip| {
+            skip.token == "codex"
+                && skip
+                    .reason
+                    .contains("incomplete cask transaction is pending")
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn homebrew_uninstall_rejects_unknown_before_removal_and_ignores_zap() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
@@ -8867,15 +8926,32 @@ end
 
         value = serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
         value["uninstall_artifacts"] = serde_json::json!([
-            {"uninstall_preflight_steps": [{"system_command": ["/usr/bin/true"]}]}
+            {"uninstall": [{"quit": "com.example\"; do shell script \"id"}]}
         ]);
         let receipt: receipt::CaskReceipt = serde_json::from_value(value)?;
         assert!(
             validate_homebrew_uninstall_artifacts("example", &receipt)
                 .unwrap_err()
                 .to_string()
-                .contains("uninstall_preflight_steps")
+                .contains("bundle identifier is invalid")
         );
+
+        for kind in [
+            "uninstall_preflight",
+            "uninstall_preflight_steps",
+            "uninstall_postflight",
+            "uninstall_postflight_steps",
+        ] {
+            value = serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
+            value["uninstall_artifacts"] = serde_json::json!([{(kind): []}]);
+            let receipt: receipt::CaskReceipt = serde_json::from_value(value)?;
+            assert!(
+                validate_homebrew_uninstall_artifacts("example", &receipt)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(kind)
+            );
+        }
         Ok(())
     }
 
