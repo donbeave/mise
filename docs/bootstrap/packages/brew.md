@@ -15,10 +15,11 @@ into the canonical Homebrew prefix — `/opt/homebrew` on arm64 macOS,
 `/home/linuxbrew/.linuxbrew` on Linux. It fetches metadata from the
 formulae.brew.sh API, resolves the runtime dependency closure, downloads
 prebuilt bottles from ghcr.io (verifying sha256 checksums), and performs the
-same relocation, code-signing, and linking work `brew` does when pouring a
-bottle. Formulae without a usable bottle are built from source, also without
-Homebrew (see [Source formulae](#source-formulae)). mise never shells out to
-`brew` for homebrew/core formulae.
+Homebrew-compatible relocation, code-signing, linking, shared-state, and typed
+post-install work described below. Unknown lifecycle operations fail before
+the formula is changed. Formulae without a usable bottle are built from source,
+also without Homebrew (see [Source formulae](#source-formulae)). mise never
+shells out to `brew` for homebrew/core formulae.
 
 Third-party taps are supported directly when the tap publishes Homebrew API
 metadata (`api/formula/<name>.json` or `api/cask/<token>.json`). Use the same
@@ -87,33 +88,27 @@ gains portable implementations for more cask artifact types.
 
 `brew-cask` currently supports app-bundle casks (`app` artifacts), binary and
 generated command-wrapper casks (`binary` and `command_wrapper` artifacts),
-simple macOS installer packages (`pkg` artifacts), and shell completions
+fonts, manpages, and shell completions
 (`bash_completion`, `fish_completion`, `zsh_completion`, and
 `generate_completions_from_executable`) from dmg and common archive formats.
 Binary artifacts and generated wrappers are staged in the Caskroom and linked
-into the Homebrew prefix, usually under `<prefix>/bin`. Package installers run
-through mise's normal system-package sudo path, so non-interactive runs never
-hang waiting for a password. Pkg casks must include `pkgutil` receipt IDs in
-their `uninstall` metadata so mise can verify installed state after the
-installer writes files outside the Caskroom. `zap` `pkgutil` IDs are treated as
-cleanup metadata, not install receipts. For casks with lifecycle hooks, mise
-fetches the sha256-verified cask Ruby source pinned by the API metadata and runs
-supported `preflight`/`postflight` hooks through its own Cask DSL shim, without
-delegating to Homebrew. mise also supports structured `preflight_steps` and
-`postflight_steps` for `move`/`remove` operations against `staged_path`, `run`
-operations using Homebrew's serialized command bases, arguments, environment,
-guards, and sudo setting, and `terminate_process` operations with
-Homebrew-compatible name/full matching, retries, notices, and failure policy.
-Casks that require custom installer
-choices, services, unsupported hook DSL, unsupported structured lifecycle
-steps, or other cask artifact types fail with a clear unsupported artifact
-error instead of delegating to Homebrew.
+into the Homebrew prefix, usually under `<prefix>/bin`. Mixed receipts may
+contain several supported artifact mechanisms; for example, an app can also
+install manpages and completions. Every old teardown and new activation target
+is ownership-checked and journaled before metadata is committed.
 
-Cask installs write the same Caskroom metadata, receipt, configuration, and
-installed-cask snapshot as Homebrew. The format is differential-tested against
-the Homebrew version pinned by the brew receipt module. A cask installed by
-Homebrew therefore satisfies the same mise declaration: status reports it as
-installed and apply does not modify it.
+Package installers (`pkg`), `pkgutil`/BOM teardown, structured lifecycle `run`
+steps, services, and unknown lifecycle or artifact types currently fail before
+mutation. Other typed preflight/postflight and uninstall operations are accepted
+only when the complete recorded plan can be represented and preflighted. mise
+does not delegate unsupported behavior to Homebrew and does not infer teardown
+from the current catalog in place of the installed receipt.
+
+Cask installs write Homebrew-shaped Caskroom metadata, receipts, configuration,
+and installed-cask snapshots for the supported artifact subset. A healthy cask
+installed by Homebrew satisfies the same mise declaration when its recorded
+artifacts and teardown vocabulary are supported; otherwise mise reports the
+unsupported state without mutation.
 
 Legacy casks installed by older mise versions are validated by read-only
 status, then converted by apply when their recorded version, package receipts,
@@ -153,24 +148,33 @@ exists solely for isolated tests and is not a custom-prefix feature.
 
 ## Coexistence with a real Homebrew
 
-Homebrew does not need to be installed for either engine to work. When it is
-present, both tools intentionally share the canonical prefix and lifecycle
-state. mise writes formula receipts, SBOMs, cask metadata, and links in the
-same format as Homebrew, verified by a differential oracle against the version
-pinned in `receipt::EMULATED_BREW_VERSION`.
+Homebrew does not need to be installed for either engine to work. When present,
+both tools intentionally share the canonical prefix. Interoperability is
+limited to the formula lifecycle operations and cask artifact/teardown
+mechanisms documented here; it is not a claim that mise implements the full
+Homebrew Ruby DSL.
 
-Mixing the tools is supported in both directions for valid
-Homebrew-compatible state. Either tool may install, list, upgrade, or uninstall
-a formula or cask regardless of which tool created it. A package already
-installed by Homebrew satisfies its mise declaration: status reports
-`installed`, and apply is a no-op.
+For that supported subset, mise writes native receipts, SBOMs, formula
+snapshots, links, shared lifecycle state, and cask metadata. A package already
+installed by Homebrew is a no-op only when read-only status proves its complete
+operational topology healthy. Unknown provenance, lifecycle, ownership, or
+teardown behavior fails closed.
 
 For non-keg-only formulae, mise maintains Homebrew's
 `<prefix>/var/homebrew/linked/<name>` record alongside the `opt` record. For a
 configured formula, if either record is missing, `mise bootstrap packages
 apply` restores it without repouring the keg or replacing its public links.
 Older mise installs are recognised as linked only when their existing public
-links match the keg's layout. Dependency-closure migration is not performed.
+links match the keg's layout. Status traverses installed receipt
+`runtime_dependencies` offline, so a configured root reports damaged transitive
+state. Apply repairs only lifecycle effects whose ownership and inputs are
+provable; ambiguous or interrupted state requires reinstall instead of replay.
+
+Bottle defaults under `.bottle/etc` and `.bottle/var` are installed with
+persistent-file semantics. Existing user-modified files are preserved during
+upgrade and repair. Typed post-install state is recorded by phase so missing
+idempotent effects can be repaired without replacing a healthy keg; an action
+with unknown prior outcome is never blindly replayed.
 
 mise reads the Homebrew prefix directly, whether formulae were poured by mise
 or by a real Homebrew. It never overwrites files in the prefix that it didn't
@@ -252,6 +256,11 @@ For each formula in the dependency closure (dependencies first):
    linked-keg record is created for non-keg-only formulae.
    [keg-only](https://docs.brew.sh/FAQ#what-does-keg-only-mean) formulae get
    the `opt` link but are not linked into the prefix, same as brew.
+7. **Shared state**: `.bottle/etc` and `.bottle/var` defaults are installed
+   without overwriting user changes.
+8. **Post-install**: the preflighted typed lifecycle plan runs in a restricted,
+   deterministic environment. mise records completion only after health checks
+   pass.
 
 ## Source formulae
 
@@ -274,7 +283,9 @@ still without Homebrew:
    `PKG_CONFIG_PATH`, and compiler flags pointing at the dependency kegs.
    The keg gets the same brew-compatible receipt as a poured bottle, with
    `poured_from_bottle: false` — exactly how brew marks its own source
-   builds.
+   builds. The exact formula source is stored under `.brew`, then the source
+   keg enters the same link, shared-state, typed post-install, and health
+   finalizer as a bottle.
 
 The shim implements the commonly-used subset of the formula DSL
 (configure/cmake/meson-style builds, resources, patches, the standard path
@@ -303,11 +314,13 @@ behavior.
 ## Limitations
 
 - **Cask artifact coverage is intentionally narrow.** On macOS, `brew-cask`
-  supports app bundles, binary artifacts, font artifacts, and simple pkg
-  installers from dmg and common archive formats. On Linux, it supports
+  supports app bundles, binary artifacts, command wrappers, fonts, manpages,
+  and declared or generated shell completions from dmg and common archive
+  formats. Pkg/BOM teardown, structured lifecycle `run`, services, and unknown
+  artifact or teardown mechanisms fail before mutation. On Linux, it supports
   font-only casks without lifecycle hooks or structured `preflight_steps` or
-  `postflight_steps`. Other artifact types, pkg installers without `pkgutil`
-  IDs, and pkg installers with custom choices fail explicitly.
+  `postflight_steps`; targets use XDG/Linux Homebrew paths, never macOS cask
+  paths.
 - **`brew services` is not implemented.**
 - **Cask import is not implemented.** Cask prune reads the installed receipt and
   refuses unknown uninstall directives; it never substitutes today's catalog
@@ -316,6 +329,10 @@ behavior.
   implements the widely-used subset of the DSL (see
   [Source formulae](#source-formulae)); formulae that reach beyond it fail
   with a clear error naming the unsupported feature.
+- **Formula post-install coverage is typed, not arbitrary Ruby.** Supported
+  plans use preflighted `mkdir_p`, `remove`, `copy`, `symlink`, and confined
+  `run` operations plus `.bottle/etc` and `.bottle/var` installation. Opaque
+  Ruby and unknown step/path/guard forms fail before the mutation set changes.
 - **Use canonical formula names.** `postgresql@17` is a formula name, not a
   mise version pin — the API's current stable version decides what gets
   installed. Aliases (`postgres`) install correctly but `mise bootstrap packages status`

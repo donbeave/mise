@@ -74,7 +74,8 @@ Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
 - Ghostty-shaped unit coverage executes app + two manpages + bash/fish/zsh
   completions. `plans/007-corpus-results.md` now pins all 37 names as a
   multi-mechanism matrix at tap commit
-  `139b32436d745fd04f1d531bad85b8864a7c7270`, with full API payload digests.
+  `9a1a1d1caa8dd0b1f40107205cb3776120130245`, with canonical API payload
+  digests that exclude only analytics and generation time.
 - One platform directory model drives target paths and native config. Linux
   tests cover `~/.config/apps`, XDG fonts, `~/.vst`, and `~/.vst3`, and reject
   macOS path leakage.
