@@ -342,3 +342,20 @@ engine state, corpus class table.
 - **Choice:** explicitly select `.tool-versions` in the test fixture. This
   preserves the intended drop-in write-target assertion, changes no production
   behavior, and removes dependence on an unrelated format-preference setting.
+
+## Blocker resolution — 2026-08-12 normalization audit
+
+- **Condition:** final verification found two normalizers broad enough to hide
+  genuine divergence: any timestamp-shaped path component was replaced, and
+  the complete SPDX creator array was discarded.
+- **Evidence:** neither value is wholly nondeterministic. Only Homebrew's cask
+  `.metadata/<version>/<install timestamp>` directory and the version-bearing
+  producer string vary; path placement, creator type, and creator cardinality
+  are invariant state.
+- **Options:** retain the broad rules, remove normalization and accept expected
+  machine/time diffs, or validate invariant structure and normalize only the
+  intrinsically variable fragments.
+- **Choice:** scope timestamp replacement to cask metadata installation
+  directories, require exactly one Homebrew producer creator, and replace only
+  that creator string. This keeps the oracle stable without concealing missing,
+  extra, or malformed state.
