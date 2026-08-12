@@ -156,8 +156,8 @@ Completed proof:
   exact mise head is `84d74314f904c0accad1c4cdc563ea662360316b`.
 - Local all-brew tests (204 passed) cover offline installed-receipt closure
   traversal, exact dependency/phase diagnostics, legacy lifecycle repair,
-unprovable-state reinstall classification, preserved valid topology/inodes,
-and ordered effect health.
+  unprovable-state reinstall classification, preserved valid topology/inodes,
+  and ordered effect health.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew

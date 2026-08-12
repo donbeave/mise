@@ -5,7 +5,7 @@
 > source builds lack the required formula snapshot, and formula lifecycle is not
 > complete. Use plans 010–012, 017, and 018. Their branch, commit-trailer, drift,
 > and done criteria override this document.
-
+>
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >

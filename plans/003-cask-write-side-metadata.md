@@ -6,7 +6,7 @@
 > Homebrew, and transaction recovery is incomplete. Do not execute this file as
 > a current completion plan. Use plans 013, 015, 017, and 018. Their branch,
 > commit-trailer, drift, and done criteria override this document.
-
+>
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >

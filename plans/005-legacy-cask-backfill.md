@@ -4,7 +4,7 @@
 > does not cover Homebrew moved-artifact topology, full target ownership, or
 > recoverable transaction state. Use plans 013, 017, and 018. Their branch,
 > commit-trailer, drift, and done criteria override this document.
-
+>
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
