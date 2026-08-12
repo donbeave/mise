@@ -196,7 +196,13 @@ fn source_compiler() -> Result<String> {
         bail!("cannot determine source-build compiler")
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let version = command_output("cc", &["-dumpfullversion", "-dumpversion"]);
+    let version = std::process::Command::new("cc")
+        .args(["-dumpfullversion", "-dumpversion"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|version| !version.is_empty());
     parse_source_compiler(&text, version.as_deref())
 }
 
