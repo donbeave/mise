@@ -22,14 +22,15 @@ Execution start (2026-08-13):
 Execution continuation (2026-08-13):
 
 - formula prerequisite advanced to
-  `300551418c3837c62f6c26b0fe2bc2d2d047d3cf` after exact-head source proof
+  `300551418f7a4fc2b4579eac2993eff7f62c8aa5` after exact-head source proof
   exposed an Ubuntu GCC provenance parser defect and the general container E2E
   exposed an unsafe-directory Git identity probe; the pinned macOS oracle then
   exposed the isolated harness omitting fixed `/usr/sbin` and `/sbin`, which
   prevented its package-receipt no-mutation probe from invoking `pkgutil`;
 - combined stack was restacked without conflict; current code-proof SHA is
-  `98adcff5c8b2f0bd64a0faf5e278635631c77936` and current exact pushed evidence
-  head is `7db9c28bb62e7868930227f03f6c7793c8ac675d`;
+  `0fd2adeae546d4ae9f5cd2cabfcd63960342b039`. The previous exact evidence head
+  `7db9c28bb62e7868930227f03f6c7793c8ac675d` failed before cask mutation because
+  the isolated harness omitted the fixed system path containing `pkgutil`;
 - first pinned macOS execution proved runtime `6.0.17` at exact SHA
   `4dacfe77a24dead72de749c0876028b77b99cd04`, then correctly failed because
   `brew uninstall` in 6.0.17 does not accept the stale oracle's `--yes` flag.

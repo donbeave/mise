@@ -8,7 +8,7 @@ Depends on: 012, 014, 015, 016
 
 Integration start (2026-08-13):
 
-- prerequisite #11915 head: `300551418c3837c62f6c26b0fe2bc2d2d047d3cf`
+- prerequisite #11915 head: `300551418f7a4fc2b4579eac2993eff7f62c8aa5`
 - pre-stack #11910 head: `09d4509c04ff54cfc01ee5f08e26382e5699552c`
 - shared merge base: `1c7db9f92c80f94bcca31345640483e176e82f4e`
 - formula local gates: lifecycle 15 passed, brew 204 passed, lint passed, and
@@ -20,12 +20,12 @@ Integration start (2026-08-13):
 Semantic rebase result (2026-08-13):
 
 - rebased all #11910 commits from shared base `1c7db9f92c80f94bcca31345640483e176e82f4e`
-  onto #11915 `300551418c3837c62f6c26b0fe2bc2d2d047d3cf`;
+  onto #11915 `300551418f7a4fc2b4579eac2993eff7f62c8aa5`;
 - preserved the explicit OCI/archive/source provenance enum, source snapshot,
   unified finalizer, typed lifecycle, and closure health architecture;
 - layered the typed Homebrew receipt/SBOM schema into that finalizer;
 - discarded obsolete duplicate pour paths and generic-`CI` oracle authorization;
-- combined code-proof head `98adcff5c8b2f0bd64a0faf5e278635631c77936`
+- combined code-proof head `0fd2adeae546d4ae9f5cd2cabfcd63960342b039`
   is a descendant of the exact #11915 head;
 - `rtk cargo test --bin mise system::packages::brew -- --test-threads=1`:
   258 passed across two suites on the combined code-proof head;
