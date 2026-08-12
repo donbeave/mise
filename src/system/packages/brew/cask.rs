@@ -9700,10 +9700,10 @@ end
         let _guard = BrewPrefixGuard::set(tmp.path());
         let mut cask = test_cask("legacy-backfill", "2.0.0");
         cask.artifacts = serde_json::from_value(serde_json::json!([
-            {"app": ["Legacy.app"]}
+            {"app": ["Legacy.app", {"target": "$HOMEBREW_PREFIX/Applications/Legacy.app"}]}
         ]))?;
         let artifacts = cask_artifacts(&cask)?;
-        let target = app_target_path("Legacy.app")?;
+        let target = app_target_path(artifacts.apps[0].target_name())?;
         file::create_dir_all(target.join("Contents"))?;
         file::write(target.join("Contents/payload"), "untouched")?;
         let payload = target.join("Contents/payload");
