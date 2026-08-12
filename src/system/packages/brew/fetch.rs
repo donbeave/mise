@@ -55,6 +55,8 @@ pub async fn fetch_oci_bottle_metadata(
     bottle: &BottleFile,
 ) -> Result<Option<OciBottleMetadata>> {
     let Some((registry, _)) = bottle.url.split_once("/blobs/") else {
+        // Non-OCI third-party bottles carry their original receipt inside the
+        // verified archive. The pour path derives truthful facts from it.
         return Ok(None);
     };
     let url = format!("{registry}/manifests/{pkg_version}");

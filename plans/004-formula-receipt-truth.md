@@ -236,3 +236,16 @@ be updated, not preserved).
   Homebrew's own sources. Minimal plumbing changes in `api.rs`, `mod.rs`,
   and `source.rs`, plus the shared `BuiltOn` option adaptation in `cask.rs`,
   are therefore part of this resolution rather than silent scope growth.
+
+## Blocker resolution — 2026-08-12 PR review
+
+- **Condition:** OCI-only tab lookup made a valid third-party bottle URL
+  fail before the verified archive could supply its embedded receipt.
+- **Evidence:** OCI annotations are available for Homebrew registry
+  bottles, while non-OCI taps may publish ordinary bottle archives whose
+  installed receipt is embedded in the archive itself.
+- **Options:** reject non-OCI bottles; synthesize OCI metadata; or make OCI
+  metadata optional and continue deriving facts from the verified archive.
+- **Choice:** make OCI metadata optional. No receipt field is invented;
+  OCI bottles retain annotation fidelity and third-party archive bottles
+  retain their existing install path.
