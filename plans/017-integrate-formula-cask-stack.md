@@ -16,6 +16,21 @@ Integration start (2026-08-13):
   source-build marker gate.
 - cask local gates: cask 169 passed, brew 226 passed, Clippy zero errors.
 
+Semantic rebase result (2026-08-13):
+
+- rebased all #11910 commits from shared base `1c7db9f92c80f94bcca31345640483e176e82f4e`
+  onto #11915 `df067e021b178d65a194a2b9c9b19de45144b669`;
+- preserved the explicit OCI/archive/source provenance enum, source snapshot,
+  unified finalizer, typed lifecycle, and closure health architecture;
+- layered the typed Homebrew receipt/SBOM schema into that finalizer;
+- discarded obsolete duplicate pour paths and generic-`CI` oracle authorization;
+- combined pre-proof head `20003897ec9323eca02160728e813c08d0cde770` is
+  a descendant of the exact #11915 head;
+- `rtk cargo test --bin mise system::packages::brew -- --test-threads=1`:
+  257 passed across two suites. A parallel-only existing test harness cwd race
+  was observed once in the git-clone cask fixture; the serial focused gate is
+  deterministic, and normal parallel proof remains required before DONE.
+
 ## Objective
 
 Produce one mergeable head containing all formula and cask corrections. Resolve

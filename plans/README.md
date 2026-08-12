@@ -73,15 +73,15 @@ Corrective plans:
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 | --- | --- | --- | --- | --- | --- |
-| 009 | Make destructive oracles safe and non-skippable | P0 | M | — | IN PROGRESS |
-| 010 | Compile formula lifecycle once; preflight and confine it | P0 | L | 009 | TODO |
-| 011 | Unify bottle/source finalization and truthful provenance | P0 | L | 010 | TODO |
-| 012 | Add closure-aware formula health and lifecycle-only repair | P0 | L | 010, 011 | TODO |
-| 013 | Make cask activation owned, transactional, and recoverable | P0 | L | 009 | TODO |
-| 014 | Execute replayable predecessor teardown on upgrade/reinstall | P0 | L | 013 | TODO |
-| 015 | Implement mixed cask artifacts and platform-correct config | P0 | M | 013, 014 | TODO |
-| 016 | Coordinate cask mutations with Homebrew locks | P1 | M | 013 | TODO |
-| 017 | Build one semantically integrated stack | P0 | M | 012, 014, 015, 016 | TODO |
+| 009 | Make destructive oracles safe and non-skippable | P0 | M | — | DONE |
+| 010 | Compile formula lifecycle once; preflight and confine it | P0 | L | 009 | DONE |
+| 011 | Unify bottle/source finalization and truthful provenance | P0 | L | 010 | DONE |
+| 012 | Add closure-aware formula health and lifecycle-only repair | P0 | L | 010, 011 | DONE |
+| 013 | Make cask activation owned, transactional, and recoverable | P0 | L | 009 | IN PROGRESS |
+| 014 | Execute replayable predecessor teardown on upgrade/reinstall | P0 | L | 013 | IN PROGRESS |
+| 015 | Implement mixed cask artifacts and platform-correct config | P0 | M | 013, 014 | IN PROGRESS |
+| 016 | Coordinate cask mutations with Homebrew locks | P1 | M | 013 | IN PROGRESS |
+| 017 | Build one semantically integrated stack | P0 | M | 012, 014, 015, 016 | IN PROGRESS |
 | 018 | Prove operational parity with real differential oracles | P0 | L | 017 | TODO |
 | 019 | Reconcile claims, review state, and final merge gate | P0 | S | 018 | TODO |
 

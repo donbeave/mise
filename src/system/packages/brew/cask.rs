@@ -944,9 +944,9 @@ fn legacy_catalog_failure_status(
         request: req.clone(),
         state: PackageState::NeedsRepair {
             installed: version,
-            reason: Some(format!(
+            reason: format!(
                 "brew-cask:{token}: legacy mise install could not be verified against catalog ({err}); retry online, or reinstall with either 'brew install --cask {token}' or mise apply after uninstalling"
-            )),
+            ),
         },
     })
 }
