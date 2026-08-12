@@ -122,8 +122,8 @@ Completed proof:
   typed step is healthy. Linux process-reference safety no longer self-matches.
 - Confinement tests cover deterministic environment, allowed roots, traversal,
   symlink escape, network denial, and outside-root write denial. Unsupported
-  lifecycle on a non-mutating current dependency is not validated; the complete
-  mutation set is validated before its first side effect.
+lifecycle on a non-mutating current dependency is not validated; the complete
+mutation set is validated before its first side effect.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew::lifecycle

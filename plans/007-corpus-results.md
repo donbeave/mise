@@ -1,32 +1,50 @@
-# Plan 007 corpus equivalence results
+# Plan 007 corpus results — evidence invalidated
 
-Recorded 2026-08-12. No corpus install was run against the operator's live
-machine. The committed macOS oracle runs `hiddenbar` and
-`font-jetbrains-mono` only on disposable CI runners.
+Recorded 2026-08-12; invalidated by deep audit 2026-08-13.
 
-| Equivalence class                  | Corpus members                                                                                                                                                                                                                                                                  | Representative                                      | Result                                                                                                                        |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| App-only                           | bartender, chatgpt, claude, cleanshot, codexbar, ghostty, grammarly-desktop, handbrake-app, jetbrains-toolbox, kimi, notion, opencode-desktop, plex-media-server, sketch, speechify-voice-ai, sublime-text, superwhisper, surge, tableplus, tor-browser, transmission, visualvm | hiddenbar (same app artifact mechanism; CI fixture) | PASS — disposable macOS CI differential, including installed app target                                                       |
-| Binary and generated completions   | 1password-cli, claude-code, codex, grok-build                                                                                                                                                                                                                                   | codex                                               | NOT VERIFIED — no disposable macOS runner was available locally; covered by receipt fixtures and must run in CI/corpus runner |
-| Pkg installer                      | cloudflare-warp, little-snitch, zoom                                                                                                                                                                                                                                            | zoom                                                | NOT VERIFIED — pkg install/forget mutates host package receipts; requires a disposable macOS VM                               |
-| Font                               | font-jetbrains-mono, font-jetbrains-mono-nerd-font                                                                                                                                                                                                                              | font-jetbrains-mono (CI fixture)                    | PASS — disposable macOS CI differential, including installed font targets                                                     |
-| Versioned token                    | zed@preview                                                                                                                                                                                                                                                                     | zed@preview                                         | NOT VERIFIED — vendor app install requires a disposable runner; opaque-token unit coverage passes                             |
-| Auto-updating app                  | 1password, google-chrome                                                                                                                                                                                                                                                        | google-chrome                                       | NOT VERIFIED — vendor app install requires a disposable runner; `auto_updates` no-op unit coverage passes                     |
-| Nested/wrapper app                 | vlc, yaak                                                                                                                                                                                                                                                                       | yaak                                                | NOT VERIFIED — regression needs a disposable runner with application install privileges                                       |
-| Privileged helper/system extension | little-snitch, orbstack                                                                                                                                                                                                                                                         | orbstack                                            | NOT VERIFIED — activation requires interactive user/system approval unavailable in headless disposable CI                     |
+## Verdict
 
-## Coverage accounting
+The previous PASS claims are withdrawn. `e2e/run_test` launched scripts through
+`env -i` without forwarding `CI`; both guarded oracle bodies returned success
+before executing fixtures. These zero-second jobs are links to false-green
+evidence, not parity proof:
 
-All 37 casks from the 2026-08-12 corpus snapshot appear above. Overlapping
-mechanisms intentionally appear in more than one class (`little-snitch`).
-The class representatives are the minimum non-redundant differential set;
-NOT VERIFIED is explicit where destructive or interactive machine state is
-required.
+- [macOS job 93970283233](https://github.com/jdx/mise/actions/runs/31549912509/job/93970283233)
+- [Linux job 93980178865](https://github.com/jdx/mise/actions/runs/31552852719/job/93980178865)
 
-## CI evidence
+All 37 cask names were present in the old table. That proves name accounting
+only. It does not prove equivalence-class coverage.
 
-- macOS app/font differential: [job 93970283233](https://github.com/jdx/mise/actions/runs/31549912509/job/93970283233) —
-  real fixture step completed successfully after exact fixture cleanup.
-- Linux formula differential: [job 93980178865](https://github.com/jdx/mise/actions/runs/31552852719/job/93980178865) —
-  dedicated disposable-host oracle completed successfully; normalized xz
-  snapshots were equal and lifecycle round-trips passed.
+## Classification defect
+
+The old table assigned mostly one label per cask. Current casks combine multiple
+artifact/lifecycle mechanisms. For example, Ghostty has an app, two manpages,
+and three completions; mise currently skips manpages. Hidden Bar therefore
+cannot prove Ghostty equivalence. Other corpus members require binary, pkg,
+postflight, quit, signal, script, launchctl, privileged helper, auto-update, or
+versioned-token behavior in combinations.
+
+Six of the eight old classes were explicitly NOT VERIFIED. The two PASS rows are
+now INVALIDATED because their job bodies did not run.
+
+## Replacement evidence
+
+Plan 018 must replace this file with a pinned cask-by-mechanism matrix. Multiple
+mechanisms per cask are required. Each supported mechanism and important
+combination needs a real disposable differential representative in both safe
+ownership directions. Unsafe/interactive or unimplemented behavior must be
+recorded UNSUPPORTED and fail closed before mutation.
+
+Required replacement fields:
+
+| Field | Requirement |
+| --- | --- |
+| Cask/token | All original 37 names |
+| Metadata identity | API/tap revision and payload digest |
+| Mechanisms | Boolean/details per artifact and lifecycle action |
+| Support | SUPPORTED or UNSUPPORTED with exact reason |
+| Representative | One or more tests covering combinations |
+| Evidence | Combined mise SHA, Homebrew SHA/version, job URL, completion marker, fixture count |
+| Result | Real structural/runtime comparison; no unit-only PASS |
+
+Until that replacement exists, corpus equivalence status is **NOT VERIFIED**.

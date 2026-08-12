@@ -1,5 +1,10 @@
 # Plan 008: Document the 1:1 Homebrew-compatible bootstrap
 
+> **2026-08-13 audit override — claims unsupported.** Full formula/cask
+> interoperability has not been proved on a combined head. Narrow public claims
+> immediately and restore only what plan 018 proves. Use plan 019; its branch,
+> disclosure, drift, and done criteria override this document.
+
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
@@ -13,6 +18,8 @@
 > mismatch.
 
 ## Status
+
+- **Current acceptance:** INVALIDATED; documentation overstates behavior
 
 - **Priority**: P2
 - **Effort**: S

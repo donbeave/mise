@@ -1,5 +1,11 @@
 # Plan 004: Write truthful formula receipts with the pinned producer version
 
+> **2026-08-13 audit override — acceptance invalidated.** Receipt shape is not
+> operational formula equivalence. Archive bottles fall into source-build facts,
+> source builds lack the required formula snapshot, and formula lifecycle is not
+> complete. Use plans 010–012, 017, and 018. Their branch, commit-trailer, drift,
+> and done criteria override this document.
+
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
@@ -16,6 +22,8 @@
 > mismatch STOP.
 
 ## Status
+
+- **Current acceptance:** INVALIDATED by the 2026-08-13 deep audit
 
 - **Priority**: P1
 - **Effort**: L
