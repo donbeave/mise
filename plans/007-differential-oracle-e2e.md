@@ -269,4 +269,6 @@ engine state, corpus class table.
 - **Options:** retain metadata-only comparison, normalize target differences,
   or snapshot labeled metadata plus target roots and run mise as `linuxbrew`.
 - **Choice:** compare all labeled roots byte-for-byte and use the prefix owner
-  for every Linux engine operation. No normalization was widened.
+  for every Linux engine operation. Disposable macOS CI clears only the exact
+  fixture state before running, so preinstalled fonts cannot silently skip the
+  oracle. No normalization was widened.
