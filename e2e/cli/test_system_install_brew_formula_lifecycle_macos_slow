@@ -151,6 +151,75 @@ assert_contains "mise bootstrap packages status" "installed"
 assert_formula_runtime
 snapshot_formula_chain mise-formula-chain.snapshot
 
+# Reproduce the old mise dependency state reached from the one configured root:
+# valid keg/receipt/opt, missing linked-keg, retained .bottle/etc, missing shared
+# etc, skipped post-install, and no lifecycle record. Status must find the
+# broken dependency offline and remain read-only. Top-level bootstrap then
+# repairs it without replacing unrelated topology.
+openssl_keg=$(readlink -f "$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3")
+assert_succeed "test -d '$openssl_keg/.bottle/etc/openssl@3'"
+openssl_lifecycle_state=$(grep -lF "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3" \
+  "$MISE_STATE_DIR"/brew-formula-lifecycle/*.json)
+[[ $(printf '%s\n' "$openssl_lifecycle_state" | grep -c .) == 1 ]] ||
+  brew_oracle_fail "expected exactly one OpenSSL lifecycle state record"
+openssl_keg_inode=$(stat -f '%i' "$openssl_keg")
+openssl_receipt_inode=$(stat -f '%i' "$openssl_keg/INSTALL_RECEIPT.json")
+openssl_opt_inode=$(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3")
+openssl_public_inode=$(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/bin/openssl")
+openssl_receipt_sha=$(shasum -a 256 "$openssl_keg/INSTALL_RECEIPT.json" | awk '{print $1}')
+rm "$MISE_SYSTEM_BREW_PREFIX/var/homebrew/linked/openssl@3"
+rm -rf "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3"
+rm "$openssl_lifecycle_state"
+legacy_status=$(mise bootstrap packages status 2>&1)
+printf '%s\n' "$legacy_status" >"$MISE_BREW_ORACLE_RESULT_DIR/legacy-status.txt"
+for expected in \
+  "dependency openssl@3" \
+  "linked-keg record" \
+  "lifecycle state absent" \
+  "shared lifecycle path missing"; do
+  grep -F "$expected" <<<"$legacy_status" >/dev/null ||
+    brew_oracle_fail "legacy status omitted: $expected"
+done
+[[ $(stat -f '%i' "$openssl_keg") == "$openssl_keg_inode" ]]
+[[ $(stat -f '%i' "$openssl_keg/INSTALL_RECEIPT.json") == "$openssl_receipt_inode" ]]
+[[ $(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3") == "$openssl_opt_inode" ]]
+[[ $(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/bin/openssl") == "$openssl_public_inode" ]]
+[[ $(shasum -a 256 "$openssl_keg/INSTALL_RECEIPT.json" | awk '{print $1}') == "$openssl_receipt_sha" ]]
+assert_fail "test -e '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3'"
+assert_fail "test -e '$MISE_SYSTEM_BREW_PREFIX/var/homebrew/linked/openssl@3'"
+
+mise bootstrap --yes
+[[ $(stat -f '%i' "$openssl_keg") == "$openssl_keg_inode" ]]
+[[ $(stat -f '%i' "$openssl_keg/INSTALL_RECEIPT.json") == "$openssl_receipt_inode" ]]
+[[ $(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3") == "$openssl_opt_inode" ]]
+[[ $(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/bin/openssl") == "$openssl_public_inode" ]]
+[[ $(shasum -a 256 "$openssl_keg/INSTALL_RECEIPT.json" | awk '{print $1}') == "$openssl_receipt_sha" ]]
+assert_formula_runtime
+
+# The same legacy repair is not guessed when its authoritative formula source
+# no longer matches. Apply must fail before touching the valid receipt/shared
+# state and name the exact reinstall requirement.
+openssl_lifecycle_state=$(grep -lF "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3" \
+  "$MISE_STATE_DIR"/brew-formula-lifecycle/*.json)
+[[ $(printf '%s\n' "$openssl_lifecycle_state" | grep -c .) == 1 ]] ||
+  brew_oracle_fail "expected exactly one repaired OpenSSL lifecycle state record"
+cp -p "$openssl_lifecycle_state" "$MISE_BREW_ORACLE_RESULT_DIR/openssl-lifecycle-state.json"
+cp -p "$openssl_keg/.brew/openssl@3.rb" "$MISE_BREW_ORACLE_RESULT_DIR/openssl@3.rb"
+rm "$openssl_lifecycle_state"
+printf '\n# ambiguous legacy source\n' >>"$openssl_keg/.brew/openssl@3.rb"
+ambiguous_shared_sha=$(shasum -a 256 "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/openssl.cnf" | awk '{print $1}')
+if mise bootstrap --yes >"$MISE_BREW_ORACLE_RESULT_DIR/legacy-ambiguous.txt" 2>&1; then
+  brew_oracle_fail "ambiguous legacy formula source was repaired"
+fi
+grep -F "requires reinstall: formula snapshot checksum does not match" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/legacy-ambiguous.txt" >/dev/null ||
+  brew_oracle_fail "ambiguous legacy failure omitted exact reinstall requirement"
+[[ $(shasum -a 256 "$openssl_keg/INSTALL_RECEIPT.json" | awk '{print $1}') == "$openssl_receipt_sha" ]]
+[[ $(shasum -a 256 "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/openssl.cnf" | awk '{print $1}') == "$ambiguous_shared_sha" ]]
+cp -p "$MISE_BREW_ORACLE_RESULT_DIR/openssl@3.rb" "$openssl_keg/.brew/openssl@3.rb"
+cp -p "$MISE_BREW_ORACLE_RESULT_DIR/openssl-lifecycle-state.json" "$openssl_lifecycle_state"
+assert_contains "mise bootstrap packages status" "installed"
+
 # Exact Homebrew accepts mise-owned state for every user-visible operation.
 for formula in "${formula_fixtures[@]}"; do
   assert_contains "'$brew' list --formula" "$formula"
@@ -165,13 +234,6 @@ if grep -E '(ca-certificates|openssl@3|node|kimi-code)' \
   brew_oracle_fail "Homebrew doctor rejected a mise-owned formula fixture"
 fi
 assert_formula_runtime
-
-# Legacy mise state had a valid keg and opt record but omitted shared config.
-rm "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem"
-assert_contains "mise bootstrap packages status" "needs repair"
-mise bootstrap --yes
-assert_succeed "test -L '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'"
-assert_contains "mise bootstrap packages status" "installed"
 
 # Exact Homebrew can remove the mise-owned chain, then mise accepts the same
 # chain installed by Homebrew without rewriting it.
