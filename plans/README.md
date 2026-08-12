@@ -82,7 +82,7 @@ Corrective plans:
 | 015  | Implement mixed cask artifacts and platform-correct config   | P0       | M      | 013, 014           | IN PROGRESS |
 | 016  | Coordinate cask mutations with Homebrew locks                | P1       | M      | 013                | IN PROGRESS |
 | 017  | Build one semantically integrated stack                      | P0       | M      | 012, 014, 015, 016 | DONE        |
-| 018  | Prove operational parity with real differential oracles      | P0       | L      | 017                | TODO        |
+| 018  | Prove operational parity with real differential oracles      | P0       | L      | 017                | IN PROGRESS |
 | 019  | Reconcile claims, review state, and final merge gate         | P0       | S      | 018                | TODO        |
 
 Independent formula and cask work may proceed in parallel after plan 009.
