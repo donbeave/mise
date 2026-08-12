@@ -313,3 +313,17 @@ engine state, corpus class table.
   retrigger the unchanged suite after quota reset.
 - **Choice:** retrigger unchanged. Test weakening or production changes would
   hide external failures and do not improve Homebrew fidelity.
+
+## Blocker resolution — 2026-08-12 macOS tool download timeout
+
+- **Condition:** current-head macOS CI stopped during tool bootstrap before
+  unit tests or the differential oracle because the Bun release archive did
+  not download within the fixed 30-second HTTP timeout.
+- **Evidence:** run `31558512480`, job `93995821842`, failed while fetching
+  `bun-darwin-aarch64.zip`; nightly and Ubuntu builds passed on the identical
+  head, and prior disposable macOS job `93970283233` passed the oracle.
+- **Options:** weaken the oracle, change the repository-wide HTTP timeout, or
+  retrigger the unchanged branch on a fresh disposable runner.
+- **Choice:** retrigger unchanged. The failure occurred before project tests;
+  changing timeout policy is outside this plan, while weakening coverage would
+  violate the differential-oracle invariant.
