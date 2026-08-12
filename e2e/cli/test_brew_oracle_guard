@@ -36,7 +36,7 @@ fi
 if brew_oracle_verify_marker \
   "$result_dir/missing.completed" missing 1 /opt/homebrew "$MISE_BREW_ORACLE_MISE_SHA" \
   6.0.17 1111111111111111111111111111111111111111 \
-  5.1.4 2222222222222222222222222222222222222222; then
+  6.0.17 1111111111111111111111111111111111111111; then
   fail "missing completion marker was accepted"
 fi
 if brew_oracle_verify_marker \
@@ -122,7 +122,7 @@ if brew_oracle_require_disposable incomplete-runtime-identity /opt/homebrew; the
 fi
 
 MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE=6.0.16
-MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA=$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA
-if brew_oracle_require_disposable mismatched-runtime /opt/homebrew; then
-  fail "Homebrew runtime differing from the pinned reference was accepted"
+MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA=2222222222222222222222222222222222222222
+if brew_oracle_require_disposable unpinned-runtime /opt/homebrew; then
+  fail "unpinned Homebrew runtime identity was accepted"
 fi

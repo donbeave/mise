@@ -272,7 +272,7 @@ jobs:
           result_dir="$RUNNER_TEMP/mise-brew-oracle-results"
           brew_oracle_verify_marker \
             "$result_dir/macos-cask.completed" \
-            test_system_install_brew_macos_slow 1 /opt/homebrew \
+            test_system_install_brew_macos_slow 3 /opt/homebrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
@@ -280,7 +280,7 @@ jobs:
             "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA"
           brew_oracle_verify_marker \
             "$result_dir/macos-formula-lifecycle.completed" \
-            test_system_install_brew_formula_lifecycle_macos_slow 4 /opt/homebrew \
+            test_system_install_brew_formula_lifecycle_macos_slow 5 /opt/homebrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
@@ -299,8 +299,6 @@ jobs:
     env:
       MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE: "6.0.17"
       MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA: 4dacfe77a24dead72de749c0876028b77b99cd04
-      MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE: not-installed
-      MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA: not-installed
     needs: [classify-changes]
     if: always() && needs.classify-changes.outputs.full-ci == 'true'
     steps:
@@ -335,8 +333,10 @@ jobs:
             echo "platform=$(uname -s)-$(uname -m)"
             echo "homebrew_reference_version=$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE"
             echo "homebrew_reference_sha=$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA"
-            echo "homebrew_runtime_version=$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE"
-            echo "homebrew_runtime_sha=$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA"
+            echo "linux_formula_runtime_version=$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE"
+            echo "linux_formula_runtime_sha=$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA"
+            echo "linux_source_runtime_version=not-installed"
+            echo "linux_source_runtime_sha=not-installed"
             echo "tests=test_system_install_brew_linux,test_system_install_brew_source_slow"
           } > "$RUNNER_TEMP/mise-brew-oracle-results/job-context.txt"
       - name: Run Linux formula oracle
@@ -346,6 +346,8 @@ jobs:
           MISE_BREW_ORACLE_RUNNER_TEMP: ${{ runner.temp }}
           MISE_BREW_ORACLE_MISE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MISE_BREW_ORACLE_UNFORWARDED: must-not-leak
+          MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE: ${{ env.MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE }}
+          MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA: ${{ env.MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA }}
           MISE_DISABLE_TOOLS: "1"
           MISE_AUTO_INSTALL: "false"
         run: |
@@ -371,6 +373,8 @@ jobs:
           MISE_BREW_ORACLE_MISE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MISE_BREW_ORACLE_SOURCE_PREFIX: /tmp/mise-brew-source-prefix
           MISE_BREW_ORACLE_UNFORWARDED: must-not-leak
+          MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE: not-installed
+          MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA: not-installed
           MISE_DISABLE_TOOLS: "1"
           MISE_AUTO_INSTALL: "false"
         run: |
@@ -397,20 +401,20 @@ jobs:
           source e2e/cli/brew_oracle_guard.sh
           brew_oracle_verify_marker \
             "$RUNNER_TEMP/mise-brew-oracle-results/linux-formula.completed" \
-            test_system_install_brew_linux 1 /home/linuxbrew/.linuxbrew \
+            test_system_install_brew_linux 2 /home/linuxbrew/.linuxbrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
-            "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE" \
-            "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA"
+            "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
+            "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA"
           brew_oracle_verify_marker \
             "$RUNNER_TEMP/mise-brew-oracle-results/linux-source.completed" \
             test_system_install_brew_source_slow 1 /tmp/mise-brew-source-prefix \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
-            "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_RELEASE" \
-            "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA"
+            not-installed \
+            not-installed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:

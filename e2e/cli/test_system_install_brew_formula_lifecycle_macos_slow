@@ -7,6 +7,8 @@ fi
 
 # shellcheck source=e2e/cli/brew_oracle_guard.sh
 source "${BASH_SOURCE[0]%/*}/brew_oracle_guard.sh"
+# shellcheck source=e2e/cli/brew_oracle.sh
+source "${BASH_SOURCE[0]%/*}/brew_oracle.sh"
 export MISE_SYSTEM_BREW_PREFIX="${MISE_BREW_LIFECYCLE_TEST_PREFIX:-}"
 brew_oracle_require_disposable macos-formula-lifecycle /opt/homebrew
 [[ $MISE_SYSTEM_BREW_PREFIX == "$BREW_ORACLE_EXPECTED_PREFIX" ]] ||
@@ -15,22 +17,39 @@ brew_oracle_configure_runtime "$MISE_SYSTEM_BREW_PREFIX"
 brew=$BREW_ORACLE_BREW
 
 formula_fixtures=(ca-certificates openssl@3 node kimi-code)
+unsupported_current_formula=postgresql@17
 shared_fixture_paths=(
   "$MISE_SYSTEM_BREW_PREFIX/etc/ca-certificates"
   "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3"
 )
+postgresql_var="$MISE_SYSTEM_BREW_PREFIX/var/postgresql@17"
 preexisting_record="$MISE_BREW_ORACLE_RESULT_DIR/macos-formula-lifecycle.preexisting"
+
+brew_oracle_record_api_fixture formula ca-certificates 2026-07-16 \
+  ddcd496674ccb5dd4a91b9914a8034f259ceca391db74d686ef8d7dab0c769fe
+brew_oracle_record_api_fixture formula openssl@3 3.6.3 \
+  6bffa3965e201f85e36892b2743ff76e6096ac7c0a9ed178355c00e4e8bbdf9e
+brew_oracle_record_api_fixture formula node 26.7.0 \
+  57bdcc6d9125310665cb651d71fd12de69291a646aeb0f6c2b35198a339e0309
+brew_oracle_record_api_fixture formula kimi-code 0.34.0 \
+  535182eb5a718667f32ae1a146416d6aac57960e9925b65f2dc6902c95dc2b28
+brew_oracle_record_api_fixture formula postgresql@17 17.10 \
+  e2e8c16d4323ddacc83e7a3479570076f472e0ef5082e9305e4576058c2d6efe
 
 {
   printf 'prefix=%s\n' "$("$brew" --prefix)"
   for formula in "${formula_fixtures[@]}"; do
     "$brew" list --versions "$formula" 2>/dev/null || true
   done
+  "$brew" list --versions "$unsupported_current_formula" 2>/dev/null || true
   for path in "${shared_fixture_paths[@]}"; do
     if [[ -e $path || -L $path ]]; then
       ls -ld "$path"
     fi
   done
+  if [[ -e $postgresql_var || -L $postgresql_var ]]; then
+    ls -ld "$postgresql_var"
+  fi
 } >"$preexisting_record"
 
 cleanup_formula_fixtures() {
@@ -41,9 +60,17 @@ cleanup_formula_fixtures() {
     # merely because another preloaded runner formula refers to it.
     "$brew" uninstall --formula --force --ignore-dependencies "$formula" >/dev/null 2>&1 || true
   done
+  "$brew" uninstall --formula --force --ignore-dependencies \
+    "$unsupported_current_formula" >/dev/null 2>&1 || true
   for path in "${shared_fixture_paths[@]}"; do
     rm -rf "$path"
   done
+  rm -rf "$postgresql_var"
+}
+
+cleanup_formula_oracle() {
+  cleanup_formula_fixtures
+  brew_oracle_remove_runtime_bridge
 }
 
 cleanup_formula_oracle() {
@@ -65,6 +92,46 @@ for formula in "${formula_fixtures[@]}"; do
     brew_oracle_fail "stale linked-keg record remains for $formula"
 done
 
+# An already-current formula whose API uses unsupported lifecycle operations is
+# outside the mutation set and cannot block an unrelated Kimi installation.
+"$brew" install "$unsupported_current_formula"
+cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew:$unsupported_current_formula" = "latest"
+"brew:kimi-code" = "latest"
+EOF
+mise bootstrap packages apply --yes
+assert_contains "mise bootstrap packages status" "installed"
+assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/bin/kimi'"
+cleanup_formula_fixtures
+
+snapshot_formula_chain() {
+  local output=$1 formula keg
+  local roots=()
+  for formula in "${formula_fixtures[@]}"; do
+    keg=$(readlink -f "$MISE_SYSTEM_BREW_PREFIX/opt/$formula")
+    roots+=("formula-$formula=$keg")
+  done
+  roots+=(
+    "shared-ca=$MISE_SYSTEM_BREW_PREFIX/etc/ca-certificates"
+    "shared-openssl=$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3"
+  )
+  brew_oracle_snapshot "$output" "${roots[@]}"
+}
+
+assert_formula_runtime() {
+  assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/ca-certificates/cert.pem'"
+  assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/openssl.cnf'"
+  assert_succeed "test -L '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'"
+  assert_contains "readlink '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'" "ca-certificates/cert.pem"
+  assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node'"
+  assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/bin/kimi'"
+  assert_fail "test -n \"${SSL_CERT_FILE:-}${NODE_EXTRA_CA_CERTS:-}${NODE_OPTIONS:-}\""
+  assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3/bin/openssl' s_client -verify_return_error -connect auth.kimi.com:443 -servername auth.kimi.com </dev/null"
+  assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node' -e 'fetch(\"https://auth.kimi.com/api/oauth/device_authorization\").then(r => { if (r.status !== 405) process.exit(1) })'"
+  assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/bin/kimi' --version"
+}
+
 cat <<'EOF' >mise.toml
 [bootstrap.packages]
 "brew:kimi-code" = "latest"
@@ -72,19 +139,23 @@ EOF
 
 mise bootstrap --yes
 assert_contains "mise bootstrap packages status" "installed"
-assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/ca-certificates/cert.pem'"
-assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/openssl.cnf'"
-assert_succeed "test -L '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'"
-assert_contains "readlink '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'" "ca-certificates/cert.pem"
-assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node'"
-assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/bin/kimi'"
-assert_fail "test -n \"${SSL_CERT_FILE:-}${NODE_EXTRA_CA_CERTS:-}${NODE_OPTIONS:-}\""
-assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3/bin/openssl' s_client -verify_return_error -connect auth.kimi.com:443 -servername auth.kimi.com </dev/null"
-if [[ $MISE_SYSTEM_BREW_PREFIX == "/opt/homebrew" ]]; then
-  # Bottled Node embeds Homebrew's canonical OpenSSL directory. Exercise its
-  # unmodified default CA mode only on a disposable canonical-prefix runner.
-  assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node' -e 'fetch(\"https://auth.kimi.com/api/oauth/device_authorization\").then(r => { if (r.status !== 405) process.exit(1) })'"
+assert_formula_runtime
+snapshot_formula_chain mise-formula-chain.snapshot
+
+# Exact Homebrew accepts mise-owned state for every user-visible operation.
+for formula in "${formula_fixtures[@]}"; do
+  assert_contains "'$brew' list --formula" "$formula"
+  assert_succeed "'$brew' info '$formula'"
+done
+"$brew" postinstall ca-certificates
+"$brew" postinstall openssl@3
+"$brew" upgrade "${formula_fixtures[@]}"
+"$brew" doctor >"$MISE_BREW_ORACLE_RESULT_DIR/macos-formula-doctor.txt" 2>&1 || true
+if grep -E '(ca-certificates|openssl@3|node|kimi-code)' \
+  "$MISE_BREW_ORACLE_RESULT_DIR/macos-formula-doctor.txt"; then
+  brew_oracle_fail "Homebrew doctor rejected a mise-owned formula fixture"
 fi
+assert_formula_runtime
 
 # Legacy mise state had a valid keg and opt record but omitted shared config.
 rm "$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem"
@@ -93,4 +164,22 @@ mise bootstrap --yes
 assert_succeed "test -L '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'"
 assert_contains "mise bootstrap packages status" "installed"
 
-brew_oracle_complete test_system_install_brew_formula_lifecycle_macos_slow 4 "$MISE_SYSTEM_BREW_PREFIX"
+# Exact Homebrew can remove the mise-owned chain, then mise accepts the same
+# chain installed by Homebrew without rewriting it.
+for formula in kimi-code node openssl@3 ca-certificates; do
+  "$brew" uninstall --formula --force --ignore-dependencies "$formula"
+done
+for formula in "${formula_fixtures[@]}"; do
+  assert_fail "test -e '$MISE_SYSTEM_BREW_PREFIX/opt/$formula'"
+done
+for path in "${shared_fixture_paths[@]}"; do
+  rm -rf "$path"
+done
+"$brew" install kimi-code
+snapshot_formula_chain brew-formula-chain.snapshot
+brew_oracle_diff brew-formula-chain.snapshot mise-formula-chain.snapshot
+assert_contains "mise bootstrap packages status" "installed"
+assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
+assert_formula_runtime
+
+brew_oracle_complete test_system_install_brew_formula_lifecycle_macos_slow 5 "$MISE_SYSTEM_BREW_PREFIX"

@@ -1,10 +1,23 @@
 # Plan 018: Prove operational parity with real Homebrew
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P0
 Effort: L
 Planned against: combined SHA produced by plan 017
 Depends on: 017
+
+Execution start (2026-08-13):
+
+- exact combined starting SHA: `ca03fc901f49c9d8a264672c77d5dce4e66af156`;
+- exact prerequisite #11915 SHA:
+  `a5046918a091a421289405a9ac380717e3145ffb`;
+- official `6.0.17` tag revalidated with
+  `rtk git ls-remote https://github.com/Homebrew/brew.git refs/tags/6.0.17`:
+  `4dacfe77a24dead72de749c0876028b77b99cd04`;
+- drift found before mutation: the macOS job used the runner's unpinned Homebrew
+  checkout, while the Linux marker claimed `not-installed` after installing and
+  executing a live Homebrew checkout. Neither runtime identity is valid plan
+  018 proof.
 
 ## Objective
 

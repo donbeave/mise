@@ -97,3 +97,39 @@ brew_oracle_diff() {
     return 1
   fi
 }
+
+brew_oracle_record_api_fixture() {
+  local kind=$1 token=$2 expected_version=$3 expected_sha=$4
+  local result_dir=${MISE_BREW_ORACLE_RESULT_DIR:-}
+  local version_filter url safe_token raw canonical actual_version actual_sha
+
+  [[ $kind == formula || $kind == cask ]] || return 1
+  [[ $token =~ ^[a-z0-9@+._-]+$ ]] || return 1
+  [[ $expected_sha =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ -d $result_dir && ! -L $result_dir ]] || return 1
+  safe_token=${token//@/_at_}
+  raw="$result_dir/api-$kind-$safe_token.raw.json"
+  canonical="$result_dir/api-$kind-$safe_token.json"
+  [[ ! -e $raw && ! -L $raw && ! -e $canonical && ! -L $canonical ]] || return 1
+  url="https://formulae.brew.sh/api/$kind/$token.json"
+  curl --retry 3 --retry-delay 1 --max-time 60 -fsSL "$url" -o "$raw"
+  if [[ $kind == formula ]]; then
+    version_filter=.versions.stable
+  else
+    version_filter=.version
+  fi
+  actual_version=$(jq -er "$version_filter" "$raw")
+  [[ $actual_version == "$expected_version" ]] || {
+    echo "brew oracle fixture drift: $kind:$token version $actual_version != $expected_version" >&2
+    return 1
+  }
+  jq -S 'del(.analytics, .generated_date)' "$raw" >"$canonical"
+  actual_sha=$(shasum -a 256 "$canonical" | awk '{print $1}')
+  [[ $actual_sha == "$expected_sha" ]] || {
+    echo "brew oracle fixture drift: $kind:$token digest $actual_sha != $expected_sha" >&2
+    return 1
+  }
+  printf '%s:%s version=%s sha256=%s\n' \
+    "$kind" "$token" "$actual_version" "$actual_sha" \
+    >>"$result_dir/api-fixtures.txt"
+}

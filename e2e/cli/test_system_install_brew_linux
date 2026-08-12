@@ -84,7 +84,19 @@ printf '%s  %s\n' "$installer_sha256" /home/linuxbrew/install-homebrew.sh | shas
 chown linuxbrew:linuxbrew /home/linuxbrew/install-homebrew.sh
 runuser -u linuxbrew -- env NONINTERACTIVE=1 CI=1 \
   bash /home/linuxbrew/install-homebrew.sh
-brew=/home/linuxbrew/.linuxbrew/bin/brew
+homebrew_repository=/home/linuxbrew/.linuxbrew/Homebrew
+runuser -u linuxbrew -- git -C "$homebrew_repository" fetch --force --depth=1 origin \
+  "refs/tags/$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE:refs/tags/$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE"
+runuser -u linuxbrew -- git -C "$homebrew_repository" checkout --detach \
+  "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE"
+export MISE_BREW_ORACLE_BREW_SOURCE="$homebrew_repository/bin/brew"
+export MISE_BREW_ORACLE_HOMEBREW_REPOSITORY=$homebrew_repository
+brew_oracle_configure_runtime /home/linuxbrew/.linuxbrew
+brew=$BREW_ORACLE_BREW
+brew_oracle_record_api_fixture formula xz 5.8.3 \
+  22abb2f075ef25b74f47cebe60ffbe9a347f8f4ce2ea3a9a1f6393da43938ba6
+brew_oracle_record_api_fixture formula hello 2.12.3 \
+  d7f449add984301433a7d8d4175550c67eedea5723a8971cffd290914f59ba35
 mise_bin=$(command -v mise)
 mise_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache '$mise_bin'"
 
@@ -160,4 +172,42 @@ runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
 assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
 
-brew_oracle_complete test_system_install_brew_linux 1 /home/linuxbrew/.linuxbrew
+# Forced-source ownership in both directions. Each engine must accept, execute,
+# and remove the other's source-built keg without inventing bottle provenance.
+cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew:hello" = "latest"
+EOF
+runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
+  MISE_SYSTEM_BREW_FORCE_SOURCE=hello \
+  MISE_URL_REPLACEMENTS='{"https://ftpmirror.gnu.org/gnu":"https://ftp.gnu.org/gnu"}' \
+  "$mise_bin" bootstrap packages apply --yes
+mise_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
+assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "hello"
+assert_succeed "runuser -u linuxbrew -- '$brew' info hello"
+assert_contains "runuser -u linuxbrew -- '$mise_hello_keg/bin/hello' --greeting=mise-source" "mise-source"
+assert_contains "cat '$mise_hello_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": false'
+assert_succeed "test -s '$mise_hello_keg/.brew/hello.rb'"
+cp "$mise_hello_keg/INSTALL_RECEIPT.json" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json"
+cp "$mise_hello_keg/.brew/hello.rb" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-formula.rb"
+runuser -u linuxbrew -- "$brew" uninstall --formula hello --yes
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
+
+runuser -u linuxbrew -- env HOMEBREW_NO_AUTO_UPDATE=1 \
+  "$brew" install --build-from-source hello
+brew_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
+assert_contains "$mise_as_linuxbrew bootstrap packages status" "installed"
+assert_contains "$mise_as_linuxbrew bootstrap packages apply --yes 2>&1" "already"
+assert_contains "runuser -u linuxbrew -- '$brew_hello_keg/bin/hello' --greeting=brew-source" "brew-source"
+assert_contains "cat '$brew_hello_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": false'
+assert_succeed "test -s '$brew_hello_keg/.brew/hello.rb'"
+cp "$brew_hello_keg/INSTALL_RECEIPT.json" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-receipt.json"
+cp "$brew_hello_keg/.brew/hello.rb" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-formula.rb"
+runuser -u linuxbrew -- "$brew" uninstall --formula hello --yes
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
+
+brew_oracle_complete test_system_install_brew_linux 2 /home/linuxbrew/.linuxbrew
