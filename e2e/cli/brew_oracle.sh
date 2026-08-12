@@ -27,15 +27,24 @@ brew_oracle_normalize_json() {
     ' "$input" >"$output"
   elif [[ $input == */sbom.spdx.json ]]; then
     jq -e '
-      .creationInfo | type == "object" and has("created") and has("creators")
+      .creationInfo |
+      type == "object" and has("created") and
+      (.creators | type == "array" and length == 1 and
+        (.[0] | type == "string" and
+          startswith("Tool: https://github.com/Homebrew/brew@")))
     ' "$input" >/dev/null
     jq -S '
       .creationInfo.created = "<NORMALIZED>" |
-      .creationInfo.creators = ["<NORMALIZED>"]
+      .creationInfo.creators[0] = "<NORMALIZED>"
     ' "$input" >"$output"
   else
     jq -S . "$input" >"$output"
   fi
+}
+
+brew_oracle_normalize_path() {
+  # Homebrew assigns cask metadata a wall-clock installation directory.
+  sed -E 's#(/\.metadata/[^/]+)/[0-9]{14}\.[0-9]{3}/#\1/<TIMESTAMP>/#'
 }
 
 brew_oracle_snapshot() {
@@ -57,7 +66,7 @@ brew_oracle_snapshot() {
       else
         relative=${path#"$root"/}
       fi
-      relative=$(printf '%s/%s' "$label" "$relative" | sed -E 's#/[0-9]{14}\.[0-9]{3}/#/<TIMESTAMP>/#g')
+      relative=$(printf '%s/%s' "$label" "$relative" | brew_oracle_normalize_path)
       mode=$(brew_oracle_mode "$path")
       if [[ -L $path ]]; then
         target=$(readlink "$path")
