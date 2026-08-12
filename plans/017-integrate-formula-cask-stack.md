@@ -1,10 +1,20 @@
 # Plan 017: Build one semantically integrated formula/cask stack
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P0
 Effort: M
 Planned against: #11910 `05ccd7ab8`, #11915 `b94b6b1c1`
 Depends on: 012, 014, 015, 016
+
+Integration start (2026-08-13):
+
+- prerequisite #11915 head: `df067e021b178d65a194a2b9c9b19de45144b669`
+- pre-stack #11910 head: `09d4509c04ff54cfc01ee5f08e26382e5699552c`
+- shared merge base: `1c7db9f92c80f94bcca31345640483e176e82f4e`
+- formula local gates: lifecycle 15 passed, brew 204 passed; exact-head macOS
+  and Linux oracles passed at prior proof head `84d74314f` before the added
+  source-build marker gate.
+- cask local gates: cask 169 passed, brew 226 passed, Clippy zero errors.
 
 ## Objective
 
