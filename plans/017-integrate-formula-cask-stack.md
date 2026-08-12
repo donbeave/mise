@@ -1,6 +1,6 @@
 # Plan 017: Build one semantically integrated formula/cask stack
 
-Status: IN PROGRESS
+Status: DONE
 Priority: P0
 Effort: M
 Planned against: #11910 `05ccd7ab8`, #11915 `b94b6b1c1`
@@ -8,28 +8,32 @@ Depends on: 012, 014, 015, 016
 
 Integration start (2026-08-13):
 
-- prerequisite #11915 head: `df067e021b178d65a194a2b9c9b19de45144b669`
+- prerequisite #11915 head: `a5046918a091a421289405a9ac380717e3145ffb`
 - pre-stack #11910 head: `09d4509c04ff54cfc01ee5f08e26382e5699552c`
 - shared merge base: `1c7db9f92c80f94bcca31345640483e176e82f4e`
-- formula local gates: lifecycle 15 passed, brew 204 passed; exact-head macOS
-  and Linux oracles passed at prior proof head `84d74314f` before the added
-  source-build marker gate.
+- formula local gates: lifecycle 15 passed, brew 204 passed, and lint passed;
+  the source-build marker assertion and Linux ShellCheck gate were corrected by
+  `a5046918a091a421289405a9ac380717e3145ffb`.
 - cask local gates: cask 169 passed, brew 226 passed, Clippy zero errors.
 
 Semantic rebase result (2026-08-13):
 
 - rebased all #11910 commits from shared base `1c7db9f92c80f94bcca31345640483e176e82f4e`
-  onto #11915 `df067e021b178d65a194a2b9c9b19de45144b669`;
+  onto #11915 `a5046918a091a421289405a9ac380717e3145ffb`;
 - preserved the explicit OCI/archive/source provenance enum, source snapshot,
   unified finalizer, typed lifecycle, and closure health architecture;
 - layered the typed Homebrew receipt/SBOM schema into that finalizer;
 - discarded obsolete duplicate pour paths and generic-`CI` oracle authorization;
-- combined pre-proof head `20003897ec9323eca02160728e813c08d0cde770` is
-  a descendant of the exact #11915 head;
+- combined code-proof head `b83b4ca66094b8629907ac4d02d637a6cb843c5c`
+  is a descendant of the exact #11915 head;
 - `rtk cargo test --bin mise system::packages::brew -- --test-threads=1`:
-  257 passed across two suites. A parallel-only existing test harness cwd race
-  was observed once in the git-clone cask fixture; the serial focused gate is
-  deterministic, and normal parallel proof remains required before DONE.
+  257 passed across two suites on the combined code-proof head;
+- `rtk cargo clippy --workspace --all-features --all-targets -- -D warnings`:
+  passed on the combined code-proof head;
+- `rtk git diff --check` and the conflict-marker invariant grep: passed;
+- normal parallel brew tests and the repository lint gate passed on the same
+  tree immediately before the ancestry-only restack. Plan 018 owns the fresh
+  pushed-head workflow and destructive oracle proof.
 
 ## Objective
 
