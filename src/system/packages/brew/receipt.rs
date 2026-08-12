@@ -390,6 +390,34 @@ mod tests {
     }
 
     #[test]
+    fn built_on_absent_probe_values_serialize_as_null() {
+        let value = serde_json::to_value(BuiltOn {
+            os: "Linux".to_string(),
+            os_version: "test".to_string(),
+            cpu_family: "test".to_string(),
+            xcode: None,
+            clt: None,
+            preferred_perl: None,
+            extra: Map::new(),
+        })
+        .unwrap();
+
+        assert!(value["xcode"].is_null());
+        assert!(value["clt"].is_null());
+        assert!(value["preferred_perl"].is_null());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn unsupported_platform_fails_closed() {
+        assert!(matches!(
+            native_build_system_info(),
+            Err(ReceiptError::MissingFact(message))
+                if message.contains("unsupported")
+        ));
+    }
+
+    #[test]
     fn metadata_timestamp_order_does_not_order_versions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".metadata/nightly");
