@@ -67,6 +67,10 @@ done
 } >"$MISE_BREW_ORACLE_RESULT_DIR/linux-home.preexisting"
 
 cleanup_linuxbrew_home() {
+  if [[ -n ${archive_server_pid:-} ]]; then
+    kill "$archive_server_pid" 2>/dev/null || true
+    wait "$archive_server_pid" 2>/dev/null || true
+  fi
   userdel linuxbrew 2>/dev/null || true
   rm -rf /home/linuxbrew
   if [[ $linuxbrew_home_existed == 1 ]]; then
@@ -109,8 +113,8 @@ chown linuxbrew:linuxbrew "$PWD" mise.toml
 # Real Homebrew baseline in disposable state.
 runuser -u linuxbrew -- "$brew" install --formula xz --yes
 brew_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
-brew_oracle_snapshot brew-xz.snapshot "keg=$brew_keg"
-runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/brew-xz.snapshot" "keg=$brew_keg"
+runuser -u linuxbrew -- "$brew" uninstall --formula xz
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
 assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
 
@@ -119,21 +123,27 @@ assert_contains "$mise_as_linuxbrew bootstrap packages status" "missing"
 runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
   "$mise_bin" bootstrap packages apply --yes
 mise_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
-brew_oracle_snapshot mise-xz.snapshot "keg=$mise_keg"
-brew_oracle_diff brew-xz.snapshot mise-xz.snapshot
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-xz.snapshot" "keg=$mise_keg"
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/brew-xz.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/mise-xz.snapshot"
 assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "xz"
 assert_succeed "runuser -u linuxbrew -- '$brew' info xz"
-runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
+runuser -u linuxbrew -- "$brew" uninstall --formula xz
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
 
 # Brew-installed state is an engine no-op and remains byte-identical.
 runuser -u linuxbrew -- "$brew" install --formula xz --yes
-brew_oracle_snapshot before-noop.snapshot "keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)"
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/before-xz-noop.snapshot" \
+  "keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)"
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "installed"
 assert_contains "$mise_as_linuxbrew bootstrap packages apply --yes 2>&1" "already"
-brew_oracle_snapshot after-noop.snapshot "keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)"
-brew_oracle_diff before-noop.snapshot after-noop.snapshot
-runuser -u linuxbrew -- "$brew" uninstall --formula xz --yes
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/after-xz-noop.snapshot" \
+  "keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)"
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/before-xz-noop.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/after-xz-noop.snapshot"
+runuser -u linuxbrew -- "$brew" uninstall --formula xz
 
 # Keep repair/import/prune coverage on engine-installed state.
 runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
@@ -192,7 +202,7 @@ cp "$mise_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json"
 cp "$mise_hello_keg/.brew/hello.rb" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-formula.rb"
-runuser -u linuxbrew -- "$brew" uninstall --formula hello --yes
+runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
 
 runuser -u linuxbrew -- env HOMEBREW_NO_AUTO_UPDATE=1 \
@@ -207,7 +217,194 @@ cp "$brew_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-receipt.json"
 cp "$brew_hello_keg/.brew/hello.rb" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-formula.rb"
-runuser -u linuxbrew -- "$brew" uninstall --formula hello --yes
+runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
 
-brew_oracle_complete test_system_install_brew_linux 2 /home/linuxbrew/.linuxbrew
+# A local checksum-pinned third-party tap supplies a real non-OCI bottle. Both
+# engines consume the same embedded receipt/SBOM, and a failing cc shim proves
+# pouring never fabricates source-build facts.
+archive_root="$TMPDIR/archive-bottle-oracle"
+archive_payload="$archive_root/payload/archive-fixture/1.0.0"
+archive_tap="$homebrew_repository/Library/Taps/mise/homebrew-oracle"
+archive_name=archive-fixture--1.0.0.x86_64_linux.bottle.tar.gz
+mkdir -p "$archive_payload/bin" "$archive_payload/.brew" "$archive_tap/Formula"
+cat <<'EOF' >"$archive_payload/bin/archive-fixture"
+#!/usr/bin/env bash
+printf 'archive-fixture 1.0.0\n'
+EOF
+chmod 0755 "$archive_payload/bin/archive-fixture"
+cat <<'EOF' >"$archive_payload/.brew/archive-fixture.rb"
+class ArchiveFixture < Formula
+  desc "mise archive bottle oracle"
+  homepage "https://mise.jdx.dev"
+  url "https://example.invalid/archive-fixture-1.0.0.tar.gz"
+  version "1.0.0"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+
+  def install
+    bin.install "archive-fixture"
+  end
+end
+EOF
+cat <<'EOF' >"$archive_payload/INSTALL_RECEIPT.json"
+{
+  "homebrew_version": "6.0.17",
+  "source_modified_time": 0,
+  "compiler": "gcc-13",
+  "poured_from_bottle": true,
+  "runtime_dependencies": [],
+  "built_on": {
+    "os": "Linux",
+    "os_version": "Ubuntu 24.04",
+    "cpu_family": "x86_64",
+    "xcode": null,
+    "clt": null,
+    "preferred_perl": null
+  },
+  "source": {"versions": {"stable": "1.0.0"}}
+}
+EOF
+cat <<'EOF' >"$archive_payload/sbom.spdx.json"
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "archive-fixture-1.0.0",
+  "documentNamespace": "https://mise.jdx.dev/oracle/archive-fixture-1.0.0",
+  "creationInfo": {
+    "created": "2026-08-13T00:00:00Z",
+    "creators": ["Tool: https://github.com/Homebrew/brew@6.0.17"]
+  },
+  "packages": [{
+    "name": "archive-fixture",
+    "SPDXID": "SPDXRef-Package-archive-fixture",
+    "versionInfo": "1.0.0",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": false
+  }]
+}
+EOF
+tar -C "$archive_root/payload" -czf "$archive_root/$archive_name" archive-fixture
+archive_sha=$(shasum -a 256 "$archive_root/$archive_name" | awk '{print $1}')
+cat <<'PY' >"$archive_root/server.py"
+import http.server
+import pathlib
+import socketserver
+import sys
+
+root = pathlib.Path(sys.argv[1])
+port_file = pathlib.Path(sys.argv[2])
+handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
+    *args, directory=root, **kwargs
+)
+with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
+    port_file.write_text(str(server.server_address[1]))
+    server.serve_forever()
+PY
+python3 "$archive_root/server.py" "$archive_root" "$archive_root/port" \
+  >"$MISE_BREW_ORACLE_RESULT_DIR/archive-server.log" 2>&1 &
+archive_server_pid=$!
+for _ in {1..50}; do
+  [[ -s $archive_root/port ]] && break
+  sleep 0.1
+done
+[[ -s $archive_root/port ]] || brew_oracle_fail "archive bottle server did not start"
+archive_port=$(cat "$archive_root/port")
+archive_url="http://127.0.0.1:$archive_port/$archive_name"
+
+cat <<EOF >"$archive_tap/Formula/archive-fixture.rb"
+class ArchiveFixture < Formula
+  desc "mise archive bottle oracle"
+  homepage "https://mise.jdx.dev"
+  url "https://example.invalid/archive-fixture-1.0.0.tar.gz"
+  version "1.0.0"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+
+  bottle do
+    root_url "http://127.0.0.1:$archive_port"
+    sha256 cellar: :any_skip_relocation, x86_64_linux: "$archive_sha"
+  end
+
+  def install
+    bin.install "archive-fixture"
+  end
+end
+EOF
+cat <<EOF >"$archive_root/archive-fixture.json"
+{
+  "name": "archive-fixture",
+  "tap": "mise/oracle",
+  "versions": {"stable": "1.0.0"},
+  "revision": 0,
+  "keg_only": false,
+  "dependencies": [],
+  "build_dependencies": [],
+  "bottle": {"stable": {"rebuild": 0, "files": {
+    "x86_64_linux": {
+      "cellar": ":any_skip_relocation",
+      "url": "$archive_url",
+      "sha256": "$archive_sha"
+    }
+  }}},
+  "post_install_defined": false,
+  "post_install_steps": [],
+  "version_scheme": 0
+}
+EOF
+git -C "$archive_tap" init
+git -C "$archive_tap" remote add origin https://github.com/mise/homebrew-oracle.git
+git -C "$archive_tap" add Formula/archive-fixture.rb
+git -C "$archive_tap" -c user.name=oracle -c user.email=oracle@example.invalid \
+  commit -m 'test: add archive fixture'
+chown -R linuxbrew:linuxbrew "$archive_root" "$archive_tap"
+printf 'formula:archive-fixture version=1.0.0 bottle_sha256=%s tap_sha=%s\n' \
+  "$archive_sha" "$(git -C "$archive_tap" rev-parse HEAD)" \
+  >>"$MISE_BREW_ORACLE_RESULT_DIR/api-fixtures.txt"
+
+archive_replacements="{\"https://raw.githubusercontent.com/mise/homebrew-oracle/HEAD/api/formula/archive-fixture.json\":\"http://127.0.0.1:$archive_port/archive-fixture.json\"}"
+cat <<EOF >mise.toml
+[bootstrap.brew.taps]
+"mise/oracle" = "https://github.com/mise/homebrew-oracle.git"
+
+[bootstrap.packages]
+"brew:mise/oracle/archive-fixture" = "latest"
+EOF
+chown linuxbrew:linuxbrew mise.toml
+mkdir "$archive_root/no-compiler"
+cat <<'EOF' >"$archive_root/no-compiler/cc"
+#!/usr/bin/env bash
+echo "archive bottle unexpectedly invoked cc" >&2
+exit 97
+EOF
+chmod 0755 "$archive_root/no-compiler/cc"
+chown -R linuxbrew:linuxbrew "$archive_root/no-compiler"
+mise_archive="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache MISE_URL_REPLACEMENTS='$archive_replacements' PATH='$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin' '$mise_bin'"
+assert_contains "$mise_archive bootstrap packages status" "missing"
+runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
+  MISE_URL_REPLACEMENTS="$archive_replacements" \
+  PATH="$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin" \
+  "$mise_bin" bootstrap packages apply --yes
+mise_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
+assert_contains "'$mise_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0"
+assert_contains "cat '$mise_archive_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": true'
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive.snapshot" \
+  "keg=$mise_archive_keg"
+assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "archive-fixture"
+assert_succeed "runuser -u linuxbrew -- '$brew' info mise/oracle/archive-fixture"
+runuser -u linuxbrew -- "$brew" uninstall --formula archive-fixture
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/archive-fixture"
+
+runuser -u linuxbrew -- "$brew" install --force-bottle mise/oracle/archive-fixture
+brew_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
+brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive.snapshot" \
+  "keg=$brew_archive_keg"
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive.snapshot"
+assert_contains "$mise_archive bootstrap packages status" "installed"
+assert_contains "$mise_archive bootstrap packages apply --yes 2>&1" "already"
+assert_contains "'$brew_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0"
+runuser -u linuxbrew -- "$brew" uninstall --formula archive-fixture
+assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/archive-fixture"
+
+brew_oracle_complete test_system_install_brew_linux 3 /home/linuxbrew/.linuxbrew

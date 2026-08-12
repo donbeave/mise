@@ -104,9 +104,18 @@ mise bootstrap packages apply --yes
 assert_contains "mise bootstrap packages status" "installed"
 assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/bin/kimi'"
 cleanup_formula_fixtures
+for formula in "${formula_fixtures[@]}" "$unsupported_current_formula"; do
+  [[ ! -e $MISE_SYSTEM_BREW_PREFIX/Cellar/$formula ]] ||
+    brew_oracle_fail "exact Homebrew failed to remove mise-owned fixture: $formula"
+  [[ ! -e $MISE_SYSTEM_BREW_PREFIX/opt/$formula && ! -L $MISE_SYSTEM_BREW_PREFIX/opt/$formula ]] ||
+    brew_oracle_fail "stale opt record remains after cross-engine removal: $formula"
+  [[ ! -e $MISE_SYSTEM_BREW_PREFIX/var/homebrew/linked/$formula && ! -L $MISE_SYSTEM_BREW_PREFIX/var/homebrew/linked/$formula ]] ||
+    brew_oracle_fail "stale linked-keg remains after cross-engine removal: $formula"
+done
 
 snapshot_formula_chain() {
   local output=$1 formula keg
+  output="$MISE_BREW_ORACLE_RESULT_DIR/$output"
   local roots=()
   for formula in "${formula_fixtures[@]}"; do
     keg=$(readlink -f "$MISE_SYSTEM_BREW_PREFIX/opt/$formula")
@@ -177,7 +186,9 @@ for path in "${shared_fixture_paths[@]}"; do
 done
 "$brew" install kimi-code
 snapshot_formula_chain brew-formula-chain.snapshot
-brew_oracle_diff brew-formula-chain.snapshot mise-formula-chain.snapshot
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/brew-formula-chain.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/mise-formula-chain.snapshot"
 assert_contains "mise bootstrap packages status" "installed"
 assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
 assert_formula_runtime
