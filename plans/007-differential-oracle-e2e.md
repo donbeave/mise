@@ -298,3 +298,18 @@ engine state, corpus class table.
   repair/import/prune lifecycle coverage.
 - Focused unit suite: 206 passed. `mise run lint`: passed. No normalization
   entry was added during divergence investigation.
+
+## Blocker resolution — 2026-08-12 shared CI network quota
+
+- **Condition:** final-head Linux e2e failed after the differential oracle
+  passed: cmake.org refused a vfox-cmake download on attempt one, then the
+  shared GitHub installation token reached zero remaining requests on attempt
+  two and an unrelated lockfile test could not enumerate platforms.
+- **Evidence:** run `31555069700` shows the Homebrew differential step passed;
+  only `backend/test_vfox_cmake` and
+  `lockfile/test_lockfile_platforms_setting` failed on external network/quota
+  responses. All other Linux tranches and platform jobs passed.
+- **Options:** weaken/skip unrelated tests, change production networking, or
+  retrigger the unchanged suite after quota reset.
+- **Choice:** retrigger unchanged. Test weakening or production changes would
+  hide external failures and do not improve Homebrew fidelity.
