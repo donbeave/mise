@@ -97,9 +97,9 @@ State plainly, replacing contradicting text:
 - apply ensures presence; upgrade is explicit and mirrors brew semantics —
   `auto_updates` casks are skipped (no implicit `--greedy`);
 - prune removes packages exactly as `brew uninstall` would;
-- legacy mise-only casks (pre-1:1 installs) convert automatically when
-  provable, otherwise report needs-repair with a one-line fix — quote the
-  actual message format from plan 005;
+- for legacy mise-only casks (pre-1:1 installs), status only validates;
+  apply converts provable state; invalid or unprovable state remains
+  NeedsRepair without mutation and includes the one-line fix from plan 005;
 - Homebrew installation is NOT required for the engine to work; when brew
   is present, both tools share state;
 - `MISE_SYSTEM_BREW_PREFIX` is test-only; no custom-prefix support.
@@ -127,6 +127,9 @@ Docs-only; verification is the two grep gates plus lint.
 
 - [ ] Step 1 grep gate passes (no stale ownership-model text).
 - [ ] Page accurately reflects the eight shipped behaviors listed above.
+- [ ] Legacy status is documented as read-only validation; only apply may
+      convert provable state, while invalid/unprovable state remains
+      NeedsRepair without mutation.
 - [ ] `mise run lint` exits 0.
 - [ ] ONE commit; only in-scope files; `plans/README.md` row 008 updated.
 - [ ] Single PR opened per Git workflow (all plans DONE).

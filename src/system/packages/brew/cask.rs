@@ -5473,8 +5473,8 @@ fn execute_homebrew_uninstall_artifacts(
             HomebrewUninstallAction::Pkgutil(id) => {
                 #[cfg(not(target_os = "macos"))]
                 bail!(
-                    "brew-cask:{}: pkgutil uninstall is only available on macOS",
-                    candidate.token
+                    "brew-cask:{}: pkgutil uninstall for {id} is only available on macOS",
+                    candidate.token,
                 );
                 #[cfg(target_os = "macos")]
                 run_uninstall_command("/usr/sbin/pkgutil", &["--forget", &id], &candidate.token)?;
@@ -5504,8 +5504,8 @@ fn execute_homebrew_uninstall_artifacts(
             HomebrewUninstallAction::Quit(bundle_id) => {
                 #[cfg(not(target_os = "macos"))]
                 bail!(
-                    "brew-cask:{}: quit uninstall is only available on macOS",
-                    candidate.token
+                    "brew-cask:{}: quit uninstall for {bundle_id} is only available on macOS",
+                    candidate.token,
                 );
                 #[cfg(target_os = "macos")]
                 {
@@ -5528,8 +5528,8 @@ fn execute_homebrew_uninstall_artifacts(
             HomebrewUninstallAction::Launchctl(label) => {
                 #[cfg(not(target_os = "macos"))]
                 bail!(
-                    "brew-cask:{}: launchctl uninstall is only available on macOS",
-                    candidate.token
+                    "brew-cask:{}: launchctl uninstall for {label} is only available on macOS",
+                    candidate.token,
                 );
                 #[cfg(target_os = "macos")]
                 run_uninstall_command("/bin/launchctl", &["remove", &label], &candidate.token)?;

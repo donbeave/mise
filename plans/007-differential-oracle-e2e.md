@@ -285,4 +285,6 @@ engine state, corpus class table.
   disposable Linux host while keeping all brew/mise operations non-root.
 - **Choice:** the container tranche explicitly defers this one test; the Linux
   e2e job invokes it separately through `mise run test:e2e` under `sudo` on the
-  disposable host. The test still creates and removes only `/home/linuxbrew`.
+  disposable host. `CI=true` is mandatory; any pre-provisioned fixture user and
+  `/home/linuxbrew` are removed before the run, and cleanup remains scoped to
+  that exact disposable state.
