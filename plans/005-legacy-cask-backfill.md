@@ -198,6 +198,18 @@ pass.
 - **Options:** keep mutating status, suppress live validation, or validate truth read-only in status and reserve conversion for apply.
 - **Choice:** status validates and reports a provable legacy install as installed without mutation; apply performs the gated metadata conversion. Decision 2 is clarified accordingly.
 
+## Blocker resolution — 2026-08-12 Linux nightly isolation
+
+- **Condition:** final CI's Linux nightly job failed because the successful
+  backfill test created `/Applications/Legacy.app` on the runner.
+- **Evidence:** job `93979059823` reported `Permission denied` at that exact
+  path; the test's bare app target bypassed its temporary Homebrew prefix.
+- **Options:** grant runner permission, skip the test on Linux, or give the
+  fixture an explicit `$HOMEBREW_PREFIX/Applications` target.
+- **Choice:** use the explicit prefix-relative target. It exercises the same
+  backfill behavior while keeping every payload and fingerprint inside the
+  disposable test directory; focused and full Homebrew suites pass.
+
 ## Maintenance notes
 
 - This path becomes dead code once the legacy fleet converges; mark it
