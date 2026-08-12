@@ -288,3 +288,13 @@ engine state, corpus class table.
   disposable host. `CI=true` is mandatory; any pre-provisioned fixture user and
   `/home/linuxbrew` are removed before the run, and cleanup remains scoped to
   that exact disposable state.
+
+## Completion evidence — 2026-08-12
+
+- macOS job `93970283233`: `hiddenbar` and `font-jetbrains-mono` differential
+  step passed on a disposable runner after exact fixture cleanup.
+- Linux job `93980178865`: dedicated host oracle passed with real non-root
+  Homebrew, empty normalized xz diff, both ownership directions, and
+  repair/import/prune lifecycle coverage.
+- Focused unit suite: 206 passed. `mise run lint`: passed. No normalization
+  entry was added during divergence investigation.

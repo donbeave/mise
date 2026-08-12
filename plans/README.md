@@ -24,16 +24,16 @@ branch. Push to `fork` after each completed plan.
 
 ## Execution order & status
 
-| Plan | Title                                                    | Priority | Effort | Depends on    | Status      |
-| ---- | -------------------------------------------------------- | -------- | ------ | ------------- | ----------- |
-| 001  | Shared Homebrew receipt schema module with emulation pin | P1       | M      | —             | DONE        |
-| 002  | Cask read-side recognition of Homebrew-installed state   | P1       | M      | 001           | DONE        |
-| 003  | Cask write-side 1:1 Homebrew metadata                    | P1       | L      | 001, 002      | DONE        |
-| 004  | Truthful formula receipts with pinned producer version   | P1       | L      | 001           | DONE        |
-| 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | DONE        |
-| 006  | Removal parity with brew uninstall                       | P1       | L      | 001, 003, 004 | DONE        |
-| 007  | Differential brew-vs-mise e2e oracle                     | P1       | L      | 003, 004, 006 | IN PROGRESS |
-| 008  | Documentation: 1:1 Homebrew-compatible bootstrap         | P2       | S      | 001–007       | DONE        |
+| Plan | Title                                                    | Priority | Effort | Depends on    | Status |
+| ---- | -------------------------------------------------------- | -------- | ------ | ------------- | ------ |
+| 001  | Shared Homebrew receipt schema module with emulation pin | P1       | M      | —             | DONE   |
+| 002  | Cask read-side recognition of Homebrew-installed state   | P1       | M      | 001           | DONE   |
+| 003  | Cask write-side 1:1 Homebrew metadata                    | P1       | L      | 001, 002      | DONE   |
+| 004  | Truthful formula receipts with pinned producer version   | P1       | L      | 001           | DONE   |
+| 005  | Gated legacy cask backfill                               | P2       | M      | 001, 002, 003 | DONE   |
+| 006  | Removal parity with brew uninstall                       | P1       | L      | 001, 003, 004 | DONE   |
+| 007  | Differential brew-vs-mise e2e oracle                     | P1       | L      | 003, 004, 006 | DONE   |
+| 008  | Documentation: 1:1 Homebrew-compatible bootstrap         | P2       | S      | 001–007       | DONE   |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale).
