@@ -1,10 +1,16 @@
 # Plan 015: Implement mixed cask artifacts and platform-correct configuration
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P0
 Effort: M
 Planned against: #11910 `05ccd7ab8`
 Depends on: 013, 014
+Implementation start: #11910 `279530a1e33814c7c6a49aca6198ba67efb124b3`
+Implementation commit: `bca8747bd362679a6c97d72f3e0001539730f011`
+
+Drift check (2026-08-13): `manpage` remains in the non-installing allowlist and
+is absent from receipt/status/prune topology. `native_cask_config` still emits
+macOS application/font/audio paths unconditionally on Linux.
 
 ## Objective
 
@@ -60,6 +66,26 @@ mixed-artifact cask must install, report, upgrade, and remove all mechanisms.
 - No macOS-only path appears in a Linux receipt.
 
 ## Verification
+
+Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
+
+- Manpages participate in stage, activation, receipt inventory, installed
+  topology, predecessor claims, and prune. Invalid sections/escapes fail.
+- Ghostty-shaped unit coverage executes app + two manpages + bash/fish/zsh
+  completions. `plans/007-corpus-results.md` now pins all 37 names as a
+  multi-mechanism matrix at tap commit
+  `139b32436d745fd04f1d531bad85b8864a7c7270`, with full API payload digests.
+- One platform directory model drives target paths and native config. Linux
+  tests cover `~/.config/apps`, XDG fonts, `~/.vst`, and `~/.vst3`, and reject
+  macOS path leakage.
+- Adopted Homebrew receipts use their installed artifacts, not current catalog
+  artifacts. Relevant custom Homebrew directories fail as NeedsRepair instead
+  of being silently reinterpreted through mise defaults.
+- Focused cask tests: 169 passed; all brew tests: 226 passed; Clippy: zero
+  errors.
+
+Pinned real-brew round trips remain required by plan 018; matrix rows are
+explicitly oracle-pending, so this plan stays IN PROGRESS.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew::cask

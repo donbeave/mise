@@ -1,10 +1,19 @@
 # Plan 016: Coordinate cask mutations with Homebrew-compatible locks
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P1
 Effort: M
 Planned against: #11910 `05ccd7ab8`
 Depends on: 013
+Implementation start: #11910 `279530a1e33814c7c6a49aca6198ba67efb124b3`
+Implementation commit: `bca8747bd362679a6c97d72f3e0001539730f011`
+
+Drift check (2026-08-13): Homebrew 6.0.17 resolves a cask lock to
+`<prefix>/var/homebrew/locks/<token>.cask.lock`, uses an open file descriptor
+plus exclusive nonblocking `flock`, verifies the locked descriptor still names
+the on-disk inode, and never unlinks the live lock. Mise still serializes every
+cask through `Caskroom/.mise.lock`, so it neither contends with brew nor permits
+different-token concurrency.
 
 ## Objective
 
@@ -57,6 +66,22 @@ No global package-manager lock redesign.
 - Read-only status creates no lock file/directory.
 
 ## Verification
+
+Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
+
+- Mise locks `<prefix>/var/homebrew/locks/<token>.cask.lock` with exclusive
+  nonblocking `flock`, verifies descriptor/path inode identity, and never
+  removes a live lock.
+- Tests prove same-token contention across separate processes, release and
+  reacquisition, different-token concurrency, sorted/deduplicated batch order,
+  symlinked-directory rejection, and lock-free read-only status.
+- Locks cover post-lock ownership revalidation, recovery, predecessor teardown,
+  activation, metadata commit, cleanup, and prune.
+- Focused cask tests: 169 passed; all brew tests: 226 passed; Clippy: zero
+  errors.
+
+Disposable contention with the pinned real `brew` implementation and combined
+exact-head CI remain required by plans 017–018, so this plan stays IN PROGRESS.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew::cask

@@ -1,10 +1,17 @@
 # Plan 014: Execute replayable predecessor teardown on upgrade/reinstall
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P0
 Effort: L
 Planned against: #11910 `05ccd7ab8`
 Depends on: 013
+Implementation start: #11910 `279530a1e33814c7c6a49aca6198ba67efb124b3`
+Implementation commit: `bca8747bd362679a6c97d72f3e0001539730f011`
+
+Drift check (2026-08-13): the installed native receipt is now loaded and its
+limited uninstall vocabulary validated under the cask lock, but upgrade still
+never calls the executor. The parser also preserves JSON iteration order rather
+than Homebrew 6.0.17's fixed directive order and cannot express recovery intent.
 
 ## Objective
 
@@ -84,6 +91,23 @@ Operation semantics are explicit:
   repeats.
 
 ## Verification
+
+Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
+
+- Installed receipt actions are compiled in Homebrew 6.0.17 directive order,
+  validated before download/public mutation, and executed by upgrade as well as
+  prune. Zap is excluded.
+- A running predecessor app's bundle ID is journaled before quit and reopened
+  only after successor topology validation. Unknown crash outcomes remain
+  manual recovery and are never blindly replayed.
+- `launchctl`, exact bundle `quit`, and protected/glob-validated `delete` are
+  implemented. `pkgutil`/pkg BOM removal, `script`, `signal`, uninstall flight
+  blocks, and structured symlink teardown fail closed before mutation.
+- Focused cask tests: 169 passed; all brew tests: 226 passed; Clippy: zero
+  errors.
+
+Real macOS predecessor/reopen differential proof remains required by plans
+017–018, so this plan stays IN PROGRESS.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew::cask

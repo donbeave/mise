@@ -1,10 +1,19 @@
 # Plan 013: Make cask activation owned, transactional, and recoverable
 
-Status: TODO
+Status: IN PROGRESS
 Priority: P0
 Effort: L
 Planned against: #11910 `05ccd7ab8`
 Depends on: 009
+Implementation start: #11910 `279530a1e33814c7c6a49aca6198ba67efb124b3`
+Implementation commit: `bca8747bd362679a6c97d72f3e0001539730f011`
+
+Drift check (2026-08-13): the activation code still builds one
+`current_targets` vector from apps, binaries, completions, and fonts. Apps are
+already installed publicly before `ArtifactLinkTransaction::begin` moves every
+entry in that vector to backup; the activation closure recreates links/fonts
+but not apps, so commit still deletes the only app copy. The journal remains a
+completed-string list rather than an executable recovery state machine.
 
 ## Objective
 
@@ -95,6 +104,20 @@ phase.
   following or removing its target.
 
 ## Verification
+
+Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
+
+- `rtk cargo test --bin mise system::packages::brew::cask` — 169 passed.
+- `rtk cargo test --bin mise system::packages::brew` — 226 passed.
+- `rtk cargo clippy --workspace --all-features --all-targets -- -D warnings` —
+  zero errors (one pre-existing linker warning).
+- Regressions cover successful app activation retaining both public app and
+  Caskroom backlink, protected predecessor replacement, foreign target
+  rejection, activation rollback, durable pending-phase reporting, and
+  installed-receipt topology independent of current catalog metadata.
+
+Hosted macOS differential proof remains required by plans 017–018, so this plan
+stays IN PROGRESS despite local implementation passing.
 
 ```bash
 rtk cargo test --bin mise system::packages::brew::cask
