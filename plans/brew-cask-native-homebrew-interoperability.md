@@ -793,9 +793,9 @@ by real brew; such a case reports needs-repair, never silent repair.
 
 ### Casks created by current mise (gated backfill — decision 2)
 
-A `.mise-cask.toml` cask without Homebrew `.metadata` is converted during
-status/apply to the full truthful receipt set **only when truth is
-provable**:
+A `.mise-cask.toml` cask without Homebrew `.metadata` is validated during
+read-only status and converted during apply to the full truthful receipt set
+**only when truth is provable**:
 
 - the mise legacy receipt exists and parses;
 - artifact fingerprints still match the installed payload;
@@ -803,8 +803,8 @@ provable**:
   version equals current catalog version, because uninstall directives are
   version-specific.
 
-On success the engine writes the complete `.metadata` receipt set and
-removes `.mise-cask.toml`. If any condition fails (auto-updated app,
+On successful apply the engine writes the complete `.metadata` receipt set
+and removes `.mise-cask.toml`. If any condition fails (auto-updated app,
 fingerprint mismatch, version drift), the cask reports needs-repair with a
 one-line reinstall instruction and nothing is mutated. The July `99e2e50a5`
 empty-tab backfill remains the anti-pattern: backfill without provable truth

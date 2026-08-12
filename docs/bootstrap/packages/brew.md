@@ -115,9 +115,10 @@ the Homebrew version pinned by the brew receipt module. A cask installed by
 Homebrew therefore satisfies the same mise declaration: status reports it as
 installed and apply does not modify it.
 
-Legacy casks installed by older mise versions are converted automatically when
-their recorded version, package receipts, and payload fingerprints prove the
-installed state. When that history cannot be proven, status reports
+Legacy casks installed by older mise versions are validated by read-only
+status, then converted by apply when their recorded version, package receipts,
+and payload fingerprints prove the installed state. When that history cannot
+be proven, status reports
 `brew-cask:<token>: legacy mise install cannot be converted (<reason>); reinstall with either 'brew install --cask <token>' or mise apply after uninstalling`.
 It never invents missing ownership facts.
 
@@ -158,10 +159,11 @@ state. mise writes formula receipts, SBOMs, cask metadata, and links in the
 same format as Homebrew, verified by a differential oracle against the version
 pinned in `receipt::EMULATED_BREW_VERSION`.
 
-Mixing the tools is supported in both directions. Either tool may install,
-list, upgrade, or uninstall a formula or cask regardless of which tool created
-it. A package already installed by Homebrew satisfies its mise declaration:
-status reports `installed`, and apply is a no-op.
+Mixing the tools is supported in both directions for valid
+Homebrew-compatible state. Either tool may install, list, upgrade, or uninstall
+a formula or cask regardless of which tool created it. A package already
+installed by Homebrew satisfies its mise declaration: status reports
+`installed`, and apply is a no-op.
 
 For non-keg-only formulae, mise maintains Homebrew's
 `<prefix>/var/homebrew/linked/<name>` record alongside the `opt` record. For a

@@ -39,31 +39,44 @@ brew_oracle_normalize_json() {
 }
 
 brew_oracle_snapshot() {
-  local root=$1 output=$2
-  local scratch
+  local output=$1
+  shift
+  local scratch entries
   scratch=$(mktemp -d)
-  : >"$output"
-  while IFS= read -r path; do
-    local relative normalized mode digest target
-    relative=${path#"$root"/}
-    relative=$(printf '%s' "$relative" | sed -E 's#/[0-9]{14}\.[0-9]{3}/#/<TIMESTAMP>/#g')
-    mode=$(brew_oracle_mode "$path")
-    if [[ -L $path ]]; then
-      target=$(readlink "$path")
-      printf 'l %s %s -> %s\n' "$mode" "$relative" "$target" >>"$output"
-    elif [[ -d $path ]]; then
-      printf 'd %s %s\n' "$mode" "$relative" >>"$output"
-    elif [[ -f $path ]]; then
-      if [[ $path == *.json ]]; then
-        normalized="$scratch/normalized.json"
-        brew_oracle_normalize_json "$path" "$normalized"
-        digest=$(shasum -a 256 "$normalized" | awk '{print $1}')
+  entries="$scratch/entries"
+  : >"$entries"
+  local spec label root
+  for spec in "$@"; do
+    label=${spec%%=*}
+    root=${spec#*=}
+    [[ $label != "$spec" && -e $root ]] || return 1
+    while IFS= read -r path; do
+      local relative normalized mode digest target
+      if [[ $path == "$root" ]]; then
+        relative=.
       else
-        digest=$(shasum -a 256 "$path" | awk '{print $1}')
+        relative=${path#"$root"/}
       fi
-      printf 'f %s %s %s\n' "$mode" "$relative" "$digest" >>"$output"
-    fi
-  done < <(find "$root" -mindepth 1 -print | LC_ALL=C sort)
+      relative=$(printf '%s/%s' "$label" "$relative" | sed -E 's#/[0-9]{14}\.[0-9]{3}/#/<TIMESTAMP>/#g')
+      mode=$(brew_oracle_mode "$path")
+      if [[ -L $path ]]; then
+        target=$(readlink "$path")
+        printf 'l %s %s -> %s\n' "$mode" "$relative" "$target" >>"$entries"
+      elif [[ -d $path ]]; then
+        printf 'd %s %s\n' "$mode" "$relative" >>"$entries"
+      elif [[ -f $path ]]; then
+        if [[ $path == *.json ]]; then
+          normalized="$scratch/normalized.json"
+          brew_oracle_normalize_json "$path" "$normalized"
+          digest=$(shasum -a 256 "$normalized" | awk '{print $1}')
+        else
+          digest=$(shasum -a 256 "$path" | awk '{print $1}')
+        fi
+        printf 'f %s %s %s\n' "$mode" "$relative" "$digest" >>"$entries"
+      fi
+    done < <(find "$root" -print | LC_ALL=C sort)
+  done
+  LC_ALL=C sort "$entries" >"$output"
   rm -rf "$scratch"
 }
 

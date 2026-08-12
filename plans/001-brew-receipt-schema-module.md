@@ -337,3 +337,12 @@ Stop and report (do not improvise) if:
   exclusion, no runtime behavior, and no public surface. Plan 002 must remove
   it when the first production reader is wired; plans 003–004 consume the
   remaining writers and models.
+
+## Blocker resolution — 2026-08-12 PR schema review
+
+- **Condition:** optional native probes omitted `built_on` keys instead of
+  preserving Homebrew's stable receipt shape.
+- **Evidence:** captured receipts contain the full key set; absence of a
+  machine value is represented by JSON null.
+- **Options:** omit absent keys, invent values, or serialize nulls.
+- **Choice:** serialize nulls and fail closed on unsupported operating systems.

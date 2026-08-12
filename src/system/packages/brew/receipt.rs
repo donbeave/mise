@@ -38,11 +38,8 @@ pub struct BuiltOn {
     pub os: String,
     pub os_version: String,
     pub cpu_family: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub xcode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub clt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_perl: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -297,6 +294,14 @@ pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
         preferred_perl: None,
         extra: Map::new(),
     })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
+    Err(ReceiptError::MissingFact(format!(
+        "Homebrew build-system metadata is unsupported on {}",
+        std::env::consts::OS
+    )))
 }
 
 /// Finds the most recent metadata snapshot by Homebrew's sortable timestamp

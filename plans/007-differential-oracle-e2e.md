@@ -259,3 +259,14 @@ engine state, corpus class table.
   machine/time facts and fails if required keys are missing. Corpus classes
   without a safe disposable representative carry explicit NOT VERIFIED
   reasons rather than silent success.
+
+## Blocker resolution — 2026-08-12 PR oracle review
+
+- **Condition:** Caskroom-only snapshots could miss divergent installed apps
+  and fonts; Linux engine operations ran as root instead of the prefix owner.
+- **Evidence:** cask targets live outside Caskroom, and Homebrew state is owned
+  by the dedicated `linuxbrew` user in the disposable Linux oracle.
+- **Options:** retain metadata-only comparison, normalize target differences,
+  or snapshot labeled metadata plus target roots and run mise as `linuxbrew`.
+- **Choice:** compare all labeled roots byte-for-byte and use the prefix owner
+  for every Linux engine operation. No normalization was widened.
