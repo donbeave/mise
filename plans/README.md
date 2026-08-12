@@ -76,7 +76,7 @@ Corrective plans:
 | 009  | Make destructive oracles safe and non-skippable              | P0       | M      | —                  | DONE        |
 | 010  | Compile formula lifecycle once; preflight and confine it     | P0       | L      | 009                | DONE        |
 | 011  | Unify bottle/source finalization and truthful provenance     | P0       | L      | 010                | DONE        |
-| 012  | Add closure-aware formula health and lifecycle-only repair   | P0       | L      | 010, 011           | DONE        |
+| 012  | Add closure-aware formula health and lifecycle-only repair   | P0       | L      | 010, 011           | IN PROGRESS |
 | 013  | Make cask activation owned, transactional, and recoverable   | P0       | L      | 009                | IN PROGRESS |
 | 014  | Execute replayable predecessor teardown on upgrade/reinstall | P0       | L      | 013                | IN PROGRESS |
 | 015  | Implement mixed cask artifacts and platform-correct config   | P0       | M      | 013, 014           | IN PROGRESS |

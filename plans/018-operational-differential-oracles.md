@@ -22,13 +22,13 @@ Execution start (2026-08-13):
 Execution continuation (2026-08-13):
 
 - formula prerequisite advanced to
-  `667866575b92c19f5f8ba07646f52cfbbcf330fb` after exact-head source proof
+  `fa760b0b42bcbdb6c56c0d919a1cc1de717d5170` after exact-head source proof
   exposed an Ubuntu GCC provenance parser defect and the general container E2E
   exposed an unsafe-directory Git identity probe; the pinned macOS oracle then
   exposed the isolated harness omitting fixed `/usr/sbin` and `/sbin`, which
   prevented its package-receipt no-mutation probe from invoking `pkgutil`;
 - combined stack was restacked without conflict; current code-proof SHA is
-  `74d9817b17ada28ade9629eefdf7a9cd64df1a1d`. The previous exact evidence head
+  `752467bcc4368b84692e42aaa950fc956d13e09f`. The previous exact evidence head
   `7db9c28bb62e7868930227f03f6c7793c8ac675d` failed before cask mutation because
   the isolated harness omitted the fixed system path containing `pkgutil`;
 - first pinned macOS execution proved runtime `6.0.17` at exact SHA
