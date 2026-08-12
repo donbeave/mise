@@ -32,6 +32,17 @@ ghostty_targets=(
   "$prefix/share/fish/vendor_completions.d/ghostty.fish"
   "$prefix/share/zsh/site-functions/_ghostty"
 )
+onepassword_room="$prefix/Caskroom/1password-cli"
+onepassword_targets=(
+  "$prefix/bin/op"
+  "$prefix/etc/bash_completion.d/op"
+  "$prefix/share/fish/vendor_completions.d/op.fish"
+  "$prefix/share/zsh/site-functions/_op"
+)
+codexbar_room="$prefix/Caskroom/codexbar"
+codexbar_targets=(/Applications/CodexBar.app "$prefix/bin/codexbar")
+vlc_room="$prefix/Caskroom/vlc"
+vlc_targets=(/Applications/VLC.app "$prefix/bin/vlc")
 
 brew_oracle_require_absent_path "$cask_app" "foreign or stale fixture app"
 brew_oracle_require_absent_path "$caskroom" "foreign or stale fixture Caskroom"
@@ -39,6 +50,12 @@ brew_oracle_require_absent_path "$font_room" "foreign or stale font Caskroom"
 brew_oracle_require_absent_path "$ghostty_room" "foreign or stale Ghostty Caskroom"
 for target in "${ghostty_targets[@]}"; do
   brew_oracle_require_absent_path "$target" "foreign or stale Ghostty artifact"
+done
+for room in "$onepassword_room" "$codexbar_room" "$vlc_room"; do
+  brew_oracle_require_absent_path "$room" "foreign or stale cask Caskroom"
+done
+for target in "${onepassword_targets[@]}" "${codexbar_targets[@]}" "${vlc_targets[@]}"; do
+  brew_oracle_require_absent_path "$target" "foreign or stale cask artifact"
 done
 if find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print -quit 2>/dev/null | grep -q .; then
   brew_oracle_fail "foreign or stale JetBrains Mono font exists"
@@ -50,6 +67,34 @@ brew_oracle_record_api_fixture cask font-jetbrains-mono 2.304 \
   759100caac0dbb17c0a3d54a050584a89893ed787ed84a821afedd6b99e1c8e0
 brew_oracle_record_api_fixture cask ghostty 1.3.1 \
   628dfe93794ad00c7025925832727f71aaea676feafa68138a2e64323a88d0aa
+brew_oracle_record_api_fixture cask 1password-cli 2.38.1 \
+  d819694c6428760d4b539913b5962d8e1f7ac2310253a9167eb20d4a6b1a8f14
+brew_oracle_record_api_fixture cask codexbar 0.49.3 \
+  17a8ff2d3ab8b143ff76d3cdbc19ac950d2c7a3a45789c38e451a1fdddeb4224
+brew_oracle_record_api_fixture cask vlc 3.0.23 \
+  4df4df5f21490863a16591bb2d6968174bfa4657c037be9dcac929ffdcd0d8f4
+brew_oracle_record_api_fixture cask cloudflare-warp 2026.6.880.0 \
+  dd2d62c16ae5e05d6021c34626d6b8a972a5b0da9cf0ac7196f63a279354576a
+
+# Package installers and uninstall scripts are explicitly unsupported. Their
+# availability preflight must reject the cask before download, metadata, app,
+# or macOS package-receipt mutation.
+cloudflare_room="$prefix/Caskroom/cloudflare-warp"
+cloudflare_app="/Applications/Cloudflare WARP.app"
+brew_oracle_require_absent_path "$cloudflare_room" "unsupported pkg cask metadata"
+brew_oracle_require_absent_path "$cloudflare_app" "unsupported pkg cask app"
+assert_fail "pkgutil --pkg-info com.cloudflare.1dot1dot1dot1.macos"
+pkgutil --pkgs | LC_ALL=C sort >"$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-before.txt"
+cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew-cask:cloudflare-warp" = "latest"
+EOF
+assert_fail "mise bootstrap packages apply --yes"
+pkgutil --pkgs | LC_ALL=C sort >"$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-after.txt"
+cmp "$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-before.txt" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-after.txt"
+brew_oracle_require_absent_path "$cloudflare_room" "unsupported pkg cask metadata"
+brew_oracle_require_absent_path "$cloudflare_app" "unsupported pkg cask app"
 
 # A process using Homebrew's exact lock identity blocks mise before the first
 # artifact or metadata mutation.
@@ -83,9 +128,12 @@ cleanup() {
     kill "$lock_pid" 2>/dev/null || true
     wait "$lock_pid" 2>/dev/null || true
   fi
-  "$brew" uninstall --cask hiddenbar --yes >/dev/null 2>&1 || true
-  "$brew" uninstall --cask font-jetbrains-mono --yes >/dev/null 2>&1 || true
-  "$brew" uninstall --cask ghostty --yes >/dev/null 2>&1 || true
+  "$brew" uninstall --cask hiddenbar >/dev/null 2>&1 || true
+  "$brew" uninstall --cask font-jetbrains-mono >/dev/null 2>&1 || true
+  "$brew" uninstall --cask ghostty >/dev/null 2>&1 || true
+  "$brew" uninstall --cask 1password-cli >/dev/null 2>&1 || true
+  "$brew" uninstall --cask codexbar >/dev/null 2>&1 || true
+  "$brew" uninstall --cask vlc >/dev/null 2>&1 || true
   shopt -s nullglob
   local app_work_paths=(
     /Applications/Hidden\ Bar.mise-old-*
@@ -93,13 +141,16 @@ cleanup() {
   )
   chmod -RN "$hiddenbar_app" "${app_work_paths[@]}" 2>/dev/null || true
   rm -rf "$hiddenbar_app" "$hiddenbar_room" "$font_room" "$ghostty_room" \
-    "${ghostty_targets[@]}" "${app_work_paths[@]}"
+    "$onepassword_room" "$codexbar_room" "$vlc_room" \
+    "${ghostty_targets[@]}" "${onepassword_targets[@]}" \
+    "${codexbar_targets[@]}" "${vlc_targets[@]}" "${app_work_paths[@]}"
   brew_oracle_remove_runtime_bridge
 }
 trap cleanup EXIT
 
 snapshot_cask() {
   local token=$1 output=$2 room="$prefix/Caskroom/$1"
+  output="$MISE_BREW_ORACLE_RESULT_DIR/$output"
   local roots=("caskroom=$room")
   if [[ $token == hiddenbar ]]; then
     roots+=("app=$hiddenbar_app")
@@ -108,11 +159,23 @@ snapshot_cask() {
     while IFS= read -r font; do
       roots+=("font-$(basename "$font")=$font")
     done < <(find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print | LC_ALL=C sort)
-  else
+  elif [[ $token == ghostty ]]; then
     local target
     for target in "${ghostty_targets[@]}"; do
       [[ -e $target || -L $target ]] || return 1
       roots+=("ghostty-$(basename "$target")=$target")
+    done
+  else
+    local target targets=()
+    case "$token" in
+      1password-cli) targets=("${onepassword_targets[@]}") ;;
+      codexbar) targets=("${codexbar_targets[@]}") ;;
+      vlc) targets=("${vlc_targets[@]}") ;;
+      *) return 1 ;;
+    esac
+    for target in "${targets[@]}"; do
+      [[ -e $target || -L $target ]] || return 1
+      roots+=("$token-$(basename "$target")=$target")
     done
   fi
   brew_oracle_snapshot "$output" "${roots[@]}"
@@ -127,15 +190,17 @@ EOF
 
   "$brew" install --cask "$token" --yes
   snapshot_cask "$token" "brew-$token.snapshot"
-  "$brew" uninstall --cask "$token" --yes
+  "$brew" uninstall --cask "$token"
   assert_fail "test -e '$room'"
 
   mise bootstrap packages apply --yes
   snapshot_cask "$token" "mise-$token.snapshot"
-  brew_oracle_diff "brew-$token.snapshot" "mise-$token.snapshot"
+  brew_oracle_diff \
+    "$MISE_BREW_ORACLE_RESULT_DIR/brew-$token.snapshot" \
+    "$MISE_BREW_ORACLE_RESULT_DIR/mise-$token.snapshot"
   assert_contains "'$brew' list --cask" "$token"
   assert_succeed "'$brew' info --cask '$token'"
-  "$brew" uninstall --cask "$token" --yes
+  "$brew" uninstall --cask "$token"
   assert_fail "test -e '$room'"
 
   "$brew" install --cask "$token" --yes
@@ -143,13 +208,18 @@ EOF
   assert_contains "mise bootstrap packages status" "installed"
   assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
   snapshot_cask "$token" "after-$token-noop.snapshot"
-  brew_oracle_diff "before-$token-noop.snapshot" "after-$token-noop.snapshot"
-  "$brew" uninstall --cask "$token" --yes
+  brew_oracle_diff \
+    "$MISE_BREW_ORACLE_RESULT_DIR/before-$token-noop.snapshot" \
+    "$MISE_BREW_ORACLE_RESULT_DIR/after-$token-noop.snapshot"
+  "$brew" uninstall --cask "$token"
 }
 
 oracle_cask hiddenbar
 oracle_cask font-jetbrains-mono
 oracle_cask ghostty
+oracle_cask 1password-cli
+oracle_cask codexbar
+oracle_cask vlc
 
 # Preserve tap coverage.
 assert_contains "mise bootstrap packages brew tap --dry-run jdx/tap" "~/.config/mise/config.toml"
@@ -180,4 +250,4 @@ EOF
   assert_contains "$prefix/bin/aube --version" "aube"
 fi
 
-brew_oracle_complete test_system_install_brew_macos_slow 3 /opt/homebrew
+brew_oracle_complete test_system_install_brew_macos_slow 7 /opt/homebrew

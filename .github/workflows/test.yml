@@ -272,7 +272,7 @@ jobs:
           result_dir="$RUNNER_TEMP/mise-brew-oracle-results"
           brew_oracle_verify_marker \
             "$result_dir/macos-cask.completed" \
-            test_system_install_brew_macos_slow 3 /opt/homebrew \
+            test_system_install_brew_macos_slow 7 /opt/homebrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
@@ -401,7 +401,7 @@ jobs:
           source e2e/cli/brew_oracle_guard.sh
           brew_oracle_verify_marker \
             "$RUNNER_TEMP/mise-brew-oracle-results/linux-formula.completed" \
-            test_system_install_brew_linux 2 /home/linuxbrew/.linuxbrew \
+            test_system_install_brew_linux 3 /home/linuxbrew/.linuxbrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
