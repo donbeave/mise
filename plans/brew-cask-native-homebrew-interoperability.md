@@ -1,5 +1,14 @@
 # Make the mise brew/brew-cask engine one-to-one with Homebrew
 
+> **2026-08-13 merge-readiness correction:** the direction remains approved,
+> but the implementation is not ready and “one-to-one” is not yet demonstrated.
+> PR #11910 (`05ccd7ab8`) and prerequisite #11915 (`b94b6b1c1`) conflict in
+> `api.rs`, `pour.rs`, and `source.rs`; their differential jobs did not execute;
+> and critical formula/cask state-machine defects remain. Plans 009–019 in
+> `plans/README.md` are the controlling corrective graph. They override older
+> branch, completion, and acceptance statements in this design. Do not merge
+> either PR until plan 019 passes on one combined exact head.
+
 > **Executor instructions:** Read this plan completely before editing code.
 > The internal brew/brew-cask engine is retained and must produce on-disk
 > state byte-identical to what real Homebrew produces. Production mise never
@@ -23,6 +32,9 @@
 > Stop if an in-scope symbol no longer matches what this plan describes.
 
 ## Status
+
+- **Current implementation verdict (2026-08-13):** DO NOT MERGE; corrective
+  plans 009–019 TODO
 
 - **Status:** design APPROVED by maintainer 2026-08-12 after question-driven
   review; ready for implementation on explicit instruction

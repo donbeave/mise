@@ -1,5 +1,10 @@
 # Plan 001: Add the shared Homebrew receipt schema module with the emulation pin
 
+> **2026-08-13 audit override — historical implementation.** The schema/pin
+> work remains useful, but this plan is not independent merge evidence. Reverify
+> it on plan 017's combined head. `plans/README.md` overrides this file's old
+> one-branch and “no agent trailers” instructions.
+
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
 > next step. If anything in "STOP conditions" occurs, stop and report — do
@@ -19,6 +24,8 @@
 > "Current state" excerpts below against live code; on a mismatch, STOP.
 
 ## Status
+
+- **Current acceptance:** IMPLEMENTED; REVERIFY ON COMBINED HEAD
 
 - **Priority**: P1
 - **Effort**: M

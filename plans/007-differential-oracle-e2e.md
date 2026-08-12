@@ -1,5 +1,11 @@
 # Plan 007: Add the differential brew-vs-mise e2e oracle
 
+> **2026-08-13 audit override — FALSE-GREEN.** `e2e/run_test` stripped `CI`, so
+> the macOS and Linux oracle bodies exited successfully without fixtures. The
+> cited zero-second jobs are not evidence. The corpus also conflated names with
+> mechanisms. Use plans 009, 017, and 018. Their safety, completion-marker,
+> branch, drift, and done criteria override this document.
+
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
@@ -13,6 +19,8 @@
 > unchanged since `d5e0390dc` — if not, compare and STOP on mismatch.
 
 ## Status
+
+- **Current acceptance:** FALSE-GREEN; no valid differential proof
 
 - **Priority**: P1
 - **Effort**: L

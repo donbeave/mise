@@ -1,5 +1,10 @@
 # Plan 006: Align prune and uninstall post-state with brew uninstall
 
+> **2026-08-13 audit override — acceptance invalidated.** Upgrade/reinstall does
+> not execute the predecessor receipt's uninstall phases, and newly recorded
+> `script`/`signal` actions are not replayable. Use plans 014, 017, and 018.
+> Their branch, commit-trailer, drift, and done criteria override this document.
+
 > **Executor instructions**: Follow step by step; verify each step. On any
 > STOP condition, stop and report. Update `plans/README.md` row when done.
 >
@@ -13,6 +18,8 @@
 > mismatch STOP.
 
 ## Status
+
+- **Current acceptance:** INVALIDATED by the 2026-08-13 deep audit
 
 - **Priority**: P1
 - **Effort**: L

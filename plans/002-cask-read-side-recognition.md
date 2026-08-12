@@ -1,5 +1,10 @@
 # Plan 002: Recognize Homebrew-installed casks in status and apply
 
+> **2026-08-13 audit override — historical implementation.** Read-side support
+> remains useful, but topology, target ownership, transaction recovery, and
+> teardown must be reverified through plans 013–018. `plans/README.md` overrides
+> this file's old one-branch and “no agent trailers” instructions.
+
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving on. On
 > any STOP condition, stop and report. When done, update this plan's row in
@@ -15,6 +20,8 @@
 > excerpts below against live code; on mismatch, STOP.
 
 ## Status
+
+- **Current acceptance:** IMPLEMENTED; REVERIFY ON COMBINED HEAD
 
 - **Priority**: P1
 - **Effort**: M
