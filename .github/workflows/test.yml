@@ -646,7 +646,6 @@ jobs:
               TOKEN_A: ${{ steps.token_3.outputs.token || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
               TOKEN_B: ${{ steps.token_7.outputs.token || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
             with: *e2e-retry
-
   bootstrap-linux-host:
     runs-on: namespace-profile-endev-linux-amd64;overrides.cache-tag=mise-pr-rust-linux
     timeout-minutes: 20

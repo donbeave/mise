@@ -272,3 +272,17 @@ engine state, corpus class table.
   for every Linux engine operation. Disposable macOS CI clears only the exact
   fixture state before running, so preinstalled fonts cannot silently skip the
   oracle. No normalization was widened.
+
+## Blocker resolution — 2026-08-12 Linux runner review
+
+- **Condition:** the regular e2e container has read-only `/etc` and no
+  `useradd`, so it cannot provision the mandatory non-root Homebrew owner.
+- **Evidence:** CI job `93971192452` failed at `useradd`; `e2e/run_test` mounts
+  only `/home`, `/tmp`, and `/root` writable and keeps the root filesystem
+  read-only for this test.
+- **Options:** run Homebrew as root (rejected by Homebrew and unlike reality),
+  weaken ownership coverage, or run the same mise e2e task as root on the
+  disposable Linux host while keeping all brew/mise operations non-root.
+- **Choice:** the container tranche explicitly defers this one test; the Linux
+  e2e job invokes it separately through `mise run test:e2e` under `sudo` on the
+  disposable host. The test still creates and removes only `/home/linuxbrew`.
