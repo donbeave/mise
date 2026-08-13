@@ -1278,6 +1278,7 @@ fn extract_archive(cask: &Cask, archive: &Path, pr: Option<&dyn SingleReport>) -
         .unwrap_or_default();
     if is_dmg_archive(archive, filename)? {
         file::un_dmg(archive, &extract_dir)?;
+        discard_dmg_presentation_entries(&extract_dir)?;
     } else {
         let format = cask_extraction_format(archive, filename)?;
         if format == ExtractionFormat::Raw {
@@ -1306,6 +1307,84 @@ fn extract_archive(cask: &Cask, archive: &Path, pr: Option<&dyn SingleReport>) -
         }
     }
     Ok(extract_dir)
+}
+
+/// Match Homebrew's DMG BOM filtering. Disk-image presentation metadata and
+/// links back to canonical system directories are not part of the staged cask
+/// payload and must never be copied into Caskroom.
+fn discard_dmg_presentation_entries(stage: &Path) -> Result<()> {
+    const METADATA: &[&str] = &[
+        ".background",
+        ".com.apple.timemachine.donotpresent",
+        ".com.apple.timemachine.supported",
+        ".DocumentRevisions-V100",
+        ".DS_Store",
+        ".fseventsd",
+        ".MobileBackups",
+        ".Spotlight-V100",
+        ".TemporaryItems",
+        ".Trashes",
+        ".VolumeIcon.icns",
+        ".HFS+ Private Directory Data\r",
+        ".HFS+ Private Data\r",
+    ];
+    // DMGs conventionally expose only these top-level system-directory links.
+    // This is the top-level subset of Homebrew 6.0.17's MacOS::SYSTEM_DIRS.
+    const SYSTEM_DIRS: &[&str] = &[
+        "/",
+        "/Applications",
+        "/Applications/Utilities",
+        "/Incompatible Software",
+        "/Library",
+        "/Network",
+        "/System",
+        "/User Information",
+        "/Users",
+        "/Volumes",
+        "/bin",
+        "/boot",
+        "/cores",
+        "/dev",
+        "/etc",
+        "/home",
+        "/libexec",
+        "/lost+found",
+        "/media",
+        "/mnt",
+        "/net",
+        "/opt",
+        "/private",
+        "/proc",
+        "/root",
+        "/sbin",
+        "/srv",
+        "/tmp",
+        "/usr",
+        "/var",
+    ];
+
+    for name in METADATA {
+        file::remove_all(stage.join(name))?;
+    }
+    let mut system_links = Vec::new();
+    for entry in walkdir::WalkDir::new(stage).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_symlink() {
+            continue;
+        }
+        let target = std::fs::read_link(entry.path())?;
+        if target.is_absolute()
+            && SYSTEM_DIRS
+                .iter()
+                .any(|system_dir| target == Path::new(system_dir))
+        {
+            system_links.push(entry.path().to_path_buf());
+        }
+    }
+    for link in system_links {
+        file::remove_file(link)?;
+    }
+    Ok(())
 }
 
 async fn execute_lifecycle_hook(
@@ -4915,7 +4994,7 @@ fn convert_legacy_moved_artifacts(
 
 fn migrate_legacy_backlink(old_source: &Path, source: &Path) -> Result<()> {
     if old_source == source
-        || !old_source.symlink_metadata().is_ok()
+        || old_source.symlink_metadata().is_err()
         || source.symlink_metadata().is_ok()
     {
         return Ok(());
@@ -5355,7 +5434,10 @@ fn cask_uninstall_artifacts(cask: &Cask) -> Result<Vec<Value>> {
             continue;
         }
         let mut entry = serde_json::Map::new();
-        entry.insert(key.clone(), object.get(key).cloned().unwrap_or(Value::Null));
+        entry.insert(
+            key.clone(),
+            expand_homebrew_cask_placeholders(object.get(key).cloned().unwrap_or(Value::Null)),
+        );
         entries.push((rank, Value::Object(entry)));
     }
 
@@ -5363,6 +5445,41 @@ fn cask_uninstall_artifacts(cask: &Cask) -> Result<Vec<Value>> {
         .into_iter()
         .map(|index| entries[index].1.clone())
         .collect())
+}
+
+/// Homebrew removes API placeholders while constructing artifact objects, so
+/// its installed receipt records the resolved arguments rather than the public
+/// API placeholders.
+fn expand_homebrew_cask_placeholders(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(expand_homebrew_cask_placeholders)
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, expand_homebrew_cask_placeholders(value)))
+                .collect(),
+        ),
+        Value::String(value) => {
+            let prefix = prefix::prefix();
+            let cellar = prefix.join("Cellar");
+            Value::String(
+                value
+                    .replace("/$HOME", &crate::dirs::HOME.to_string_lossy())
+                    .replace("$HOMEBREW_PREFIX", &prefix.to_string_lossy())
+                    .replace("$HOMEBREW_CELLAR", &cellar.to_string_lossy())
+                    .replace(
+                        "$APPDIR",
+                        &EffectiveCaskDirs::current().appdir.to_string_lossy(),
+                    ),
+            )
+        }
+        value => value,
+    }
 }
 
 fn cask_runtime_dependencies(cask: &Cask) -> Result<serde_json::Map<String, Value>> {
@@ -7730,7 +7847,10 @@ mod tests {
             serde_json::from_value::<Vec<Value>>(serde_json::json!([
                 {"binary": ["codex-aarch64-apple-darwin", {"target": "codex"}]},
                 {
-                    "bash_completion": ["$APPDIR/Codex.app/completions/codex.bash"]
+                    "bash_completion": [format!(
+                        "{}/Codex.app/completions/codex.bash",
+                        EffectiveCaskDirs::current().appdir.display()
+                    )]
                 },
                 {"generate_completions_from_executable": ["codex", "completion"]},
                 {"zap": [{"trash": "~/.codex"}]}
@@ -7803,6 +7923,29 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn uninstall_receipt_expands_homebrew_api_placeholders() {
+        let value = serde_json::json!({
+            "paths": [
+                "/$HOME/example",
+                "$HOMEBREW_PREFIX/bin/example",
+                "$HOMEBREW_CELLAR/example/1.0",
+                "$APPDIR/Example.app"
+            ]
+        });
+        assert_eq!(
+            expand_homebrew_cask_placeholders(value),
+            serde_json::json!({
+                "paths": [
+                    crate::dirs::HOME.join("example"),
+                    prefix::prefix().join("bin/example"),
+                    prefix::prefix().join("Cellar/example/1.0"),
+                    EffectiveCaskDirs::current().appdir.join("Example.app")
+                ]
+            })
+        );
     }
 
     #[test]
@@ -10240,6 +10383,33 @@ end
         );
         assert!(!caskroom.join("__MACOSX").exists());
         assert!(!caskroom.join("Example.ttf").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn discards_dmg_presentation_entries_before_staging() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path();
+        file::create_dir_all(stage.join(".background"))?;
+        crate::file::write(stage.join(".background/image.png"), "background")?;
+        crate::file::write(stage.join(".DS_Store"), "metadata")?;
+        file::create_dir_all(stage.join("Example.app"))?;
+        file::make_symlink(Path::new("/Applications"), &stage.join("Applications"))?;
+        file::make_symlink(
+            Path::new("Versions/Current"),
+            &stage.join("framework-current"),
+        )?;
+
+        discard_dmg_presentation_entries(stage)?;
+
+        assert!(!stage.join(".background").exists());
+        assert!(!stage.join(".DS_Store").exists());
+        assert!(!stage.join("Applications").symlink_metadata().is_ok());
+        assert!(stage.join("Example.app").is_dir());
+        assert_eq!(
+            std::fs::read_link(stage.join("framework-current"))?,
+            Path::new("Versions/Current")
+        );
         Ok(())
     }
 

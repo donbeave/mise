@@ -263,11 +263,15 @@ oracle_cask() {
 EOF
 
   "$brew" install --cask "$token" --yes
+  cp "$room/.metadata/INSTALL_RECEIPT.json" \
+    "$MISE_BREW_ORACLE_RESULT_DIR/brew-$token-receipt.json"
   snapshot_cask "$token" "brew-$token.snapshot"
   "$brew" uninstall --cask "$token"
   assert_fail "test -e '$room'"
 
   mise bootstrap packages apply --yes
+  cp "$room/.metadata/INSTALL_RECEIPT.json" \
+    "$MISE_BREW_ORACLE_RESULT_DIR/mise-$token-receipt.json"
   snapshot_cask "$token" "mise-$token.snapshot"
   brew_oracle_diff \
     "$MISE_BREW_ORACLE_RESULT_DIR/brew-$token.snapshot" \
