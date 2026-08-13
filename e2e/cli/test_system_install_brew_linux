@@ -80,6 +80,11 @@ cleanup_linuxbrew_home() {
 trap cleanup_linuxbrew_home EXIT
 
 useradd --create-home --home-dir /home/linuxbrew linuxbrew
+# Homebrew rejects an inaccessible current directory even when every explicit
+# operation targets its repository. The harness workspace is disposable and is
+# later used by mise as this same user, so transfer it before the first owner
+# switch.
+chown linuxbrew:linuxbrew "$PWD"
 installer_commit=a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5
 installer_sha256=12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41
 curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$installer_commit/install.sh" \
@@ -108,7 +113,7 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew:xz" = "latest"
 EOF
-chown linuxbrew:linuxbrew "$PWD" mise.toml
+chown linuxbrew:linuxbrew mise.toml
 
 # Real Homebrew baseline in disposable state.
 runuser -u linuxbrew -- "$brew" install --formula xz --yes
