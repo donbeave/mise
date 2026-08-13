@@ -8158,6 +8158,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_service_and_opaque_artifacts() {
+        for artifact in [
+            serde_json::json!({"service": {"run": ["example"]}}),
+            serde_json::json!({"artifact": ["Example.plugin"]}),
+        ] {
+            let mut cask = test_cask("example", "1.0.0");
+            cask.artifacts = vec![artifact, serde_json::json!({"app": "Example.app"})];
+
+            let err = cask_artifacts(&cask).unwrap_err().to_string();
+            assert!(err.contains("unsupported artifact type"));
+        }
+    }
+
+    #[test]
     fn rejects_structured_flight_step_group_controls() {
         let mut cask = test_cask("example", "1.0.0");
         cask.artifacts = vec![

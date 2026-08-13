@@ -18,13 +18,18 @@ pkgutil, and `D` delete. `Z` means zap metadata exists but mise never runs zap
 implicitly and exposes no zap operation. `implemented / oracle pending` is code
 support only. `UNSUPPORTED` means fresh availability must fail before mutation.
 
+No pinned corpus row currently publishes a standalone `service` or opaque
+`artifact` stanza. Both mechanism types are explicitly UNSUPPORTED and have
+synthetic parser tests proving rejection before any installable sibling can
+mutate state; they are not silently classified as metadata.
+
 ## Pinned mechanism accounting
 
 | Cask                          | Artifacts | Steps             | Uninstall | Auto | Versioned | Privileged/system | Zap | Engine support                                           |
 | ----------------------------- | --------- | ----------------- | --------- | ---- | --------- | ----------------- | --- | -------------------------------------------------------- |
 | 1password                     | A         | —                 | L,Q       | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | 1password-cli                 | B,G       | —                 | —         | —    | —         | —                 | Z   | implemented / oracle pending                             |
-| bartender                     | A         | —                 | L,Q,D     | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
+| bartender                     | A         | —                 | L,Q,D     | ✓    | —         | —                 | Z   | **UNSUPPORTED: protected `/System` delete**               |
 | chatgpt                       | A         | —                 | Q         | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | claude                        | A         | —                 | Q         | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | claude-code                   | B         | —                 | —         | —    | —         | —                 | Z   | implemented / oracle pending                             |

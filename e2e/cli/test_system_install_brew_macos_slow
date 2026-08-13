@@ -43,6 +43,16 @@ codexbar_room="$prefix/Caskroom/codexbar"
 codexbar_targets=(/Applications/CodexBar.app "$prefix/bin/codexbar")
 vlc_room="$prefix/Caskroom/vlc"
 vlc_targets=(/Applications/VLC.app "$prefix/bin/vlc")
+surge_room="$prefix/Caskroom/surge"
+surge_app="/Applications/Surge.app"
+surge_targets=(
+  "$surge_app"
+  "/Applications/Surge Dashboard.app"
+  "$prefix/bin/surge-cli"
+  "$prefix/sbin/surge-dhcpd"
+)
+surge_launchagent="$HOME/Library/LaunchAgents/com.nssurge.surge-mac.helper.plist"
+surge_delete_target="/Library/PrivilegedHelperTools/com.nssurge.surge-mac.helper"
 
 brew_oracle_require_absent_path "$cask_app" "foreign or stale fixture app"
 brew_oracle_require_absent_path "$caskroom" "foreign or stale fixture Caskroom"
@@ -51,12 +61,17 @@ brew_oracle_require_absent_path "$ghostty_room" "foreign or stale Ghostty Caskro
 for target in "${ghostty_targets[@]}"; do
   brew_oracle_require_absent_path "$target" "foreign or stale Ghostty artifact"
 done
-for room in "$onepassword_room" "$codexbar_room" "$vlc_room"; do
+for room in "$onepassword_room" "$codexbar_room" "$vlc_room" "$surge_room"; do
   brew_oracle_require_absent_path "$room" "foreign or stale cask Caskroom"
 done
 for target in "${onepassword_targets[@]}" "${codexbar_targets[@]}" "${vlc_targets[@]}"; do
   brew_oracle_require_absent_path "$target" "foreign or stale cask artifact"
 done
+for target in "${surge_targets[@]}"; do
+  brew_oracle_require_absent_path "$target" "foreign or stale Surge artifact"
+done
+brew_oracle_require_absent_path "$surge_launchagent" "foreign Surge launch agent"
+brew_oracle_require_absent_path "$surge_delete_target" "foreign Surge helper"
 if find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print -quit 2>/dev/null | grep -q .; then
   brew_oracle_fail "foreign or stale JetBrains Mono font exists"
 fi
@@ -73,6 +88,8 @@ brew_oracle_record_api_fixture cask codexbar 0.49.3 \
   17a8ff2d3ab8b143ff76d3cdbc19ac950d2c7a3a45789c38e451a1fdddeb4224
 brew_oracle_record_api_fixture cask vlc 3.0.23 \
   4df4df5f21490863a16591bb2d6968174bfa4657c037be9dcac929ffdcd0d8f4
+brew_oracle_record_api_fixture cask surge 6.8.1,12030,69f4be88db9663476f31a6b264109f0b \
+  8f0c3fa2392b528ac4d8964b4361947c3d7ce212f44e9405b235062738b5010d
 brew_oracle_record_api_fixture cask cloudflare-warp 2026.6.880.0 \
   dd2d62c16ae5e05d6021c34626d6b8a972a5b0da9cf0ac7196f63a279354576a
 
@@ -134,6 +151,7 @@ cleanup() {
   "$brew" uninstall --cask 1password-cli >/dev/null 2>&1 || true
   "$brew" uninstall --cask codexbar >/dev/null 2>&1 || true
   "$brew" uninstall --cask vlc >/dev/null 2>&1 || true
+  "$brew" uninstall --cask surge >/dev/null 2>&1 || true
   shopt -s nullglob
   local app_work_paths=(
     /Applications/Hidden\ Bar.mise-old-*
@@ -141,9 +159,12 @@ cleanup() {
   )
   chmod -RN "$hiddenbar_app" "${app_work_paths[@]}" 2>/dev/null || true
   rm -rf "$hiddenbar_app" "$hiddenbar_room" "$font_room" "$ghostty_room" \
-    "$onepassword_room" "$codexbar_room" "$vlc_room" \
+    "$onepassword_room" "$codexbar_room" "$vlc_room" "$surge_room" \
+    "$surge_launchagent" \
     "${ghostty_targets[@]}" "${onepassword_targets[@]}" \
-    "${codexbar_targets[@]}" "${vlc_targets[@]}" "${app_work_paths[@]}"
+    "${codexbar_targets[@]}" "${vlc_targets[@]}" "${surge_targets[@]}" \
+    "${app_work_paths[@]}"
+  sudo rm -rf "$surge_delete_target"
   brew_oracle_remove_runtime_bridge
 }
 trap cleanup EXIT
@@ -171,6 +192,7 @@ snapshot_cask() {
       1password-cli) targets=("${onepassword_targets[@]}") ;;
       codexbar) targets=("${codexbar_targets[@]}") ;;
       vlc) targets=("${vlc_targets[@]}") ;;
+      surge) targets=("${surge_targets[@]}") ;;
       *) return 1 ;;
     esac
     for target in "${targets[@]}"; do
@@ -179,6 +201,43 @@ snapshot_cask() {
     done
   fi
   brew_oracle_snapshot "$output" "${roots[@]}"
+}
+
+assert_cask_absent() {
+  local token=$1 room="$prefix/Caskroom/$1" target
+  [[ ! -e $room && ! -L $room ]] || return 1
+  case "$token" in
+    hiddenbar) [[ ! -e $hiddenbar_app && ! -L $hiddenbar_app ]] ;;
+    font-jetbrains-mono)
+      ! find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print -quit 2>/dev/null | grep -q .
+      ;;
+    ghostty)
+      for target in "${ghostty_targets[@]}"; do
+        [[ ! -e $target && ! -L $target ]] || return 1
+      done
+      ;;
+    1password-cli)
+      for target in "${onepassword_targets[@]}"; do
+        [[ ! -e $target && ! -L $target ]] || return 1
+      done
+      ;;
+    codexbar)
+      for target in "${codexbar_targets[@]}"; do
+        [[ ! -e $target && ! -L $target ]] || return 1
+      done
+      ;;
+    vlc)
+      for target in "${vlc_targets[@]}"; do
+        [[ ! -e $target && ! -L $target ]] || return 1
+      done
+      ;;
+    surge)
+      for target in "${surge_targets[@]}"; do
+        [[ ! -e $target && ! -L $target ]] || return 1
+      done
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 oracle_cask() {
@@ -211,7 +270,14 @@ EOF
   brew_oracle_diff \
     "$MISE_BREW_ORACLE_RESULT_DIR/before-$token-noop.snapshot" \
     "$MISE_BREW_ORACLE_RESULT_DIR/after-$token-noop.snapshot"
-  "$brew" uninstall --cask "$token"
+
+  # Real-Homebrew-created state must also be removable by mise using only the
+  # installed receipt. An empty declarative set drives the real prune path.
+  cat <<'EOF' >mise.toml
+[bootstrap.packages]
+EOF
+  mise bootstrap packages prune --manager brew-cask --yes
+  assert_cask_absent "$token"
 }
 
 oracle_cask hiddenbar
@@ -220,6 +286,28 @@ oracle_cask ghostty
 oracle_cask 1password-cli
 oracle_cask codexbar
 oracle_cask vlc
+oracle_cask surge
+
+# Surge's installed receipt supplies launchctl and delete teardown.
+# Break only its public app to force a successor install, then prove predecessor
+# actions execute before activation and the app is recreated.
+cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew-cask:surge" = "latest"
+EOF
+mise bootstrap packages apply --yes
+mkdir -p "$(dirname "$surge_launchagent")"
+printf 'fixture\n' >"$surge_launchagent"
+sudo mkdir -p "$surge_delete_target"
+sudo touch "$surge_delete_target/mise-oracle"
+rm -rf "$surge_app"
+assert_contains "mise bootstrap packages status" "needs repair"
+mise bootstrap packages apply --yes
+assert_directory_exists "$surge_app"
+assert_fail "test -e '$surge_launchagent'"
+assert_fail "test -e '$surge_delete_target'"
+assert_contains "mise bootstrap packages status" "installed"
+"$brew" uninstall --cask surge
 
 # Preserve tap coverage.
 assert_contains "mise bootstrap packages brew tap --dry-run jdx/tap" "~/.config/mise/config.toml"
@@ -250,4 +338,4 @@ EOF
   assert_contains "$prefix/bin/aube --version" "aube"
 fi
 
-brew_oracle_complete test_system_install_brew_macos_slow 7 /opt/homebrew
+brew_oracle_complete test_system_install_brew_macos_slow 8 /opt/homebrew
