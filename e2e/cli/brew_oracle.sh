@@ -76,7 +76,7 @@ brew_oracle_snapshot() {
       elif [[ -d $path ]]; then
         printf 'd %s %s\n' "$mode" "$relative" >>"$entries"
       elif [[ -f $path ]]; then
-        if [[ $path == *.json ]]; then
+        if [[ $path == */INSTALL_RECEIPT.json || $path == */sbom.spdx.json ]]; then
           normalized="$scratch/normalized.json"
           brew_oracle_normalize_json "$path" "$normalized"
           digest=$(shasum -a 256 "$normalized" | awk '{print $1}')
