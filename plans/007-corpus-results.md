@@ -7,7 +7,7 @@ Source identity for every row:
 
 - API: `https://formulae.brew.sh/api/cask/<token>.json`
 - tap: `homebrew/cask`
-- tap commit: `9a1a1d1caa8dd0b1f40107205cb3776120130245`
+- drift-audit tap commit: `38e49d2d9b9113d2384550124f9dca83323c73a8`
 - Homebrew behavior reference: `6.0.17`, commit
   `4dacfe77a24dead72de749c0876028b77b99cd04`
 
@@ -70,49 +70,51 @@ its app + two manpages + three declared completions.
 
 ## Exact API payload identities
 
-The SHA-256 is over canonical sorted JSON after removing only the live
-`analytics` and `generated_date` fields. All structural cask data, versions,
-artifact URLs/checksums, mechanisms, and tap identity remain pinned.
+The SHA-256 is over canonical sorted JSON after removing live `analytics`,
+`generated_date`, and the tap-global `tap_git_head`. Every per-cask
+`ruby_source_checksum`, version, artifact URL/checksum, and mechanism remains
+pinned. The global tap head is recorded above but excluded because an unrelated
+tap commit otherwise invalidates every unchanged cask fixture.
 
 | Cask                          | Version                                            | SHA-256                                                            |
 | ----------------------------- | -------------------------------------------------- | ------------------------------------------------------------------ |
-| 1password                     | 8.12.33                                            | `bb82a1030961864607ed871cafdd5c6baaa725713f0e6aaab1ba071a808b90c7` |
-| 1password-cli                 | 2.38.1                                             | `d819694c6428760d4b539913b5962d8e1f7ac2310253a9167eb20d4a6b1a8f14` |
-| bartender                     | 6.6.2                                              | `b71788109bb5053abab6be69656ab53f5a3bc74dfd5bd5b5877435791bfa9388` |
-| chatgpt                       | 26.803.81509                                       | `0d669a3bdd87e0013771a3ac6e4372ae1d890200ac9a8cc4526293a8c8e419e7` |
-| claude                        | 1.28929.0,d1a6bcd4ef8627d603a8290548a984220b6701cf | `bd2960c186692f39746b76337a8187edbf8ba3f2ba0f781196ef86d8b731b15a` |
-| claude-code                   | 2.1.222                                            | `4bff89d3240e4b736f30d65c52e3c11ba682387f058713f18c06515b0bfa49a9` |
-| cleanshot                     | 4.8.10                                             | `653391f8eeac4d3f5841e01aac540e21339f8a0c3d602a92ec9531384d2d3e65` |
-| cloudflare-warp               | 2026.6.880.0                                       | `dd2d62c16ae5e05d6021c34626d6b8a972a5b0da9cf0ac7196f63a279354576a` |
-| codex                         | 0.147.0                                            | `dedcbcbea960912cac5302703b403f8cea3f481830340fc622e17f384d3fe380` |
-| codexbar                      | 0.49.3                                             | `17a8ff2d3ab8b143ff76d3cdbc19ac950d2c7a3a45789c38e451a1fdddeb4224` |
-| font-jetbrains-mono           | 2.304                                              | `759100caac0dbb17c0a3d54a050584a89893ed787ed84a821afedd6b99e1c8e0` |
-| font-jetbrains-mono-nerd-font | 3.5.0                                              | `da91b0312efbaae14a73dc2318ba799a6aa48ddc2d03eecac3a65477fd1c69cf` |
-| ghostty                       | 1.3.1                                              | `628dfe93794ad00c7025925832727f71aaea676feafa68138a2e64323a88d0aa` |
-| google-chrome                 | 151.0.7922.138                                     | `755cfd18efc0258e600f27b59ed0ae819bafcfcc33c33e6c750b2d4e54235023` |
-| grammarly-desktop             | 1.183.1.0                                          | `bb22709dced0a0aa8db186eb60f495f4fe6f87e9d6ccbc7e927e05e046f91fe2` |
-| grok-build                    | 1.0.3                                              | `38d4a7f61366d7fbbddc524018fd4a7f055f5029aba07830769dc0e31a5189c5` |
-| handbrake-app                 | 1.11.2                                             | `40a912f7302220faa78adea4d36c2aa167264c3f7f9a32056b66550f5b9c5184` |
-| jetbrains-toolbox             | 3.6.4,3.6.4.86641                                  | `97ce78344ab11d8dd7390edaa97602be6a68c0c873e8d4b86b19cebd5692330a` |
-| kimi                          | 3.1.8                                              | `4e245261670242d388dc4ab32dc8bddcf7738f07ebd4fadd3a67249e5616999f` |
-| little-snitch                 | 6.4.1                                              | `e899d3a20862e2bf8a6b9b0952078c3e900564f2cd69e6df863fbd088f877d76` |
-| notion                        | 7.30.0                                             | `531f3183f101a924499f949c6a214f53b3405fcab1f554034f9dcb971f307483` |
-| opencode-desktop              | 1.18.17                                            | `ecccbcc63aa0fcb331e47468808d8dfd0c5242831e68d4c69d12c9b51dc1aadd` |
-| orbstack                      | 2.2.3,20963                                        | `1aac4067bd6f70086a5a43291f2bd361e9f420d2585d4e3fe8b299529664eec8` |
-| plex-media-server             | 1.43.3.10861,07dfddaeb                             | `c9c03348869baa0d196e6e8af4f8a24d43a229ab1218172199adfed7c1cf55e2` |
-| sketch                        | 2026.2.1,231087                                    | `ef8e5bf55a4c3d784fbc102c44168df8468d7ab027222af97bf93118499dbb53` |
-| speechify-voice-ai            | 3.12.0                                             | `80b3468dc698e88e7274dd02a847c8b1b1cde10a492112fc17941b137e142be6` |
-| sublime-text                  | 4200                                               | `2b3dd706035e413596a0fec86a7f2e0d0de23f46f6a5f442839a48232b14c816` |
-| superwhisper                  | 2.17.2                                             | `897fd8367cf98df7a954047b82df909093f35d9849250ca3bb462041062bb792` |
-| surge                         | 6.8.1,12030,69f4be88db9663476f31a6b264109f0b       | `8f0c3fa2392b528ac4d8964b4361947c3d7ce212f44e9405b235062738b5010d` |
-| tableplus                     | 26.9.6,762                                         | `8e683526c6d6f4b9ac8449c1033ded25cffd8ba7bb12d51510ead0256e43fa7e` |
-| tor-browser                   | 15.0.19                                            | `4340d6b3e1804a6084f553510c01ec39658140c18cb371cecbde992ef5ab7795` |
-| transmission                  | 4.1.3                                              | `5e0dfc6088107647c5c2f2a42035b01a75cecbe941d85c59e481a66896a28f2d` |
-| visualvm                      | 2.2.1                                              | `ada9d84a1ed42230a44e5548d971681491f3b0616d37a389887603b7342251f7` |
-| vlc                           | 3.0.23                                             | `4df4df5f21490863a16591bb2d6968174bfa4657c037be9dcac929ffdcd0d8f4` |
-| yaak                          | 2026.5.0                                           | `5fef44435759ba9540978fdf2e7ee4af14f7de1345557373065663bae58db9a8` |
-| zed@preview                   | 1.16.0                                             | `a78be581d8747bf90f83e76148d74ccb1bb16d6e2496b3cd40d6ab8c6e812767` |
-| zoom                          | 7.1.5.84650                                        | `2563de8e659fb51c4720aecd4def75b86de8105213a7e21f27b9682acab5cbd5` |
+| 1password                     | 8.12.33                                            | `7f99a444e4e3f75e59f5730850348709ac9c3f923de5efe780b7f352de00eeb7` |
+| 1password-cli                 | 2.38.1                                             | `7f8a437caee68aefa8c965ed2f1e14a685eb4330e83370bef4ec7f6dc0fdbcfc` |
+| bartender                     | 6.6.2                                              | `c5078747fa2b5ba5043e183891a72a45d01bf3053013f5d88a287bb253b816d9` |
+| chatgpt                       | 26.803.81509                                       | `26df9e4ac9ab1225a5efb0a97e8eb321f229fb8fb5a43f2109360c4968ee5c0e` |
+| claude                        | 1.28929.0,d1a6bcd4ef8627d603a8290548a984220b6701cf | `10f7f3a27e43c03202c54002bbde4b16a9c1444b2d0f080e694f69ec5936e42f` |
+| claude-code                   | 2.1.222                                            | `1b605465a7e9a407303a454e77bd8406db9969ce1da14970382775185aba0174` |
+| cleanshot                     | 4.8.10                                             | `ee8175bdc2ffdfcf7cf94a7c2c17e12a83621b28f204b874410cd3a232031429` |
+| cloudflare-warp               | 2026.6.880.0                                       | `086798c2bb9d5afe1097baa3c2c7b988ccf7f56d8f3b830597f507e315d405ea` |
+| codex                         | 0.147.0                                            | `7c4c425cc4c1f2efc499468a064195c2bff09019fb9959bf3692678c60243135` |
+| codexbar                      | 0.49.3                                             | `6ee8f8d1ba0c8ac4ba246d2ff7223bbefe05df1ada7174c8e1aa769131e13131` |
+| font-jetbrains-mono           | 2.304                                              | `4aa667b54ee06b86b2473d6cfbedb0900527e918d0be8f89b2026efd69588ca2` |
+| font-jetbrains-mono-nerd-font | 3.5.0                                              | `968a3b3af709f03b8ee779a7e4b2158f184d6ec3c3b20d4d709c043ed3e3074c` |
+| ghostty                       | 1.3.1                                              | `fd15d22ac65ec6603d446f636014487d07515e296e961600575d39f7e564469b` |
+| google-chrome                 | 151.0.7922.138                                     | `2a120276338086c896ce8fed50c78d55589aecb71c8f62198e3bd30f58df2751` |
+| grammarly-desktop             | 1.183.1.0                                          | `a169237422edcee61f7ddd7f69284c8216203173749651c3c7052e0bdde7eab7` |
+| grok-build                    | 1.0.3                                              | `f27af9215951e93c04a99de48fa1d646ece0a7476649a7617602396bae1cf43b` |
+| handbrake-app                 | 1.11.2                                             | `f2a37c33995358be549285ca463b36dd7bf32ca1be8f5e5adb80f68b704a9fa1` |
+| jetbrains-toolbox             | 3.6.4,3.6.4.86641                                  | `21f810a08d37fa173257789e3033e2b1cc17812ab1e6f336bb9f84a687e80717` |
+| kimi                          | 3.1.8                                              | `014418985609e8e14d373341281c4969e9fc048a1d6372f02d8a383679995434` |
+| little-snitch                 | 6.4.1                                              | `4ad35e4ebe93e32f5522bed384960cde0546f1a6b00a0cbbd1542ddcb405bcdf` |
+| notion                        | 7.30.0                                             | `6d0630ddfb71e224d0a92648d2aba394833f3e50bd6f53f1f09453f6d6a452d0` |
+| opencode-desktop              | 1.18.18                                            | `f96d55de8513558057e4e2b3c8555a16e0be09a9027477fd511d1bac0fef006c` |
+| orbstack                      | 2.2.3,20963                                        | `88873c2daa481ab84233017f80107e72f2b53bc1bab14b36fa0bf11b1f91a61e` |
+| plex-media-server             | 1.43.3.10861,07dfddaeb                             | `41f07656e5f23fe3645cb49fa15c2c13c52f4cd3acdce78e2443a8e8017e7004` |
+| sketch                        | 2026.2.1,231087                                    | `e4e708e5e9324d81a90cc0c4379f3bfc08c1d68131ee8586eb3f0868ddb95598` |
+| speechify-voice-ai            | 3.12.0                                             | `b9b40a7911d61140e6d5f37c3a5b961f6ef7f391c38b4e4862d3d8e1bdcb8596` |
+| sublime-text                  | 4200                                               | `ef679312ae564b9856d8055a46114e32c9833f7dbaee2ad7ec84b4036e2a83ff` |
+| superwhisper                  | 2.17.2                                             | `c0b88b61c3b8ab87596e13cfc01d513c97f036ab9c85de7eaa2ddbf78c2e83d0` |
+| surge                         | 6.8.1,12030,69f4be88db9663476f31a6b264109f0b       | `0fb4149cc488687d0cb8a720cbaf77dfa13910aa03fee77bc38154cb3148a2e2` |
+| tableplus                     | 26.9.6,762                                         | `af5d8b2c92c5621d20467069c0ae1827a552344b3478fa0950a972b9b397aa2f` |
+| tor-browser                   | 15.0.19                                            | `688ab3b9a287158ab7b7fc594bc7d472a6c4d212b4ebd1599b83c2a11a55a203` |
+| transmission                  | 4.1.3                                              | `d10996b4b17b3d9379605232cf5fc4aabc4d57353acaf0c494f61cf789ae1591` |
+| visualvm                      | 2.2.1                                              | `69b66cb7cc3d8951b0ac8d098016a126e5eb1c87c12ee0923f61a4bb48868d3c` |
+| vlc                           | 3.0.23                                             | `d2006154048a8f146edf3f4827019e42deb7f82e03eb954c82d9d9ea0311dcd5` |
+| yaak                          | 2026.5.0                                           | `bd15089ef073e10a7b9b35be5794c59d3361b5191ae8ee513b060414b0946efc` |
+| zed@preview                   | 1.16.0                                             | `8dac7458ef35a6ef5bc042653b722bcad4eaf9068520d0fe7765e5f8003397f3` |
+| zoom                          | 7.1.5.84650                                        | `99bbf3dea0677e8e6418bdf247ea16443a50402af7194d84f4e81fcb3bf56492` |
 
 ## Required plan 018 evidence
 

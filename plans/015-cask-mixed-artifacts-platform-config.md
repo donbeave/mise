@@ -73,9 +73,10 @@ Local proof at `bca8747bd362679a6c97d72f3e0001539730f011`:
   topology, predecessor claims, and prune. Invalid sections/escapes fail.
 - Ghostty-shaped unit coverage executes app + two manpages + bash/fish/zsh
   completions. `plans/007-corpus-results.md` now pins all 37 names as a
-  multi-mechanism matrix at tap commit
-  `9a1a1d1caa8dd0b1f40107205cb3776120130245`, with canonical API payload
-  digests that exclude only analytics and generation time.
+  multi-mechanism matrix. The 2026-08-13 drift audit advanced the observed tap
+  head to `38e49d2d9b9113d2384550124f9dca83323c73a8`. Canonical API digests exclude
+  analytics, generation time, and the tap-global head while retaining each
+  cask's exact `ruby_source_checksum` and all operational fields.
 - One platform directory model drives target paths and native config. Linux
   tests cover `~/.config/apps`, XDG fonts, `~/.vst`, and `~/.vst3`, and reject
   macOS path leakage.

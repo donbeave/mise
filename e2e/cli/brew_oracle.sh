@@ -123,7 +123,9 @@ brew_oracle_record_api_fixture() {
     echo "brew oracle fixture drift: $kind:$token version $actual_version != $expected_version" >&2
     return 1
   }
-  jq -S 'del(.analytics, .generated_date)' "$raw" >"$canonical"
+  # `tap_git_head` changes for every unrelated tap commit. Pin the payload's
+  # per-definition ruby_source_checksum and all operational fields instead.
+  jq -S 'del(.analytics, .generated_date, .tap_git_head)' "$raw" >"$canonical"
   actual_sha=$(shasum -a 256 "$canonical" | awk '{print $1}')
   [[ $actual_sha == "$expected_sha" ]] || {
     echo "brew oracle fixture drift: $kind:$token digest $actual_sha != $expected_sha" >&2
