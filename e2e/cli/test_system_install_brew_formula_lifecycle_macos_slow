@@ -73,11 +73,6 @@ cleanup_formula_oracle() {
   brew_oracle_remove_runtime_bridge
 }
 
-cleanup_formula_oracle() {
-  cleanup_formula_fixtures
-  brew_oracle_remove_runtime_bridge
-}
-
 # The explicit capability authorizes displacement of these exact fixtures on
 # this ephemeral runner. The record above makes that displacement auditable.
 cleanup_formula_fixtures
