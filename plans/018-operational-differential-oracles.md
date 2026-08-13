@@ -35,7 +35,7 @@ Execution continuation (2026-08-13):
   `4dacfe77a24dead72de749c0876028b77b99cd04`, then correctly failed because
   `brew uninstall` in 6.0.17 does not accept the stale oracle's `--yes` flag.
 - the root-only Kimi fixture now invokes the same top-level `mise bootstrap
-  --yes` entry point as essential-mac. Its legacy phase removes OpenSSL's
+--yes` entry point as essential-mac. Its legacy phase removes OpenSSL's
   linked-keg, shared etc, and lifecycle record while retaining the keg,
   receipt, opt, formula snapshot, and `.bottle/etc`; it proves offline exact
   diagnosis, inode-preserving repair, and fail-closed checksum ambiguity.
