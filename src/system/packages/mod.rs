@@ -61,33 +61,26 @@ pub enum PackageState {
     VersionMismatch {
         installed: String,
     },
-    /// The manager is available on this host, but this individual package is
-    /// not supported on the current platform.
+    /// The manager can inspect this package on the current host, but required
+    /// install/teardown semantics are not implemented safely. Unlike an
+    /// unavailable manager, apply must fail rather than skip shared config.
     #[cfg(unix)]
-    Unavailable {
+    Unsupported {
         reason: String,
     },
 }
 
 impl PackageState {
     #[cfg(unix)]
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        Self::Unavailable {
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self::Unsupported {
             reason: reason.into(),
         }
     }
 
-    pub fn is_unavailable(&self) -> bool {
+    pub fn unsupported_reason(&self) -> Option<&str> {
         #[cfg(unix)]
-        if matches!(self, Self::Unavailable { .. }) {
-            return true;
-        }
-        false
-    }
-
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        #[cfg(unix)]
-        if let Self::Unavailable { reason } = self {
+        if let Self::Unsupported { reason } = self {
             return Some(reason);
         }
         None
