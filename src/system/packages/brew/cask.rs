@@ -840,7 +840,7 @@ impl SystemPackageManager for BrewCaskManager {
                 }
             };
             let artifacts = cask_artifacts(&cask)?;
-            if let Some(state) = platform_unavailable_state(&cask, &artifacts) {
+            if let Some(state) = unsupported_package_state(&cask, &artifacts) {
                 statuses.push(PackageStatus {
                     request: req.clone(),
                     state,
@@ -3239,10 +3239,10 @@ fn validate_platform_support(cask: &Cask, artifacts: &CaskArtifacts) -> Result<(
     Ok(())
 }
 
-fn platform_unavailable_state(cask: &Cask, artifacts: &CaskArtifacts) -> Option<PackageState> {
+fn unsupported_package_state(cask: &Cask, artifacts: &CaskArtifacts) -> Option<PackageState> {
     validate_platform_support(cask, artifacts)
         .err()
-        .map(|err| PackageState::unavailable(err.to_string()))
+        .map(|err| PackageState::unsupported(err.to_string()))
 }
 
 fn artifact_target(value: &Value, values: &[Value]) -> Option<String> {
@@ -9480,6 +9480,13 @@ end
             .unwrap_err()
             .to_string();
         assert!(error.contains("BOM") && error.contains("not implemented"));
+        let state = unsupported_package_state(&cask, &artifacts)
+            .expect("unsupported pkg lifecycle must be classified");
+        assert!(matches!(
+            state,
+            PackageState::Unsupported { reason }
+                if reason.contains("BOM") && reason.contains("not implemented")
+        ));
         Ok(())
     }
 
