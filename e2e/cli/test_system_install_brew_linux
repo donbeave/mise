@@ -135,6 +135,8 @@ run_mise_as_linuxbrew() {
     MISE_TRUSTED_CONFIG_PATHS="$PWD" \
     "$mise_bin" "$@"
 }
+export mise_bin
+export -f run_mise_as_linuxbrew
 mise_as_linuxbrew=run_mise_as_linuxbrew
 
 cat <<EOF >mise.toml
