@@ -38,8 +38,11 @@ pub struct BuiltOn {
     pub os: String,
     pub os_version: String,
     pub cpu_family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub xcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub clt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_perl: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -390,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn built_on_absent_probe_values_serialize_as_null() {
+    fn built_on_absent_probe_values_are_omitted() {
         let value = serde_json::to_value(BuiltOn {
             os: "Linux".to_string(),
             os_version: "test".to_string(),
@@ -402,9 +405,9 @@ mod tests {
         })
         .unwrap();
 
-        assert!(value["xcode"].is_null());
-        assert!(value["clt"].is_null());
-        assert!(value["preferred_perl"].is_null());
+        assert!(value.get("xcode").is_none());
+        assert!(value.get("clt").is_none());
+        assert!(value.get("preferred_perl").is_none());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
