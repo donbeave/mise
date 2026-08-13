@@ -5043,7 +5043,7 @@ fn write_homebrew_metadata(caskroom: &Path, cask: &Cask, retain_backup: bool) ->
     file::remove_all(&backup)?;
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d%H%M%S%.3f").to_string();
-    let uninstall_artifacts = cask_uninstall_artifacts(cask);
+    let uninstall_artifacts = cask_uninstall_artifacts(cask)?;
     let snapshot_bytes = installed_cask_snapshot(cask, &uninstall_artifacts)?;
     let snapshot = metadata
         .join(&cask.version)
@@ -5154,20 +5154,116 @@ fn installed_cask_snapshot(cask: &Cask, uninstall_artifacts: &[Value]) -> Result
     Ok(serde_json::to_vec_pretty(&Value::Object(installed))?)
 }
 
-fn cask_uninstall_artifacts(cask: &Cask) -> Vec<Value> {
-    cask.artifacts
+fn homebrew_artifact_rank(kind: &str) -> Option<u8> {
+    match kind {
+        "preflight_steps" => Some(0),
+        "uninstall_preflight_steps" => Some(1),
+        "preflight" | "uninstall_preflight" => Some(2),
+        "uninstall" => Some(3),
+        "generated_script" => Some(4),
+        "installer" => Some(5),
+        "pkg" => Some(6),
+        "app" | "appimage" | "suite" | "artifact" | "colorpicker" | "prefpane" | "qlplugin"
+        | "mdimporter" | "dictionary" | "font" | "service" | "input_method" | "internet_plugin"
+        | "keyboard_layout" | "audio_unit_plugin" | "vst_plugin" | "vst3_plugin"
+        | "screen_saver" => Some(7),
+        "binary" | "command_wrapper" => Some(8),
+        "manpage" => Some(9),
+        "bash_completion" | "fish_completion" | "zsh_completion" => Some(10),
+        "generate_completions_from_executable" => Some(11),
+        "postflight_steps" => Some(12),
+        "uninstall_postflight_steps" => Some(13),
+        "postflight" | "uninstall_postflight" => Some(14),
+        "zap" => Some(15),
+        _ => None,
+    }
+}
+
+fn homebrew_artifact_is_uninstallable(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "preflight" | "postflight" | "generated_script" | "installer" | "pkg"
+    )
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HomebrewArtifactOrder {
+    rank: u8,
+    index: usize,
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn compare_homebrew_artifact_order(
+    left: *const nix::libc::c_void,
+    right: *const nix::libc::c_void,
+) -> nix::libc::c_int {
+    let left = unsafe { &*left.cast::<HomebrewArtifactOrder>() };
+    let right = unsafe { &*right.cast::<HomebrewArtifactOrder>() };
+    match left.rank.cmp(&right.rank) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[cfg(unix)]
+fn sort_homebrew_artifact_order(entries: &[(u8, Value)]) -> Vec<usize> {
+    let mut order = entries
         .iter()
-        .filter_map(|artifact| {
-            let object = artifact.as_object()?;
-            let key = object.keys().find(|key| key.as_str() != "target")?;
-            if matches!(key.as_str(), "pkg" | "preflight" | "postflight") {
-                return None;
-            }
-            let mut entry = serde_json::Map::new();
-            entry.insert(key.clone(), object.get(key).cloned().unwrap_or(Value::Null));
-            Some(Value::Object(entry))
-        })
-        .collect()
+        .enumerate()
+        .map(|(index, (rank, _))| HomebrewArtifactOrder { index, rank: *rank })
+        .collect::<Vec<_>>();
+    // Ruby Array#sort delegates to the platform C qsort implementation. The
+    // comparison returns equal for artifacts sharing Homebrew's type rank, so
+    // use that same primitive to reproduce native receipt byte order exactly.
+    unsafe {
+        nix::libc::qsort(
+            order.as_mut_ptr().cast(),
+            order.len(),
+            std::mem::size_of::<HomebrewArtifactOrder>(),
+            Some(compare_homebrew_artifact_order),
+        );
+    }
+    order.into_iter().map(|entry| entry.index).collect()
+}
+
+#[cfg(not(unix))]
+fn sort_homebrew_artifact_order(entries: &[(u8, Value)]) -> Vec<usize> {
+    let mut order = (0..entries.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| (entries[*index].0, *index));
+    order
+}
+
+fn cask_uninstall_artifacts(cask: &Cask) -> Result<Vec<Value>> {
+    let mut entries = Vec::with_capacity(cask.artifacts.len());
+    for artifact in &cask.artifacts {
+        let object = artifact
+            .as_object()
+            .ok_or_else(|| eyre!("brew-cask:{}: artifact is not an object", cask.token))?;
+        let key = object
+            .keys()
+            .find(|key| key.as_str() != "target")
+            .ok_or_else(|| eyre!("brew-cask:{}: artifact has no type", cask.token))?;
+        let rank = homebrew_artifact_rank(key).ok_or_else(|| {
+            eyre!(
+                "brew-cask:{}: unsupported artifact type {key:?}",
+                cask.token
+            )
+        })?;
+        if !homebrew_artifact_is_uninstallable(key) {
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert(key.clone(), object.get(key).cloned().unwrap_or(Value::Null));
+        entries.push((rank, Value::Object(entry)));
+    }
+
+    Ok(sort_homebrew_artifact_order(&entries)
+        .into_iter()
+        .map(|index| entries[index].1.clone())
+        .collect())
 }
 
 fn cask_runtime_dependencies(cask: &Cask) -> Result<serde_json::Map<String, Value>> {
@@ -7467,7 +7563,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_artifacts_match_homebrew_order_and_shape() {
+    fn uninstall_artifacts_match_homebrew_order_and_shape() -> Result<()> {
         let mut codex = test_cask("codex", "1.2.3");
         codex.artifacts = serde_json::from_value(serde_json::json!([
             {"binary": ["codex-aarch64-apple-darwin", {"target": "codex"}]},
@@ -7481,7 +7577,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            cask_uninstall_artifacts(&codex),
+            cask_uninstall_artifacts(&codex)?,
             serde_json::from_value::<Vec<Value>>(serde_json::json!([
                 {"binary": ["codex-aarch64-apple-darwin", {"target": "codex"}]},
                 {
@@ -7504,10 +7600,10 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            cask_uninstall_artifacts(&pkg),
+            cask_uninstall_artifacts(&pkg)?,
             serde_json::from_value::<Vec<Value>>(serde_json::json!([
-                {"app": ["Example.app"]},
                 {"uninstall": [{"pkgutil": "com.example.pkg"}]},
+                {"app": ["Example.app"]},
                 {"postflight_steps": [{"steps": [{"type": "terminate_process", "name": "Example"}]}]},
                 {"uninstall_postflight": null},
                 {"zap": [{"trash": "~/Library/Application Support/Example"}]}
@@ -7519,10 +7615,33 @@ mod tests {
         font.artifacts = (0..16)
             .map(|index| serde_json::json!({"font": [format!("font-{index}.ttf")]}))
             .collect();
-        let ordered = cask_uninstall_artifacts(&font);
-        for (index, artifact) in ordered.iter().enumerate() {
-            assert_eq!(artifact["font"][0], format!("font-{index}.ttf"));
-        }
+        let ordered = cask_uninstall_artifacts(&font)?;
+        let sources = ordered
+            .iter()
+            .map(|artifact| artifact["font"][0].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            [
+                "font-15.ttf",
+                "font-1.ttf",
+                "font-2.ttf",
+                "font-3.ttf",
+                "font-4.ttf",
+                "font-5.ttf",
+                "font-6.ttf",
+                "font-7.ttf",
+                "font-8.ttf",
+                "font-9.ttf",
+                "font-10.ttf",
+                "font-11.ttf",
+                "font-12.ttf",
+                "font-13.ttf",
+                "font-14.ttf",
+                "font-0.ttf",
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -7542,7 +7661,10 @@ mod tests {
         let receipt = receipt::read_cask_receipt(&token_dir)?;
         assert_eq!(receipt.homebrew_version, receipt::EMULATED_BREW_VERSION);
         assert_eq!(receipt.source.version, "1.2.3");
-        assert_eq!(receipt.uninstall_artifacts, cask_uninstall_artifacts(&cask));
+        assert_eq!(
+            receipt.uninstall_artifacts,
+            cask_uninstall_artifacts(&cask)?
+        );
         assert!(token_dir.join(".metadata/config.json").is_file());
         let snapshot_dir = receipt::newest_cask_metadata_dir(&token_dir, "1.2.3")?.unwrap();
         assert_eq!(
