@@ -445,6 +445,8 @@ MISE_URL_REPLACEMENTS="$archive_replacements" \
 mise_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
 assert_contains "'$mise_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0"
 assert_contains "cat '$mise_archive_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": true'
+cp "$mise_archive_keg/INSTALL_RECEIPT.json" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive-INSTALL_RECEIPT.json"
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive.snapshot" \
   "keg=$mise_archive_keg"
 assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "archive-fixture"
@@ -454,6 +456,8 @@ assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/archive-fixture"
 
 runuser -u linuxbrew -- "$brew" install --force-bottle mise/oracle/archive-fixture
 brew_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
+cp "$brew_archive_keg/INSTALL_RECEIPT.json" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive-INSTALL_RECEIPT.json"
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive.snapshot" \
   "keg=$brew_archive_keg"
 brew_oracle_diff \
