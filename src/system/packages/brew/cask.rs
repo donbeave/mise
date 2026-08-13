@@ -10416,7 +10416,7 @@ end
 
         assert!(!stage.join(".background").exists());
         assert!(!stage.join(".DS_Store").exists());
-        assert!(!stage.join("Applications").symlink_metadata().is_ok());
+        assert!(stage.join("Applications").symlink_metadata().is_err());
         assert!(stage.join("Example.app").is_dir());
         assert_eq!(
             std::fs::read_link(stage.join("framework-current"))?,

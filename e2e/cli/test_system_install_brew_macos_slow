@@ -133,25 +133,27 @@ cat <<EOF >mise.toml
 "brew-cask:hiddenbar" = "latest"
 EOF
 lock_ready="$MISE_BREW_ORACLE_RESULT_DIR/hiddenbar-lock-held"
+lock_release="$MISE_BREW_ORACLE_RESULT_DIR/hiddenbar-lock-release"
 lock_holder="$MISE_BREW_ORACLE_RESULT_DIR/homebrew-cask-lock-holder.rb"
 cat <<'RUBY' >"$lock_holder"
 require "lock_file"
 
 CaskLock.new(ARGV.fetch(0)).with_lock do
     File.write(ARGV.fetch(1), "held\n")
-    sleep 5
+    1_200.times do
+      break if File.exist?(ARGV.fetch(2))
+
+      sleep 0.1
+    end
 end
 RUBY
-"$brew" ruby "$lock_holder" hiddenbar "$lock_ready" &
+"$brew" ruby "$lock_holder" hiddenbar "$lock_ready" "$lock_release" &
 lock_pid=$!
-for _ in {1..50}; do
-  [[ -f $lock_ready ]] && break
-  sleep 0.1
-done
-[[ -f $lock_ready ]] || brew_oracle_fail "Homebrew-compatible lock holder did not start"
+wait_for_file "$lock_ready" "Homebrew-compatible lock holder" 30 "$lock_pid"
 assert_fail "mise bootstrap packages apply --yes"
 brew_oracle_require_absent_path "$hiddenbar_app" "artifact created while cask lock was held"
 brew_oracle_require_absent_path "$hiddenbar_room" "metadata created while cask lock was held"
+: >"$lock_release"
 wait "$lock_pid"
 unset lock_pid
 
