@@ -248,6 +248,9 @@ cp "$mise_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json"
 cp "$mise_hello_keg/.brew/hello.rb" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-formula.rb"
+chmod 0644 \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-formula.rb"
 runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
 
@@ -262,6 +265,9 @@ assert_succeed "test -s '$brew_hello_keg/.brew/hello.rb'"
 cp "$brew_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-receipt.json"
 cp "$brew_hello_keg/.brew/hello.rb" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-formula.rb"
+chmod 0644 \
+  "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-receipt.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-formula.rb"
 runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
@@ -402,9 +408,10 @@ git -C "$archive_tap" remote add origin https://github.com/mise/homebrew-oracle.
 git -C "$archive_tap" add Formula/archive-fixture.rb
 git -C "$archive_tap" -c user.name=oracle -c user.email=oracle@example.invalid \
   commit -m 'test: add archive fixture'
+archive_tap_sha=$(git -C "$archive_tap" rev-parse HEAD)
 chown -R linuxbrew:linuxbrew "$archive_root" "$archive_tap"
 printf 'formula:archive-fixture version=1.0.0 bottle_sha256=%s tap_sha=%s\n' \
-  "$archive_sha" "$(git -C "$archive_tap" rev-parse HEAD)" \
+  "$archive_sha" "$archive_tap_sha" \
   >>"$MISE_BREW_ORACLE_RESULT_DIR/api-fixtures.txt"
 
 archive_replacements="{\"https://raw.githubusercontent.com/mise/homebrew-oracle/HEAD/api/formula/archive-fixture.json\":\"http://127.0.0.1:$archive_port/archive-fixture.json\"}"
@@ -424,10 +431,10 @@ exit 97
 EOF
 chmod 0755 "$archive_root/no-compiler/cc"
 chown -R linuxbrew:linuxbrew "$archive_root/no-compiler"
-mise_archive="MISE_URL_REPLACEMENTS='$archive_replacements' PATH='$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin' run_mise_as_linuxbrew"
+mise_archive="MISE_URL_REPLACEMENTS='$archive_replacements' PATH='$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' run_mise_as_linuxbrew"
 assert_contains "$mise_archive bootstrap packages status" "missing"
 MISE_URL_REPLACEMENTS="$archive_replacements" \
-  PATH="$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin" \
+  PATH="$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
   run_mise_as_linuxbrew bootstrap packages apply --yes
 mise_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
 assert_contains "'$mise_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0"
