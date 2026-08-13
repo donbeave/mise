@@ -279,6 +279,7 @@ archive_root="$TMPDIR/archive-bottle-oracle"
 archive_payload="$archive_root/payload/archive-fixture/1.0.0"
 archive_tap="$homebrew_repository/Library/Taps/mise/homebrew-oracle"
 archive_name=archive-fixture--1.0.0.x86_64_linux.bottle.tar.gz
+archive_brew_name=archive-fixture-1.0.0.x86_64_linux.bottle.tar.gz
 mkdir -p "$archive_payload/bin" "$archive_payload/.brew" "$archive_tap/Formula"
 cat <<'EOF' >"$archive_payload/bin/archive-fixture"
 #!/usr/bin/env bash
@@ -337,6 +338,11 @@ cat <<'EOF' >"$archive_payload/sbom.spdx.json"
 }
 EOF
 tar -C "$archive_root/payload" -czf "$archive_root/$archive_name" archive-fixture
+# Homebrew derives the download basename from this local tap's canonical URL,
+# while mise consumes the exact API bottle URL. Serve the same immutable bytes
+# under both engine-derived names so the oracle compares provenance, not URL
+# naming policy.
+ln "$archive_root/$archive_name" "$archive_root/$archive_brew_name"
 archive_sha=$(shasum -a 256 "$archive_root/$archive_name" | awk '{print $1}')
 cat <<'PY' >"$archive_root/server.py"
 import http.server
