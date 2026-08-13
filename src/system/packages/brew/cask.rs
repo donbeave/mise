@@ -1654,12 +1654,16 @@ fn copy_cask_artifact(from: &Path, to: &Path) -> Result<()> {
 fn stage_primary_container(stage: &Path, caskroom: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        ditto(stage, caskroom)
+        ditto(stage, caskroom)?;
     }
     #[cfg(not(target_os = "macos"))]
     {
-        file::copy_dir_all_preserve_symlinks(stage, caskroom)
+        file::copy_dir_all_preserve_symlinks(stage, caskroom)?;
     }
+    // Homebrew's ZIP strategy removes AppleDouble resource-fork metadata
+    // after extraction. Preserve the primary container, not extractor junk.
+    file::remove_all(caskroom.join("__MACOSX"))?;
+    Ok(())
 }
 
 fn ditto(from: &Path, to: &Path) -> Result<()> {
@@ -9899,8 +9903,10 @@ end
         };
         file::create_dir_all(stage.join("fonts/ttf"))?;
         file::create_dir_all(stage.join("fonts/webfonts"))?;
+        file::create_dir_all(stage.join("__MACOSX/fonts/ttf"))?;
         crate::file::write(stage.join("fonts/ttf/Example.ttf"), "font")?;
         crate::file::write(stage.join("fonts/webfonts/Example.woff2"), "webfont")?;
+        crate::file::write(stage.join("__MACOSX/fonts/ttf/._Example.ttf"), "metadata")?;
         crate::file::write(stage.join("LICENSE"), "license")?;
         file::create_dir_all(&caskroom)?;
 
@@ -9919,6 +9925,7 @@ end
             crate::file::read_to_string(caskroom.join("LICENSE"))?,
             "license"
         );
+        assert!(!caskroom.join("__MACOSX").exists());
         assert!(!caskroom.join("Example.ttf").exists());
         Ok(())
     }
