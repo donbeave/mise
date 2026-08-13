@@ -3183,7 +3183,7 @@ fn homebrew_shell_escape(value: &str) -> Result<String> {
             escaped.push('\n');
             escaped.push('\'');
         } else if character.is_ascii_alphanumeric()
-            || matches!(character, '_' | '-' | '.' | ',' | ':' | '+' | '/' | '@')
+            || matches!(character, '_' | '-' | '.' | ',' | ':' | '/' | '@')
         {
             escaped.push(character);
         } else {
@@ -8565,6 +8565,10 @@ mod tests {
         assert_eq!(
             homebrew_shell_escape("two words; true")?,
             "two\\ words\\;\\ true"
+        );
+        assert_eq!(
+            homebrew_shell_escape("channel+nightly")?,
+            "channel\\+nightly"
         );
         Ok(())
     }
