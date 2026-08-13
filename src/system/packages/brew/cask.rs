@@ -5150,16 +5150,10 @@ fn native_cask_config() -> receipt::CaskConfig {
     #[cfg(not(target_os = "linux"))]
     let home = crate::dirs::HOME.to_string_lossy();
     let dirs = EffectiveCaskDirs::current();
-    let language = std::env::var("LANG")
-        .ok()
-        .and_then(|lang| lang.split('.').next().map(str::to_string))
-        .filter(|lang| !lang.is_empty() && lang != "C" && lang != "POSIX")
-        .map(|lang| lang.replace('_', "-"))
-        .into_iter()
-        .collect::<Vec<_>>();
+    let languages = native_cask_languages();
     #[cfg(target_os = "linux")]
     let default = serde_json::json!({
-        "languages": language,
+        "languages": languages,
         "appdir": dirs.appdir,
         "appimagedir": dirs.appimagedir,
         "fontdir": dirs.fontdir,
@@ -5168,7 +5162,7 @@ fn native_cask_config() -> receipt::CaskConfig {
     });
     #[cfg(not(target_os = "linux"))]
     let default = serde_json::json!({
-        "languages": language,
+        "languages": languages,
         "appdir": dirs.appdir,
         "appimagedir": dirs.appimagedir,
         "keyboard_layoutdir": "/Library/Keyboard Layouts",
@@ -5192,6 +5186,68 @@ fn native_cask_config() -> receipt::CaskConfig {
         explicit: serde_json::json!({}),
         extra: serde_json::Map::new(),
     }
+}
+
+fn split_homebrew_languages(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"'))
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn native_cask_languages() -> Vec<String> {
+    command_output("/usr/bin/defaults", &["read", "-g", "AppleLanguages"])
+        .or_else(|| {
+            command_output(
+                "/usr/bin/defaults",
+                &[
+                    "read",
+                    "/Library/Preferences/.GlobalPreferences",
+                    "AppleLanguages",
+                ],
+            )
+        })
+        .map(|languages| split_homebrew_languages(&languages))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn native_cask_languages() -> Vec<String> {
+    let locales = command_output("localectl", &["list-locales"])
+        .map(|output| split_homebrew_languages(&output))
+        .filter(|languages| !languages.is_empty())
+        .unwrap_or_else(|| {
+            let mut languages = std::env::vars()
+                .filter(|(key, _)| key == "LANG" || key == "LANGUAGE" || key.starts_with("LC_"))
+                .collect::<Vec<_>>();
+            languages.sort_by(|left, right| left.0.cmp(&right.0));
+            let languages = languages
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
+            if languages.is_empty() {
+                vec!["en_US.utf8".to_string()]
+            } else {
+                languages
+            }
+        });
+    locales
+        .into_iter()
+        .map(|locale| {
+            locale
+                .split('.')
+                .next()
+                .unwrap_or(&locale)
+                .replace('_', "-")
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_cask_languages() -> Vec<String> {
+    Vec::new()
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
