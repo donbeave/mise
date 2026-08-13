@@ -560,6 +560,7 @@ impl BrewCaskManager {
             record_cask_action(&mut journal, "preflight_hook")?;
             set_cask_phase(&mut journal, CaskTransactionPhase::Staging)?;
         }
+        stage_primary_container(&stage, &tmp_caskroom)?;
         for (index, app) in artifacts.apps.iter().enumerate() {
             install_app(&stage, &tmp_caskroom, app)?;
             record_cask_action(&mut journal, &format!("app[{index}]"))?;
@@ -1455,8 +1456,11 @@ fn detect_extraction_format(archive: &Path) -> Result<Option<ExtractionFormat>> 
 fn install_app(stage: &Path, caskroom: &Path, app: &AppArtifact) -> Result<()> {
     let source = find_app(stage, &app.source)
         .ok_or_else(|| eyre!("brew-cask: app artifact '{}' was not found", app.source))?;
-    let caskroom_app = caskroom.join(app_bundle_name(app.target_name())?);
+    let caskroom_app = caskroom_artifact_path(caskroom, &app.source, "app")?;
     file::remove_all(&caskroom_app)?;
+    if let Some(parent) = caskroom_app.parent() {
+        file::create_dir_all(parent)?;
+    }
     ditto(&source, &caskroom_app)?;
     Ok(())
 }
@@ -1464,7 +1468,7 @@ fn install_app(stage: &Path, caskroom: &Path, app: &AppArtifact) -> Result<()> {
 /// Activate a staged app using Homebrew's moved-artifact topology: the public
 /// app is the authoritative payload and the Caskroom entry is a backlink.
 fn activate_app(caskroom: &Path, app: &AppArtifact) -> Result<()> {
-    let caskroom_app = caskroom.join(app_bundle_name(app.target_name())?);
+    let caskroom_app = caskroom_artifact_path(caskroom, &app.source, "app")?;
     if !caskroom_app.is_dir() {
         bail!("brew-cask: app artifact '{}' was not staged", app.source);
     }
@@ -1647,6 +1651,17 @@ fn copy_cask_artifact(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
+fn stage_primary_container(stage: &Path, caskroom: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ditto(stage, caskroom)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file::copy_dir_all_preserve_symlinks(stage, caskroom)
+    }
+}
+
 fn ditto(from: &Path, to: &Path) -> Result<()> {
     let status = std::process::Command::new("ditto")
         .arg(from)
@@ -1709,8 +1724,20 @@ fn link_font(caskroom: &Path, font: &FontArtifact) -> Result<()> {
 }
 
 fn caskroom_font_path(caskroom: &Path, font: &FontArtifact) -> Result<PathBuf> {
-    let name = font_filename(font)?;
-    Ok(caskroom.join(name))
+    caskroom_artifact_path(caskroom, &font.source, "font")
+}
+
+fn caskroom_artifact_path(caskroom: &Path, source: &str, kind: &str) -> Result<PathBuf> {
+    let source = Path::new(source);
+    if source.is_absolute()
+        || source.components().next().is_none()
+        || source
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("brew-cask: invalid {kind} source '{}'", source.display());
+    }
+    Ok(caskroom.join(source))
 }
 
 fn font_filename(font: &FontArtifact) -> Result<String> {
@@ -4589,7 +4616,7 @@ fn validate_installed_cask_topology(
 ) -> Result<()> {
     for app in &artifacts.apps {
         let target = app_target_path(app.target_name())?;
-        let backlink = version_dir.join(app_bundle_name(app.target_name())?);
+        let backlink = caskroom_artifact_path(version_dir, &app.source, "app")?;
         if !target.is_dir()
             || !backlink
                 .symlink_metadata()
@@ -4768,15 +4795,32 @@ fn convert_legacy_moved_artifacts(
     let artifacts = cask_artifacts(cask)?;
     for app in &artifacts.apps {
         let target = app_target_path(app.target_name())?;
-        let source = version_dir.join(app_bundle_name(app.target_name())?);
+        let old_source = version_dir.join(app_bundle_name(app.target_name())?);
+        let source = caskroom_artifact_path(version_dir, &app.source, "app")?;
+        migrate_legacy_backlink(&old_source, &source)?;
         convert_legacy_moved_artifact(&source, &target, legacy)?;
     }
     for font in &artifacts.fonts {
         let target = font_target_path(font)?;
+        let old_source = version_dir.join(font_filename(font)?);
         let source = caskroom_font_path(version_dir, font)?;
+        migrate_legacy_backlink(&old_source, &source)?;
         convert_legacy_moved_artifact(&source, &target, legacy)?;
     }
     Ok(())
+}
+
+fn migrate_legacy_backlink(old_source: &Path, source: &Path) -> Result<()> {
+    if old_source == source
+        || !old_source.symlink_metadata().is_ok()
+        || source.symlink_metadata().is_ok()
+    {
+        return Ok(());
+    }
+    if let Some(parent) = source.parent() {
+        file::create_dir_all(parent)?;
+    }
+    file::rename(old_source, source)
 }
 
 fn convert_legacy_moved_artifact(source: &Path, target: &Path, legacy: &CaskReceipt) -> Result<()> {
@@ -5616,7 +5660,23 @@ fn successor_owns_public_target(cask: &Cask, target: &Path) -> bool {
         };
         return path_starts_with_resolved_root(&resolve_symlink_target(target, link), &version_dir);
     }
-    let mut backlinks = Vec::new();
+    let mut backlinks = cask_artifacts(cask)
+        .ok()
+        .into_iter()
+        .flat_map(|artifacts| {
+            let app_backlinks = artifacts.apps.into_iter().filter_map(|app| {
+                (app_target_path(app.target_name()).ok().as_deref() == Some(target))
+                    .then(|| caskroom_artifact_path(&version_dir, &app.source, "app").ok())
+                    .flatten()
+            });
+            let font_backlinks = artifacts.fonts.into_iter().filter_map(|font| {
+                (font_target_path(&font).ok().as_deref() == Some(target))
+                    .then(|| caskroom_font_path(&version_dir, &font).ok())
+                    .flatten()
+            });
+            app_backlinks.chain(font_backlinks)
+        })
+        .collect::<Vec<_>>();
     if let Some(name) = target.file_name() {
         backlinks.push(version_dir.join(name));
     }
@@ -6909,9 +6969,7 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
             || !allowed_appdir_roots()
                 .iter()
                 .any(|root| path_is_below(path, root))
-            || !path.file_name().is_some_and(|name| {
-                moved_staged_target_matches(record, &candidate.version_dir.join(name))
-            })
+            || !moved_staged_target_matches_anywhere(record, &candidate.version_dir)
         {
             bail!(
                 "app target is outside an allowed Applications directory: {}",
@@ -6942,9 +7000,7 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         let fonts = font_dir();
         if record.fingerprint.kind != CaskTargetKind::File
             || !path_is_below(path, &fonts)
-            || !path.strip_prefix(&fonts).is_ok_and(|relative| {
-                moved_staged_target_matches(record, &candidate.version_dir.join(relative))
-            })
+            || !moved_staged_target_matches_anywhere(record, &candidate.version_dir)
         {
             bail!(
                 "font target is outside the platform font directory: {}",
@@ -7008,6 +7064,16 @@ fn moved_staged_target_matches(record: &CaskTargetRecord, staged: &Path) -> bool
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
         && file::same_file(staged, &record.path)
         && cask_target_record_matches(record).unwrap_or(false)
+}
+
+fn moved_staged_target_matches_anywhere(record: &CaskTargetRecord, version_dir: &Path) -> bool {
+    walkdir::WalkDir::new(version_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_type().is_symlink() && moved_staged_target_matches(record, entry.path())
+        })
 }
 
 fn symlink_resolves_below(path: &Path, root: &Path) -> bool {
@@ -9820,6 +9886,49 @@ end
                 .any(|bytes| bytes == b"/Library")
         );
         Ok(())
+    }
+
+    #[test]
+    fn stages_complete_container_and_preserves_nested_moved_sources() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let caskroom = tmp.path().join("caskroom");
+        let font = FontArtifact {
+            source: "fonts/ttf/Example.ttf".to_string(),
+            target: None,
+        };
+        file::create_dir_all(stage.join("fonts/ttf"))?;
+        file::create_dir_all(stage.join("fonts/webfonts"))?;
+        crate::file::write(stage.join("fonts/ttf/Example.ttf"), "font")?;
+        crate::file::write(stage.join("fonts/webfonts/Example.woff2"), "webfont")?;
+        crate::file::write(stage.join("LICENSE"), "license")?;
+        file::create_dir_all(&caskroom)?;
+
+        stage_primary_container(&stage, &caskroom)?;
+        stage_font(&stage, &caskroom, &font)?;
+
+        assert_eq!(
+            crate::file::read_to_string(caskroom_font_path(&caskroom, &font)?)?,
+            "font"
+        );
+        assert_eq!(
+            crate::file::read_to_string(caskroom.join("fonts/webfonts/Example.woff2"))?,
+            "webfont"
+        );
+        assert_eq!(
+            crate::file::read_to_string(caskroom.join("LICENSE"))?,
+            "license"
+        );
+        assert!(!caskroom.join("Example.ttf").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn caskroom_artifact_sources_cannot_escape_staging() {
+        let caskroom = Path::new("/tmp/caskroom");
+        assert!(caskroom_artifact_path(caskroom, "../escape", "font").is_err());
+        #[cfg(unix)]
+        assert!(caskroom_artifact_path(caskroom, "/escape", "app").is_err());
     }
 
     #[test]
