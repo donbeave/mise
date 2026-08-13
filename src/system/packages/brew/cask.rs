@@ -638,7 +638,7 @@ impl BrewCaskManager {
                 link_font(&caskroom, font)?;
             }
             for binary in &artifacts.binaries {
-                link_binary(&caskroom, &appdir, binary)?;
+                link_binary(&caskroom, &artifacts.apps, &appdir, binary)?;
             }
             for wrapper in &artifacts.command_wrappers {
                 link_command_wrapper(&caskroom, wrapper)?;
@@ -3001,28 +3001,26 @@ fn stage_binary(
     binary: &BinaryArtifact,
 ) -> Result<()> {
     let appdir = cask_appdir(apps)?;
+    if binary.source.starts_with("$APPDIR/") {
+        staged_appdir_artifact_source(&binary.source, apps, caskroom)?.ok_or_else(|| {
+            eyre!(
+                "brew-cask: binary artifact '{}' was not found",
+                binary.source
+            )
+        })?;
+        return Ok(());
+    }
     let caskroom_binary = caskroom_binary_path(caskroom, &appdir, binary)?;
     file::remove_all(&caskroom_binary)?;
     if let Some(parent) = caskroom_binary.parent() {
         file::create_dir_all(parent)?;
     }
-    if binary.source.contains("$APPDIR") {
-        let app_binary = staged_appdir_artifact_source(&binary.source, apps, caskroom)?
-            .ok_or_else(|| {
-                eyre!(
-                    "brew-cask: binary artifact '{}' was not found",
-                    binary.source
-                )
-            })?;
-        file::make_symlink(&app_binary, &caskroom_binary)?;
+    let source = find_binary_source(stage, caskroom, cask, binary)?;
+    if source.starts_with(stage) || source.starts_with(caskroom) {
+        file::copy(&source, &caskroom_binary)?;
+        file::make_executable(&caskroom_binary)?;
     } else {
-        let source = find_binary_source(stage, caskroom, cask, binary)?;
-        if source.starts_with(stage) || source.starts_with(caskroom) {
-            file::copy(&source, &caskroom_binary)?;
-            file::make_executable(&caskroom_binary)?;
-        } else {
-            file::make_symlink(&source, &caskroom_binary)?;
-        }
+        file::make_symlink(&source, &caskroom_binary)?;
     }
     Ok(())
 }
@@ -3193,30 +3191,52 @@ fn cask_appdir(apps: &[AppArtifact]) -> Result<PathBuf> {
     Ok(EffectiveCaskDirs::current().appdir)
 }
 
-fn link_binary(caskroom: &Path, appdir: &Path, binary: &BinaryArtifact) -> Result<()> {
-    let caskroom_binary = caskroom_binary_path(caskroom, appdir, binary)?;
-    if !caskroom_binary.is_file() {
-        if caskroom_binary
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            let target = std::fs::read_link(&caskroom_binary)?;
+fn link_binary(
+    caskroom: &Path,
+    apps: &[AppArtifact],
+    appdir: &Path,
+    binary: &BinaryArtifact,
+) -> Result<()> {
+    let source = if binary.source.starts_with("$APPDIR/") {
+        appdir_artifact_source(&binary.source, apps)?.ok_or_else(|| {
+            eyre!(
+                "brew-cask: binary APPDIR artifact '{}' is missing after app activation",
+                binary.source
+            )
+        })?
+    } else {
+        let source = caskroom_binary_path(caskroom, appdir, binary)?;
+        if !source.is_file() {
+            if source
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                let target = std::fs::read_link(&source)?;
+                bail!(
+                    "brew-cask: binary artifact '{}' was staged but symlink target '{}' does not exist",
+                    binary.source,
+                    target.display()
+                );
+            }
             bail!(
-                "brew-cask: binary artifact '{}' was staged but symlink target '{}' does not exist",
-                binary.source,
-                target.display()
+                "brew-cask: binary artifact '{}' was not staged",
+                binary.source
             );
         }
-        bail!(
-            "brew-cask: binary artifact '{}' was not staged",
-            binary.source
-        );
+        source
+    };
+    if source
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && !source.exists()
+    {
+        bail!("brew-cask: binary artifact '{}' is dangling", binary.source);
     }
     let target = binary.target_path(appdir)?;
     if let Some(parent) = target.parent() {
         create_dir_all_elevating(parent)?;
     }
-    make_symlink_elevating(&caskroom_binary, &target)?;
+    make_symlink_elevating(&source, &target)?;
     Ok(())
 }
 
@@ -4772,10 +4792,26 @@ fn validate_installed_cask_topology(
             );
         }
     }
-    for target in binary_targets(artifacts)? {
+    let appdir = cask_appdir(&artifacts.apps)?;
+    for binary in &artifacts.binaries {
+        let target = binary.target_path(&appdir)?;
+        let owned = if binary.source.starts_with("$APPDIR/") {
+            declared_appdir_symlink_is_owned(&binary.source, &artifacts.apps, &target)?
+        } else {
+            symlink_resolves_below(&target, version_dir)
+        };
+        if !owned {
+            bail!(
+                "binary is not an owned declared-source symlink: {}",
+                target.display()
+            );
+        }
+    }
+    for wrapper in &artifacts.command_wrappers {
+        let target = wrapper.target_path()?;
         if !symlink_resolves_below(&target, version_dir) {
             bail!(
-                "binary or wrapper is not an owned Caskroom symlink: {}",
+                "wrapper is not an owned Caskroom symlink: {}",
                 target.display()
             );
         }
@@ -11434,11 +11470,58 @@ end
         };
 
         stage_binary(&stage, &caskroom, &cask, &[], &binary)?;
-        link_binary(&caskroom, Path::new("/Applications"), &binary)?;
+        link_binary(&caskroom, &[], Path::new("/Applications"), &binary)?;
 
         let target = binary.target_path(Path::new("/Applications"))?;
         assert_eq!(std::fs::read_link(&target)?, caskroom.join("bin/op"));
         assert_eq!(crate::file::read_to_string(&target)?, "binary");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn appdir_binary_links_directly_to_moved_app() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let caskroom = caskroom_version_dir("codexbar", "1.0.0");
+        let staged_binary = caskroom.join("CodexBar.app/Contents/Helpers/CodexBarCLI");
+        file::create_dir_all(staged_binary.parent().unwrap())?;
+        crate::file::write(&staged_binary, "binary")?;
+        let cask = test_cask("codexbar", "1.0.0");
+        let app = AppArtifact {
+            source: "CodexBar.app".to_string(),
+            target: Some("$HOMEBREW_PREFIX/Applications/CodexBar.app".to_string()),
+        };
+        let binary = BinaryArtifact {
+            source: "$APPDIR/CodexBar.app/Contents/Helpers/CodexBarCLI".to_string(),
+            target: Some("$HOMEBREW_PREFIX/bin/codexbar".to_string()),
+        };
+
+        stage_binary(
+            tmp.path().join("stage").as_path(),
+            &caskroom,
+            &cask,
+            std::slice::from_ref(&app),
+            &binary,
+        )?;
+        activate_app(&caskroom, &app)?;
+        let appdir = cask_appdir(std::slice::from_ref(&app))?;
+        link_binary(&caskroom, std::slice::from_ref(&app), &appdir, &binary)?;
+
+        let app_binary = appdir.join("CodexBar.app/Contents/Helpers/CodexBarCLI");
+        let target = binary.target_path(&appdir)?;
+        assert_eq!(std::fs::read_link(&target)?, app_binary);
+        assert!(caskroom.join("bin/codexbar").symlink_metadata().is_err());
+        validate_installed_cask_topology(
+            &cask,
+            &CaskArtifacts {
+                apps: vec![app],
+                binaries: vec![binary],
+                ..Default::default()
+            },
+            &caskroom,
+        )?;
         Ok(())
     }
 
@@ -11467,8 +11550,8 @@ end
 
         stage_binary(&stage, &caskroom, &cask, &[], &bin)?;
         stage_binary(&stage, &caskroom, &cask, &[], &sbin)?;
-        link_binary(&caskroom, Path::new("/Applications"), &bin)?;
-        link_binary(&caskroom, Path::new("/Applications"), &sbin)?;
+        link_binary(&caskroom, &[], Path::new("/Applications"), &bin)?;
+        link_binary(&caskroom, &[], Path::new("/Applications"), &sbin)?;
 
         assert_eq!(
             crate::file::read_to_string(bin.target_path(Path::new("/Applications"))?)?,
@@ -11532,7 +11615,7 @@ end
         };
 
         stage_binary(&stage, &caskroom, &cask, &[], &binary)?;
-        link_binary(&caskroom, Path::new("/Applications"), &binary)?;
+        link_binary(&caskroom, &[], Path::new("/Applications"), &binary)?;
 
         let staged = caskroom.join("bin/karabiner_cli");
         assert_eq!(std::fs::read_link(&staged)?, pkg_binary);
@@ -11567,7 +11650,7 @@ end
 
         stage_binary(&stage, &caskroom, &cask, &[], &binary)?;
         file::remove_file(&pkg_binary)?;
-        let err = link_binary(&caskroom, Path::new("/Applications"), &binary)
+        let err = link_binary(&caskroom, &[], Path::new("/Applications"), &binary)
             .unwrap_err()
             .to_string();
 
