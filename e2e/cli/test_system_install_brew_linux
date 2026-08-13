@@ -98,9 +98,9 @@ export MISE_BREW_ORACLE_HOMEBREW_REPOSITORY=$homebrew_repository
 brew_oracle_configure_runtime /home/linuxbrew/.linuxbrew
 brew=$BREW_ORACLE_BREW
 brew_oracle_record_api_fixture formula xz 5.8.3 \
-  22abb2f075ef25b74f47cebe60ffbe9a347f8f4ce2ea3a9a1f6393da43938ba6
+  ebace27d1ef6c5d50fa9d0defa495a0dba0b6e38964d46ecd9cc44873d1271cc
 brew_oracle_record_api_fixture formula hello 2.12.3 \
-  d7f449add984301433a7d8d4175550c67eedea5723a8971cffd290914f59ba35
+  538b93257a35fd8382a022f47cdfde9fb1f6d37f1bbbaebacc01c76abff80801
 mise_bin=$(command -v mise)
 mise_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache '$mise_bin'"
 

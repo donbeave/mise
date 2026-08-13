@@ -77,21 +77,21 @@ if find "$HOME/Library/Fonts" -maxdepth 1 -iname 'JetBrainsMono*' -print -quit 2
 fi
 
 brew_oracle_record_api_fixture cask hiddenbar 1.10 \
-  fc50697a2736dddc492b3d294f63042e7cbc2e3b3972be57c332914ccd681541
+  3f0fc95f18e49bdbef7d049d3dd72d15839f888f3db2e3f32322dda58fd7ac33
 brew_oracle_record_api_fixture cask font-jetbrains-mono 2.304 \
-  759100caac0dbb17c0a3d54a050584a89893ed787ed84a821afedd6b99e1c8e0
+  4aa667b54ee06b86b2473d6cfbedb0900527e918d0be8f89b2026efd69588ca2
 brew_oracle_record_api_fixture cask ghostty 1.3.1 \
-  628dfe93794ad00c7025925832727f71aaea676feafa68138a2e64323a88d0aa
+  fd15d22ac65ec6603d446f636014487d07515e296e961600575d39f7e564469b
 brew_oracle_record_api_fixture cask 1password-cli 2.38.1 \
-  d819694c6428760d4b539913b5962d8e1f7ac2310253a9167eb20d4a6b1a8f14
+  7f8a437caee68aefa8c965ed2f1e14a685eb4330e83370bef4ec7f6dc0fdbcfc
 brew_oracle_record_api_fixture cask codexbar 0.49.3 \
-  17a8ff2d3ab8b143ff76d3cdbc19ac950d2c7a3a45789c38e451a1fdddeb4224
+  6ee8f8d1ba0c8ac4ba246d2ff7223bbefe05df1ada7174c8e1aa769131e13131
 brew_oracle_record_api_fixture cask vlc 3.0.23 \
-  4df4df5f21490863a16591bb2d6968174bfa4657c037be9dcac929ffdcd0d8f4
+  d2006154048a8f146edf3f4827019e42deb7f82e03eb954c82d9d9ea0311dcd5
 brew_oracle_record_api_fixture cask surge 6.8.1,12030,69f4be88db9663476f31a6b264109f0b \
-  8f0c3fa2392b528ac4d8964b4361947c3d7ce212f44e9405b235062738b5010d
+  0fb4149cc488687d0cb8a720cbaf77dfa13910aa03fee77bc38154cb3148a2e2
 brew_oracle_record_api_fixture cask cloudflare-warp 2026.6.880.0 \
-  dd2d62c16ae5e05d6021c34626d6b8a972a5b0da9cf0ac7196f63a279354576a
+  086798c2bb9d5afe1097baa3c2c7b988ccf7f56d8f3b830597f507e315d405ea
 
 # Package installers and uninstall scripts are explicitly unsupported. Their
 # availability preflight must reject the cask before download, metadata, app,
