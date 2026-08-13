@@ -51,7 +51,7 @@ pub(super) enum FormulaInstallProvenance {
 #[derive(Clone, Debug, Deserialize)]
 struct BottleFacts {
     #[serde(default)]
-    changed_files: Vec<String>,
+    changed_files: Option<Vec<String>>,
     source_modified_time: u64,
     compiler: String,
     #[serde(default)]
@@ -62,6 +62,55 @@ struct BottleFacts {
     poured_from_bottle: Option<bool>,
     #[serde(default)]
     source: Option<Value>,
+}
+
+fn formula_receipt_source(
+    rf: &ResolvedFormula,
+    bottle_source: Option<&Value>,
+) -> receipt::FormulaSource {
+    let mut source_extra = bottle_source
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut versions_extra = source_extra
+        .remove("versions")
+        .and_then(|versions| versions.as_object().cloned())
+        .unwrap_or_default();
+    let head = versions_extra
+        .remove("head")
+        .and_then(|head| head.as_str().map(str::to_string));
+    let compatibility_version = versions_extra
+        .remove("compatibility_version")
+        .and_then(|version| version.as_str().map(str::to_string));
+    versions_extra.remove("stable");
+    versions_extra.remove("version_scheme");
+    source_extra.remove("spec");
+    source_extra.remove("path");
+    source_extra.remove("tap_git_head");
+    source_extra.remove("tap");
+
+    let tap = rf
+        .formula
+        .tap
+        .clone()
+        .unwrap_or_else(|| "homebrew/core".to_string());
+    let tap_git_head = (tap != "homebrew/core")
+        .then(|| rf.formula.tap_git_head.clone())
+        .flatten();
+    receipt::FormulaSource {
+        spec: "stable".to_string(),
+        versions: receipt::FormulaVersions {
+            stable: rf.formula.versions.stable.clone(),
+            head,
+            version_scheme: rf.formula.version_scheme,
+            compatibility_version,
+            extra: versions_extra,
+        },
+        path: rf.formula.internal_api_source.clone(),
+        tap_git_head,
+        tap,
+        extra: source_extra,
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -1148,7 +1197,7 @@ pub fn write_receipt(
             (
                 false,
                 BottleFacts {
-                    changed_files: relocated_files,
+                    changed_files: Some(relocated_files),
                     source_modified_time,
                     compiler: compiler.clone(),
                     runtime_dependencies: derived_runtime_dependencies,
@@ -1177,24 +1226,7 @@ pub fn write_receipt(
         compiler: facts.compiler,
         aliases: rf.formula.aliases.clone(),
         runtime_dependencies: facts.runtime_dependencies,
-        source: receipt::FormulaSource {
-            spec: "stable".to_string(),
-            versions: receipt::FormulaVersions {
-                stable: rf.formula.versions.stable.clone(),
-                head: None,
-                version_scheme: rf.formula.version_scheme,
-                compatibility_version: None,
-                extra: serde_json::Map::new(),
-            },
-            path: rf.formula.internal_api_source.clone(),
-            tap_git_head: None,
-            tap: rf
-                .formula
-                .tap
-                .clone()
-                .unwrap_or_else(|| "homebrew/core".to_string()),
-            extra: serde_json::Map::new(),
-        },
+        source: formula_receipt_source(rf, facts.source.as_ref()),
         arch: if cfg!(target_arch = "aarch64") {
             "arm64".to_string()
         } else {
@@ -1833,6 +1865,45 @@ mod tests {
             serde_json::from_slice(&std::fs::read(keg.join("INSTALL_RECEIPT.json"))?)?;
         assert_eq!(receipt["compiler"], "bottle-clang");
         assert_eq!(receipt["built_on"]["os"], "TestOS");
+        Ok(())
+    }
+
+    #[test]
+    fn archive_receipt_preserves_nullable_and_tap_provenance() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut rf = resolved_formula("foo", "1.0");
+        rf.formula.tap = Some("mise/oracle".to_string());
+        let keg = tmp.path().join("foo/1.0");
+        crate::file::create_dir_all(&keg)?;
+        let sbom = bottle_sbom("foo", "1.0");
+        crate::file::write(keg.join("sbom.spdx.json"), serde_json::to_vec(&sbom)?)?;
+        let mut tab = bottle_tab("1.0");
+        tab["changed_files"] = Value::Null;
+        tab["source"] = json!({
+            "scm_revision": "source-deadbeef",
+            "versions": {
+                "stable": "1.0",
+                "head": null,
+                "version_scheme": 0,
+                "compatibility_version": null
+            }
+        });
+
+        write_receipt(
+            &rf,
+            "test",
+            &keg,
+            &Default::default(),
+            &[],
+            &FormulaInstallProvenance::ArchiveBottle { tab, sbom },
+        )?;
+
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(keg.join("INSTALL_RECEIPT.json"))?)?;
+        assert!(receipt["changed_files"].is_null());
+        assert_eq!(receipt["source"]["tap_git_head"], "deadbeef");
+        assert_eq!(receipt["source"]["scm_revision"], "source-deadbeef");
+        assert!(receipt["built_on"]["xcode"].is_null());
         Ok(())
     }
 

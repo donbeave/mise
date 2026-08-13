@@ -305,6 +305,7 @@ cat <<'EOF' >"$archive_payload/INSTALL_RECEIPT.json"
   "source_modified_time": 0,
   "compiler": "gcc-13",
   "poured_from_bottle": true,
+  "changed_files": null,
   "runtime_dependencies": [],
   "built_on": {
     "os": "Linux",
@@ -314,7 +315,12 @@ cat <<'EOF' >"$archive_payload/INSTALL_RECEIPT.json"
     "clt": null,
     "preferred_perl": null
   },
-  "source": {"versions": {"stable": "1.0.0"}}
+  "source": {"versions": {
+    "stable": "1.0.0",
+    "head": null,
+    "version_scheme": 0,
+    "compatibility_version": null
+  }}
 }
 EOF
 cat <<'EOF' >"$archive_payload/sbom.spdx.json"
@@ -392,6 +398,7 @@ cat <<EOF >"$archive_root/archive-fixture.json"
 {
   "name": "archive-fixture",
   "tap": "mise/oracle",
+  "tap_git_head": "__ARCHIVE_TAP_SHA__",
   "versions": {"stable": "1.0.0"},
   "revision": 0,
   "keg_only": false,
@@ -415,6 +422,10 @@ git -C "$archive_tap" add Formula/archive-fixture.rb
 git -C "$archive_tap" -c user.name=oracle -c user.email=oracle@example.invalid \
   commit -m 'test: add archive fixture'
 archive_tap_sha=$(git -C "$archive_tap" rev-parse HEAD)
+jq --arg tap_sha "$archive_tap_sha" '.tap_git_head = $tap_sha' \
+  "$archive_root/archive-fixture.json" \
+  >"$archive_root/archive-fixture.tmp.json"
+mv "$archive_root/archive-fixture.tmp.json" "$archive_root/archive-fixture.json"
 chown -R linuxbrew:linuxbrew "$archive_root" "$archive_tap"
 printf 'formula:archive-fixture version=1.0.0 bottle_sha256=%s tap_sha=%s\n' \
   "$archive_sha" "$archive_tap_sha" \
@@ -447,6 +458,11 @@ assert_contains "'$mise_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0
 assert_contains "cat '$mise_archive_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": true'
 cp "$mise_archive_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive-INSTALL_RECEIPT.json"
+jq -e --arg tap_sha "$archive_tap_sha" '
+  .loaded_from_api == true and
+  .source.tap_git_head == $tap_sha and
+  .changed_files == null
+' "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive-INSTALL_RECEIPT.json" >/dev/null
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-archive.snapshot" \
   "keg=$mise_archive_keg"
 assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "archive-fixture"
@@ -458,6 +474,11 @@ runuser -u linuxbrew -- "$brew" install --force-bottle mise/oracle/archive-fixtu
 brew_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
 cp "$brew_archive_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive-INSTALL_RECEIPT.json"
+jq -e --arg tap_sha "$archive_tap_sha" '
+  .loaded_from_api == false and
+  .source.tap_git_head == $tap_sha and
+  .changed_files == null
+' "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive-INSTALL_RECEIPT.json" >/dev/null
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/brew-archive.snapshot" \
   "keg=$brew_archive_keg"
 brew_oracle_diff \

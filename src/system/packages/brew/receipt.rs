@@ -38,11 +38,8 @@ pub struct BuiltOn {
     pub os: String,
     pub os_version: String,
     pub cpu_family: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub xcode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub clt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_perl: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -91,7 +88,7 @@ pub struct FormulaReceipt {
     pub loaded_from_api: bool,
     pub loaded_from_internal_api: bool,
     pub installed_on_request: bool,
-    pub changed_files: Vec<String>,
+    pub changed_files: Option<Vec<String>>,
     pub time: u64,
     pub source_modified_time: u64,
     pub compiler: String,
@@ -393,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn built_on_absent_probe_values_are_omitted() {
+    fn built_on_absent_probe_values_are_preserved_as_null() {
         let value = serde_json::to_value(BuiltOn {
             os: "Linux".to_string(),
             os_version: "test".to_string(),
@@ -405,9 +402,9 @@ mod tests {
         })
         .unwrap();
 
-        assert!(value.get("xcode").is_none());
-        assert!(value.get("clt").is_none());
-        assert!(value.get("preferred_perl").is_none());
+        assert!(value["xcode"].is_null());
+        assert!(value["clt"].is_null());
+        assert!(value["preferred_perl"].is_null());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
