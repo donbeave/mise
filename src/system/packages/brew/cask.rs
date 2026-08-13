@@ -6492,7 +6492,7 @@ fn validate_cask_uninstall_plan(cask: &Cask) -> Result<()> {
 fn execute_homebrew_uninstall_action(
     candidate: &CaskPruneCandidate,
     action: HomebrewUninstallAction,
-    quit_was_running: bool,
+    _quit_was_running: bool,
 ) -> Result<()> {
     match action {
         HomebrewUninstallAction::Pkgutil(id) => {
@@ -6533,7 +6533,7 @@ fn execute_homebrew_uninstall_action(
                 candidate.token,
             );
             #[cfg(target_os = "macos")]
-            quit_bundle(&candidate.token, &bundle_id, quit_was_running)?;
+            quit_bundle(&candidate.token, &bundle_id, _quit_was_running)?;
         }
         HomebrewUninstallAction::Launchctl(label) => {
             #[cfg(not(target_os = "macos"))]
