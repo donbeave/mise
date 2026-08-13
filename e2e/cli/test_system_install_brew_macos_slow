@@ -290,7 +290,12 @@ EOF
   "$brew" install --cask "$token" --yes
   snapshot_cask "$token" "before-$token-noop.snapshot"
   assert_contains "mise bootstrap packages status" "installed"
-  assert_contains "mise bootstrap packages apply --yes 2>&1" "already"
+  local apply_output
+  if ! apply_output=$(mise bootstrap packages apply --yes 2>&1); then
+    printf '%s\n' "$apply_output" >&2
+    return 1
+  fi
+  assert_contains_text "$apply_output" "already"
   snapshot_cask "$token" "after-$token-noop.snapshot"
   brew_oracle_diff \
     "$MISE_BREW_ORACLE_RESULT_DIR/before-$token-noop.snapshot" \
