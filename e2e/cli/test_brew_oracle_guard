@@ -137,3 +137,14 @@ printf 'not json\n' >"$snapshot_root/vendor.json"
 brew_oracle_snapshot "$TMPDIR/snapshot.txt" "payload=$snapshot_root"
 expected_digest=$(shasum -a 256 "$snapshot_root/vendor.json" | awk '{print $1}')
 assert_contains "cat '$TMPDIR/snapshot.txt'" "f 644 payload/vendor.json $expected_digest"
+
+# Native Caskroom metadata is canonicalized as JSON so formatting and key order
+# do not obscure structural differences. Package payloads remain byte-exact.
+metadata_root="$snapshot_root/Caskroom/example/.metadata"
+mkdir -p "$metadata_root"
+printf '{\"z\":1,\"a\":2}\n' >"$metadata_root/config.json"
+jq -S . "$metadata_root/config.json" >"$TMPDIR/canonical-config.json"
+expected_digest=$(shasum -a 256 "$TMPDIR/canonical-config.json" | awk '{print $1}')
+brew_oracle_snapshot "$TMPDIR/metadata-snapshot.txt" "prefix=$snapshot_root"
+assert_contains "cat '$TMPDIR/metadata-snapshot.txt'" \
+  "f 644 prefix/Caskroom/example/.metadata/config.json $expected_digest"
