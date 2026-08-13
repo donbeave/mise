@@ -6158,6 +6158,9 @@ fn successor_owns_public_target(cask: &Cask, target: &Path) -> bool {
         let Some(artifacts) = artifacts.as_ref() else {
             return false;
         };
+        if native_binary_target_is_owned(artifacts, target, &version_dir).unwrap_or(false) {
+            return true;
+        }
         if completion_target_is_owned(cask, artifacts, target, &version_dir).unwrap_or(false) {
             return true;
         }
@@ -11831,46 +11834,37 @@ end
         let staged_binary = caskroom.join("CodexBar.app/Contents/Helpers/CodexBarCLI");
         file::create_dir_all(staged_binary.parent().unwrap())?;
         crate::file::write(&staged_binary, "binary")?;
-        let cask = test_cask("codexbar", "1.0.0");
-        let app = AppArtifact {
-            source: "CodexBar.app".to_string(),
-            target: Some("$HOMEBREW_PREFIX/Applications/CodexBar.app".to_string()),
-        };
-        let binary = BinaryArtifact {
-            source: "$APPDIR/CodexBar.app/Contents/Helpers/CodexBarCLI".to_string(),
-            target: Some("$HOMEBREW_PREFIX/bin/codexbar".to_string()),
-        };
+        let mut cask = test_cask("codexbar", "1.0.0");
+        cask.artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["CodexBar.app", {"target": "$HOMEBREW_PREFIX/Applications/CodexBar.app"}]},
+            {"binary": ["$APPDIR/CodexBar.app/Contents/Helpers/CodexBarCLI", {"target": "$HOMEBREW_PREFIX/bin/codexbar"}]}
+        ]))?;
+        let artifacts = cask_artifacts(&cask)?;
+        let app = &artifacts.apps[0];
+        let binary = &artifacts.binaries[0];
 
         stage_binary(
             tmp.path().join("stage").as_path(),
             &caskroom,
             &cask,
-            std::slice::from_ref(&app),
-            &binary,
+            std::slice::from_ref(app),
+            binary,
         )?;
-        activate_app(&caskroom, &app)?;
-        let appdir = cask_appdir(std::slice::from_ref(&app))?;
-        link_binary(
-            &caskroom,
-            &cask,
-            std::slice::from_ref(&app),
-            &appdir,
-            &binary,
-        )?;
+        activate_app(&caskroom, app)?;
+        let appdir = cask_appdir(std::slice::from_ref(app))?;
+        link_binary(&caskroom, &cask, std::slice::from_ref(app), &appdir, binary)?;
 
         let app_binary = appdir.join("CodexBar.app/Contents/Helpers/CodexBarCLI");
         let target = binary.target_path(&appdir)?;
         assert_eq!(std::fs::read_link(&target)?, app_binary);
         assert!(caskroom.join("bin/codexbar").symlink_metadata().is_err());
-        validate_installed_cask_topology(
-            &cask,
-            &CaskArtifacts {
-                apps: vec![app],
-                binaries: vec![binary],
-                ..Default::default()
-            },
-            &caskroom,
-        )?;
+        validate_installed_cask_topology(&cask, &artifacts, &caskroom)?;
+        assert!(successor_owns_public_target(&cask, &target));
+        let foreign = tmp.path().join("foreign-codexbar");
+        crate::file::write(&foreign, "foreign")?;
+        file::remove_file(&target)?;
+        file::make_symlink(&foreign, &target)?;
+        assert!(!successor_owns_public_target(&cask, &target));
         Ok(())
     }
 
