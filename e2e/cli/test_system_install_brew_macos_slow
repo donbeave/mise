@@ -106,7 +106,9 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew-cask:cloudflare-warp" = "latest"
 EOF
-cloudflare_status=$(mise bootstrap packages status)
+if cloudflare_status=$(mise bootstrap packages status 2>&1); then
+  brew_oracle_fail "unsupported pkg cask status unexpectedly succeeded"
+fi
 grep -F "unsupported" <<<"$cloudflare_status" >/dev/null
 grep -F "pkg artifacts are unsupported" <<<"$cloudflare_status" >/dev/null
 assert_fail "mise bootstrap packages apply --yes"
