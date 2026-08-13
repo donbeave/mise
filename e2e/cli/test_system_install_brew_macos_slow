@@ -349,7 +349,10 @@ assert_contains "mise bootstrap packages brew tap --dry-run jdx/tap" "~/.config/
 mise bootstrap packages brew tap jdx/tap
 assert_contains "cat ~/.config/mise/config.toml" '[bootstrap.brew.taps]'
 
-# Protected reinstall still refreshes complete Homebrew metadata.
+# Removing all native metadata destroys the only ownership proof for the
+# surviving app. mise must fail closed and leave that app untouched. After the
+# disposable fixture explicitly removes the now-foreign app, a fresh install
+# must recreate both the app and complete Homebrew metadata.
 cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew-cask:hiddenbar" = "latest"
@@ -358,6 +361,19 @@ mise bootstrap packages apply --yes
 chmod +a "everyone deny delete_child" "$hiddenbar_app/Contents"
 rm -rf "$hiddenbar_room"
 assert_contains "mise bootstrap packages status" "missing"
+if ambiguous_output=$(mise bootstrap packages apply --yes 2>&1); then
+  printf '%s\n' "$ambiguous_output" >&2
+  echo "expected missing-receipt cask repair to fail closed" >&2
+  exit 1
+fi
+printf '%s\n' "$ambiguous_output" \
+  >"$MISE_BREW_ORACLE_RESULT_DIR/hiddenbar-ambiguous-repair.txt"
+grep -F "already exists with ambiguous ownership" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/hiddenbar-ambiguous-repair.txt"
+assert_directory_exists "$hiddenbar_app"
+assert_fail "test -e '$hiddenbar_room'"
+chmod -RN "$hiddenbar_app"
+rm -rf "$hiddenbar_app"
 mise bootstrap packages apply --yes
 assert_directory_exists "$hiddenbar_app"
 assert_directory_exists "$hiddenbar_room/.metadata"
