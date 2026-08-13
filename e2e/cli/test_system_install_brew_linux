@@ -115,6 +115,8 @@ brew_oracle_record_api_fixture formula xz 5.8.3 \
   ebace27d1ef6c5d50fa9d0defa495a0dba0b6e38964d46ecd9cc44873d1271cc
 brew_oracle_record_api_fixture formula hello 2.12.3 \
   538b93257a35fd8382a022f47cdfde9fb1f6d37f1bbbaebacc01c76abff80801
+brew_oracle_record_api_fixture cask font-jetbrains-mono 2.304 \
+  4aa667b54ee06b86b2473d6cfbedb0900527e918d0be8f89b2026efd69588ca2
 mise_bin=$(command -v mise)
 mise_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache '$mise_bin'"
 
@@ -421,4 +423,87 @@ assert_contains "'$brew_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0
 runuser -u linuxbrew -- "$brew" uninstall --formula archive-fixture
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/archive-fixture"
 
-brew_oracle_complete test_system_install_brew_linux 3 /home/linuxbrew/.linuxbrew
+# Linux cask configuration and moved-font topology must match the pinned
+# implementation under a non-default XDG data root in both ownership
+# directions. The native config snapshot also carries Linux app/VST defaults.
+linux_font_xdg=/home/linuxbrew/oracle-xdg-data
+linux_font_dir="$linux_font_xdg/fonts"
+linux_font_room=/home/linuxbrew/.linuxbrew/Caskroom/font-jetbrains-mono
+mise_font_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache HOMEBREW_XDG_DATA_HOME='$linux_font_xdg' '$mise_bin'"
+
+snapshot_linux_font() {
+  local output="$MISE_BREW_ORACLE_RESULT_DIR/$1" font index=0
+  local roots=("caskroom=$linux_font_room")
+  while IFS= read -r font; do
+    roots+=("font-$index=$font")
+    index=$((index + 1))
+  done < <(find "$linux_font_dir" -type f -name 'JetBrainsMono*' -print | LC_ALL=C sort)
+  [[ $index -gt 0 ]] || brew_oracle_fail "Linux font cask installed zero fonts"
+  brew_oracle_snapshot "$output" "${roots[@]}"
+}
+
+assert_linux_font_absent() {
+  [[ ! -e $linux_font_room && ! -L $linux_font_room ]] || return 1
+  ! find "$linux_font_dir" -type f -name 'JetBrainsMono*' -print -quit 2>/dev/null | grep -q .
+}
+
+brew_oracle_require_absent_path "$linux_font_room" "foreign Linux font Caskroom"
+assert_linux_font_absent
+cat <<EOF >mise.toml
+[bootstrap.packages]
+"brew-cask:font-jetbrains-mono" = "latest"
+EOF
+chown linuxbrew:linuxbrew mise.toml
+
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$brew" install --cask font-jetbrains-mono --yes
+snapshot_linux_font brew-linux-font.snapshot
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$brew" uninstall --cask font-jetbrains-mono
+assert_linux_font_absent
+
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  XDG_CACHE_HOME=/home/linuxbrew/.cache \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$mise_bin" bootstrap packages apply --yes
+snapshot_linux_font mise-linux-font.snapshot
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/brew-linux-font.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/mise-linux-font.snapshot"
+linux_font_config=$(find "$linux_font_room/.metadata" -name config.json -type f -print -quit)
+[[ -n $linux_font_config ]] || brew_oracle_fail "Linux cask config.json is missing"
+grep -F '"appdir":"/home/linuxbrew/.config/apps"' "$linux_font_config" >/dev/null
+grep -F '"fontdir":"/home/linuxbrew/oracle-xdg-data/fonts"' "$linux_font_config" >/dev/null
+grep -F '"vst_plugindir":"/home/linuxbrew/.vst"' "$linux_font_config" >/dev/null
+grep -F '"vst3_plugindir":"/home/linuxbrew/.vst3"' "$linux_font_config" >/dev/null
+! grep -F '/Library' "$linux_font_config" >/dev/null
+assert_contains "runuser -u linuxbrew -- '$brew' list --cask" "font-jetbrains-mono"
+assert_succeed "runuser -u linuxbrew -- '$brew' info --cask font-jetbrains-mono"
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$brew" uninstall --cask font-jetbrains-mono
+assert_linux_font_absent
+
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$brew" install --cask font-jetbrains-mono --yes
+snapshot_linux_font before-linux-font-noop.snapshot
+assert_contains "$mise_font_as_linuxbrew bootstrap packages status" "installed"
+assert_contains "$mise_font_as_linuxbrew bootstrap packages apply --yes 2>&1" "already"
+snapshot_linux_font after-linux-font-noop.snapshot
+brew_oracle_diff \
+  "$MISE_BREW_ORACLE_RESULT_DIR/before-linux-font-noop.snapshot" \
+  "$MISE_BREW_ORACLE_RESULT_DIR/after-linux-font-noop.snapshot"
+cat <<EOF >mise.toml
+[bootstrap.packages]
+EOF
+chown linuxbrew:linuxbrew mise.toml
+runuser -u linuxbrew -- env HOME=/home/linuxbrew \
+  XDG_CACHE_HOME=/home/linuxbrew/.cache \
+  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  "$mise_bin" bootstrap packages prune --manager brew-cask --yes
+assert_linux_font_absent
+
+brew_oracle_complete test_system_install_brew_linux 4 /home/linuxbrew/.linuxbrew
