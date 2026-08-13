@@ -4882,6 +4882,38 @@ fn declared_appdir_symlink_is_owned(
         && file::same_file(target, &source))
 }
 
+fn native_binary_target_is_owned(
+    artifacts: &CaskArtifacts,
+    target: &Path,
+    version_dir: &Path,
+) -> Result<bool> {
+    let appdir = cask_appdir(&artifacts.apps)?;
+    let mut claims = Vec::new();
+    for binary in &artifacts.binaries {
+        if binary.target_path(&appdir)? != target {
+            continue;
+        }
+        claims.push(if binary.source.starts_with("$APPDIR/") {
+            declared_appdir_symlink_is_owned(&binary.source, &artifacts.apps, target)?
+        } else {
+            symlink_resolves_below(target, version_dir)
+        });
+    }
+    for wrapper in &artifacts.command_wrappers {
+        if wrapper.target_path()? == target {
+            claims.push(symlink_resolves_below(target, version_dir));
+        }
+    }
+    match claims.as_slice() {
+        [owned] => Ok(*owned),
+        [] => bail!(
+            "missing native binary or command-wrapper artifact for {}",
+            target.display()
+        ),
+        _ => bail!("ambiguous native binary target claim: {}", target.display()),
+    }
+}
+
 fn manpage_target_is_owned(
     manpage: &ManpageArtifact,
     apps: &[AppArtifact],
@@ -7428,14 +7460,20 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         let record = records
             .get(path)
             .ok_or_else(|| eyre!("missing binary target record"))?;
+        let source_is_owned = match &native_artifacts {
+            Some(artifacts) => {
+                native_binary_target_is_owned(artifacts, path, &candidate.version_dir)?
+            }
+            None => symlink_resolves_below(path, &candidate.version_dir),
+        };
         if record.fingerprint.kind != CaskTargetKind::Symlink
             || !allowed_binary_target_roots()
                 .iter()
                 .any(|root| path_is_below(path, root))
-            || !symlink_resolves_below(path, &candidate.version_dir)
+            || !source_is_owned
         {
             bail!(
-                "binary target is not an owned Caskroom symlink: {}",
+                "binary target is not an owned installed-source symlink: {}",
                 path.display()
             );
         }
@@ -11110,6 +11148,48 @@ end
         assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 1);
         assert!(!target.exists());
         assert!(!caskroom_token_dir("codex").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cask_prune_removes_homebrew_appdir_binary_and_metadata() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let state_dir = tmp.path().join("state");
+        let app = EffectiveCaskDirs::current().appdir.join("CodexBar.app");
+        let executable = app.join("Contents/Helpers/CodexBarCLI");
+        write_homebrew_cask_receipt("codexbar", "1.2.3", |receipt| {
+            receipt["uninstall_artifacts"] = serde_json::json!([
+                {"app": ["CodexBar.app"]},
+                {"binary": [executable.to_string_lossy(), {"target": "codexbar"}]}
+            ]);
+        });
+        let version_dir = caskroom_version_dir("codexbar", "1.2.3");
+        file::create_dir_all(executable.parent().unwrap())?;
+        file::write(&executable, "codexbar")?;
+        file::make_symlink(&app, &version_dir.join("CodexBar.app"))?;
+        let target = prefix::prefix().join("bin/codexbar");
+        file::create_dir_all(target.parent().unwrap())?;
+        file::make_symlink(&executable, &target)?;
+
+        let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
+        assert_eq!(plan.remove.len(), 1);
+        let foreign = tmp.path().join("foreign-codexbar");
+        file::write(&foreign, "foreign")?;
+        file::remove_file(&target)?;
+        file::make_symlink(&foreign, &target)?;
+        assert!(apply_cask_prune_plan_in(&plan, false, &state_dir).is_err());
+        assert!(app.exists());
+        assert!(caskroom_token_dir("codexbar").exists());
+        file::remove_file(&target)?;
+        file::make_symlink(&executable, &target)?;
+
+        assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 1);
+        assert!(!target.exists());
+        assert!(!app.exists());
+        assert!(!caskroom_token_dir("codexbar").exists());
         Ok(())
     }
 
