@@ -251,6 +251,31 @@ cp "$mise_hello_keg/.brew/hello.rb" \
 chmod 0644 \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-formula.rb"
+
+# The mise build already downloaded and checksum-verified the exact source
+# archive. Seed Homebrew's authoritative source-cache location from those bytes
+# so the differential proof cannot fail later because a mutable GNU mirror is
+# unavailable. Refuse ambiguous source cache entries or an unexpected brew
+# cache destination before copying anything.
+mapfile -t mise_hello_sources < <(
+  find /home/linuxbrew/.cache/mise/system-brew/sources -maxdepth 1 -type f \
+    -name '*-hello-2.12.3.tar.gz' -print
+)
+[[ ${#mise_hello_sources[@]} -eq 1 ]] ||
+  brew_oracle_fail "expected exactly one checksum-verified mise hello source archive"
+brew_hello_source_cache=$(runuser -u linuxbrew -- \
+  "$brew" --cache --build-from-source hello)
+case "$brew_hello_source_cache" in
+  /home/linuxbrew/.cache/Homebrew/downloads/*--hello-2.12.3.tar.gz) ;;
+  *) brew_oracle_fail "unexpected Homebrew hello source cache path" ;;
+esac
+[[ ! -L $brew_hello_source_cache ]] ||
+  brew_oracle_fail "Homebrew hello source cache path is a symlink"
+install -d -m 0755 -o linuxbrew -g linuxbrew \
+  "$(dirname "$brew_hello_source_cache")"
+install -m 0644 -o linuxbrew -g linuxbrew \
+  "${mise_hello_sources[0]}" "$brew_hello_source_cache"
+
 runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
 
