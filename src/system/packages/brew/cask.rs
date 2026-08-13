@@ -2649,56 +2649,17 @@ fn find_generated_completion_executable(
 }
 
 fn appdir_artifact_source(source: &str, apps: &[AppArtifact]) -> Result<Option<PathBuf>> {
-    let Some(relative) = source.strip_prefix("$APPDIR/") else {
-        return Ok(None);
-    };
-    let relative = Path::new(relative);
-    if relative.components().next().is_none()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        bail!("brew-cask: APPDIR artifact '{source}' must stay below Applications");
-    }
-    let Some(Component::Normal(bundle)) = relative.components().next() else {
-        return Ok(None);
-    };
-    let suffix = relative.components().skip(1).collect::<PathBuf>();
-    let mut matches = Vec::new();
-    for app in apps {
-        let target = app_target_path(app.target_name())?;
-        let bundle = Path::new(bundle);
-        if !path_ends_with_ignore_ascii_case(Path::new(&app.source), bundle)
-            && !path_ends_with_ignore_ascii_case(&target, bundle)
-        {
-            continue;
-        }
-        let path = target.join(&suffix);
-        if path.is_file() {
-            matches.push(path);
-        }
-    }
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [path] => Ok(Some(path.clone())),
-        _ => bail!(
-            "brew-cask: APPDIR artifact '{}' is ambiguous: {}",
-            source,
-            matches
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
+    appdir_artifact_source_matching(source, apps, false)
 }
 
-fn staged_appdir_artifact_source(
+fn binary_appdir_artifact_source(source: &str, apps: &[AppArtifact]) -> Result<Option<PathBuf>> {
+    appdir_artifact_source_matching(source, apps, true)
+}
+
+fn appdir_artifact_source_matching(
     source: &str,
     apps: &[AppArtifact],
-    caskroom: &Path,
+    allow_directory: bool,
 ) -> Result<Option<PathBuf>> {
     let Some(relative) = source.strip_prefix("$APPDIR/") else {
         return Ok(None);
@@ -2724,10 +2685,82 @@ fn staged_appdir_artifact_source(
         {
             continue;
         }
-        let path = caskroom
-            .join(app_bundle_name(app.target_name())?)
-            .join(&suffix);
-        if path.is_file() {
+        let path = target.join(&suffix);
+        if appdir_source_node_is_owned(&path, &target, allow_directory) {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path.clone())),
+        _ => bail!(
+            "brew-cask: APPDIR artifact '{}' is ambiguous: {}",
+            source,
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn appdir_source_node_is_owned(path: &Path, app: &Path, allow_directory: bool) -> bool {
+    (path.is_file() || (allow_directory && path.is_dir()))
+        && path_starts_with_resolved_root(path, app)
+}
+
+fn staged_appdir_artifact_source(
+    source: &str,
+    apps: &[AppArtifact],
+    caskroom: &Path,
+) -> Result<Option<PathBuf>> {
+    staged_appdir_artifact_source_matching(source, apps, caskroom, false)
+}
+
+fn staged_binary_appdir_artifact_source(
+    source: &str,
+    apps: &[AppArtifact],
+    caskroom: &Path,
+) -> Result<Option<PathBuf>> {
+    staged_appdir_artifact_source_matching(source, apps, caskroom, true)
+}
+
+fn staged_appdir_artifact_source_matching(
+    source: &str,
+    apps: &[AppArtifact],
+    caskroom: &Path,
+    allow_directory: bool,
+) -> Result<Option<PathBuf>> {
+    let Some(relative) = source.strip_prefix("$APPDIR/") else {
+        return Ok(None);
+    };
+    let relative = Path::new(relative);
+    if relative.components().next().is_none()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("brew-cask: APPDIR artifact '{source}' must stay below Applications");
+    }
+    let Some(Component::Normal(bundle)) = relative.components().next() else {
+        return Ok(None);
+    };
+    let suffix = relative.components().skip(1).collect::<PathBuf>();
+    let mut matches = Vec::new();
+    for app in apps {
+        let target = app_target_path(app.target_name())?;
+        let bundle = Path::new(bundle);
+        if !path_ends_with_ignore_ascii_case(Path::new(&app.source), bundle)
+            && !path_ends_with_ignore_ascii_case(&target, bundle)
+        {
+            continue;
+        }
+        let staged_app = caskroom.join(app_bundle_name(app.target_name())?);
+        let path = staged_app.join(&suffix);
+        if appdir_source_node_is_owned(&path, &staged_app, allow_directory) {
             matches.push(path);
         }
     }
@@ -3055,7 +3088,7 @@ fn stage_binary(
     binary: &BinaryArtifact,
 ) -> Result<()> {
     if binary.source.starts_with("$APPDIR/") {
-        staged_appdir_artifact_source(&binary.source, apps, caskroom)?.ok_or_else(|| {
+        staged_binary_appdir_artifact_source(&binary.source, apps, caskroom)?.ok_or_else(|| {
             eyre!(
                 "brew-cask: binary artifact '{}' was not found",
                 binary.source
@@ -3259,7 +3292,7 @@ fn link_binary(
     binary: &BinaryArtifact,
 ) -> Result<()> {
     let source = if binary.source.starts_with("$APPDIR/") {
-        appdir_artifact_source(&binary.source, apps)?.ok_or_else(|| {
+        binary_appdir_artifact_source(&binary.source, apps)?.ok_or_else(|| {
             eyre!(
                 "brew-cask: binary APPDIR artifact '{}' is missing after app activation",
                 binary.source
@@ -4825,7 +4858,7 @@ fn validate_installed_cask_topology(
     for binary in &artifacts.binaries {
         let target = binary.target_path(&appdir)?;
         let owned = if binary.source.starts_with("$APPDIR/") {
-            declared_appdir_symlink_is_owned(&binary.source, &artifacts.apps, &target)?
+            declared_appdir_binary_symlink_is_owned(&binary.source, &artifacts.apps, &target)?
         } else {
             symlink_resolves_below(&target, version_dir)
         };
@@ -4882,6 +4915,20 @@ fn declared_appdir_symlink_is_owned(
         && file::same_file(target, &source))
 }
 
+fn declared_appdir_binary_symlink_is_owned(
+    source: &str,
+    apps: &[AppArtifact],
+    target: &Path,
+) -> Result<bool> {
+    let Some(source) = binary_appdir_artifact_source(source, apps)? else {
+        return Ok(false);
+    };
+    Ok(target
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && file::same_file(target, &source))
+}
+
 fn native_binary_target_is_owned(
     artifacts: &CaskArtifacts,
     target: &Path,
@@ -4894,7 +4941,7 @@ fn native_binary_target_is_owned(
             continue;
         }
         claims.push(if binary.source.starts_with("$APPDIR/") {
-            declared_appdir_symlink_is_owned(&binary.source, &artifacts.apps, target)?
+            declared_appdir_binary_symlink_is_owned(&binary.source, &artifacts.apps, target)?
         } else {
             symlink_resolves_below(target, version_dir)
         });
@@ -7460,16 +7507,25 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         let record = records
             .get(path)
             .ok_or_else(|| eyre!("missing binary target record"))?;
-        let source_is_owned = match &native_artifacts {
+        let (source_is_owned, target_root_is_allowed) = match &native_artifacts {
             Some(artifacts) => {
-                native_binary_target_is_owned(artifacts, path, &candidate.version_dir)?
+                // Parsing the installed native artifact computed this exact
+                // target through binary_target_path/target_path, including the
+                // separately bounded $APPDIR target form.
+                (
+                    native_binary_target_is_owned(artifacts, path, &candidate.version_dir)?,
+                    true,
+                )
             }
-            None => symlink_resolves_below(path, &candidate.version_dir),
+            None => (
+                symlink_resolves_below(path, &candidate.version_dir),
+                allowed_binary_target_roots()
+                    .iter()
+                    .any(|root| path_is_below(path, root)),
+            ),
         };
         if record.fingerprint.kind != CaskTargetKind::Symlink
-            || !allowed_binary_target_roots()
-                .iter()
-                .any(|root| path_is_below(path, root))
+            || !target_root_is_allowed
             || !source_is_owned
         {
             bail!(
@@ -10004,6 +10060,33 @@ end
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn binary_appdir_source_accepts_owned_directory_and_rejects_escape() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let app = tmp.path().join("Applications/Surge.app");
+        let nested = app.join("Contents/Applications/Surge Dashboard.app");
+        file::create_dir_all(&nested)?;
+        let apps = [AppArtifact {
+            source: "Surge.app".to_string(),
+            target: Some("$HOMEBREW_PREFIX/Applications/Surge.app".to_string()),
+        }];
+        let source = "$APPDIR/Surge.app/Contents/Applications/Surge Dashboard.app";
+
+        assert_eq!(
+            binary_appdir_artifact_source(source, &apps)?,
+            Some(nested.clone())
+        );
+        file::remove_all(&nested)?;
+        let foreign = tmp.path().join("foreign-dashboard");
+        file::create_dir_all(&foreign)?;
+        file::make_symlink(&foreign, &nested)?;
+        assert_eq!(binary_appdir_artifact_source(source, &apps)?, None);
+        Ok(())
+    }
+
     #[test]
     fn generated_completion_executable_prefers_staged_prefix_binary() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -11160,19 +11243,27 @@ end
         let state_dir = tmp.path().join("state");
         let app = EffectiveCaskDirs::current().appdir.join("CodexBar.app");
         let executable = app.join("Contents/Helpers/CodexBarCLI");
+        let nested_app = app.join("Contents/Applications/Codex Dashboard.app");
+        let nested_target = EffectiveCaskDirs::current()
+            .appdir
+            .join("Codex Dashboard.app");
         write_homebrew_cask_receipt("codexbar", "1.2.3", |receipt| {
             receipt["uninstall_artifacts"] = serde_json::json!([
                 {"app": ["CodexBar.app"]},
-                {"binary": [executable.to_string_lossy(), {"target": "codexbar"}]}
+                {"binary": [executable.to_string_lossy(), {"target": "codexbar"}]},
+                {"binary": [nested_app.to_string_lossy(), {"target": nested_target.to_string_lossy()}]}
             ]);
         });
         let version_dir = caskroom_version_dir("codexbar", "1.2.3");
         file::create_dir_all(executable.parent().unwrap())?;
         file::write(&executable, "codexbar")?;
+        file::create_dir_all(&nested_app)?;
+        file::write(nested_app.join("payload"), "dashboard")?;
         file::make_symlink(&app, &version_dir.join("CodexBar.app"))?;
         let target = prefix::prefix().join("bin/codexbar");
         file::create_dir_all(target.parent().unwrap())?;
         file::make_symlink(&executable, &target)?;
+        file::make_symlink(&nested_app, &nested_target)?;
 
         let plan = cask_prune_plan_from_tokens(&BTreeSet::new(), &state_dir)?;
         assert_eq!(plan.remove.len(), 1);
@@ -11188,6 +11279,7 @@ end
 
         assert_eq!(apply_cask_prune_plan_in(&plan, false, &state_dir)?, 1);
         assert!(!target.exists());
+        assert!(!nested_target.exists());
         assert!(!app.exists());
         assert!(!caskroom_token_dir("codexbar").exists());
         Ok(())
