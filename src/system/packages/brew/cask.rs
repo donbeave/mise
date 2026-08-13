@@ -5263,7 +5263,7 @@ fn native_cask_languages() -> Vec<String> {
         .map(|output| split_homebrew_languages(&output))
         .filter(|languages| !languages.is_empty())
         .unwrap_or_else(|| {
-            let mut languages = std::env::vars()
+            let mut languages = crate::env::vars_safe()
                 .filter(|(key, _)| key == "LANG" || key == "LANGUAGE" || key.starts_with("LC_"))
                 .collect::<Vec<_>>();
             languages.sort_by(|left, right| left.0.cmp(&right.0));
