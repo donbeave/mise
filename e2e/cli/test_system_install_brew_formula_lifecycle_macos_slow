@@ -68,7 +68,23 @@ cleanup_formula_fixtures() {
   rm -rf "$postgresql_var"
 }
 
+stop_kimi_login() {
+  local pid=${kimi_login_pid:-}
+  local signal
+  [[ -n $pid ]] || return 0
+  for signal in INT TERM KILL; do
+    kill -"$signal" "$pid" 2>/dev/null || break
+    for _ in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break 2
+      sleep 0.1
+    done
+  done
+  wait "$pid" 2>/dev/null || true
+  unset kimi_login_pid
+}
+
 cleanup_formula_oracle() {
+  stop_kimi_login
   cleanup_formula_fixtures
   brew_oracle_remove_runtime_bridge
 }
@@ -124,16 +140,48 @@ snapshot_formula_chain() {
 }
 
 assert_formula_runtime() {
+  local forbidden_ca_override
   assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/ca-certificates/cert.pem'"
   assert_succeed "test -r '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/openssl.cnf'"
   assert_succeed "test -L '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'"
   assert_contains "readlink '$MISE_SYSTEM_BREW_PREFIX/etc/openssl@3/cert.pem'" "ca-certificates/cert.pem"
   assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node'"
   assert_succeed "test -x '$MISE_SYSTEM_BREW_PREFIX/bin/kimi'"
-  assert_fail "test -n \"${SSL_CERT_FILE:-}${NODE_EXTRA_CA_CERTS:-}${NODE_OPTIONS:-}\""
+  for forbidden_ca_override in \
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_OPTIONS \
+    NODE_TLS_REJECT_UNAUTHORIZED; do
+    ! printenv "$forbidden_ca_override" >/dev/null 2>&1 ||
+      brew_oracle_fail "forbidden CA/TLS override is present: $forbidden_ca_override"
+  done
   assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/openssl@3/bin/openssl' s_client -verify_return_error -connect auth.kimi.com:443 -servername auth.kimi.com </dev/null"
   assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/opt/node/bin/node' -e 'fetch(\"https://auth.kimi.com/api/oauth/device_authorization\").then(r => { if (r.status !== 405) process.exit(1) })'"
   assert_succeed "'$MISE_SYSTEM_BREW_PREFIX/bin/kimi' --version"
+}
+
+assert_kimi_login_tls() {
+  local kimi_login_home="$TMPDIR/kimi-login-home"
+  local kimi_login_log="$TMPDIR/kimi-login.log"
+  local reached_device_code=0
+
+  rm -rf "$kimi_login_home" "$kimi_login_log"
+  KIMI_CODE_HOME="$kimi_login_home" \
+    "$MISE_SYSTEM_BREW_PREFIX/bin/kimi" login >"$kimi_login_log" 2>&1 &
+  kimi_login_pid=$!
+  for _ in {1..200}; do
+    if grep -Fq "Opening browser for Kimi device login:" "$kimi_login_log"; then
+      reached_device_code=1
+      break
+    fi
+    kill -0 "$kimi_login_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ $reached_device_code != 1 ]]; then
+    stop_kimi_login
+    brew_oracle_fail "Kimi login did not reach TLS-backed device authorization"
+    return 1
+  fi
+  stop_kimi_login
+  rm -rf "$kimi_login_home" "$kimi_login_log"
 }
 
 cat <<'EOF' >mise.toml
@@ -190,6 +238,7 @@ mise bootstrap --yes
 [[ $(stat -f '%i' "$MISE_SYSTEM_BREW_PREFIX/bin/openssl") == "$openssl_public_inode" ]]
 [[ $(shasum -a 256 "$openssl_keg/INSTALL_RECEIPT.json" | awk '{print $1}') == "$openssl_receipt_sha" ]]
 assert_formula_runtime
+assert_kimi_login_tls
 
 # The same legacy repair is not guessed when its authoritative formula source
 # no longer matches. Apply must fail before touching the valid receipt/shared
