@@ -8691,22 +8691,33 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_structured_flight_steps() {
-        let mut cask = test_cask("battle-net", "1.0.0");
-        cask.artifacts = vec![
-            serde_json::json!({
-                "preflight_steps": [{
-                    "steps": [{
-                        "type": "set_permissions",
-                        "paths": [{"base": "staged_path", "path": "Battle.net-Setup.app"}],
-                        "permissions": "a+x"
-                    }]
-                }]
-            }),
-            serde_json::json!({"app": "Battle.net.app"}),
-        ];
+        for (step, kind) in [
+            (
+                serde_json::json!({
+                    "type": "set_permissions",
+                    "paths": [{"base": "staged_path", "path": "Battle.net-Setup.app"}],
+                    "permissions": "a+x"
+                }),
+                "set_permissions",
+            ),
+            (
+                serde_json::json!({
+                    "type": "symlink",
+                    "source": {"base": "staged_path", "path": "source"},
+                    "target": {"base": "staged_path", "path": "target"}
+                }),
+                "symlink",
+            ),
+        ] {
+            let mut cask = test_cask("battle-net", "1.0.0");
+            cask.artifacts = vec![
+                serde_json::json!({"preflight_steps": [{"steps": [step]}]}),
+                serde_json::json!({"app": "Battle.net.app"}),
+            ];
 
-        let err = cask_artifacts(&cask).unwrap_err().to_string();
-        assert!(err.contains("unsupported preflight_steps step type set_permissions"));
+            let err = cask_artifacts(&cask).unwrap_err().to_string();
+            assert!(err.contains(&format!("unsupported preflight_steps step type {kind}")));
+        }
     }
 
     #[test]
@@ -8714,6 +8725,7 @@ mod tests {
         for artifact in [
             serde_json::json!({"service": {"run": ["example"]}}),
             serde_json::json!({"artifact": ["Example.plugin"]}),
+            serde_json::json!({"suite": ["Example Suite"]}),
         ] {
             let mut cask = test_cask("example", "1.0.0");
             cask.artifacts = vec![artifact, serde_json::json!({"app": "Example.app"})];
