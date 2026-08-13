@@ -196,7 +196,7 @@ mise_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
 assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "hello"
 assert_succeed "runuser -u linuxbrew -- '$brew' info hello"
 assert_contains "runuser -u linuxbrew -- '$mise_hello_keg/bin/hello' --greeting=mise-source" "mise-source"
-assert_contains "cat '$mise_hello_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": false'
+assert_succeed "jq -e '.poured_from_bottle == false' '$mise_hello_keg/INSTALL_RECEIPT.json'"
 assert_succeed "test -s '$mise_hello_keg/.brew/hello.rb'"
 cp "$mise_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-mise-receipt.json"
@@ -211,7 +211,7 @@ brew_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "installed"
 assert_contains "$mise_as_linuxbrew bootstrap packages apply --yes 2>&1" "already"
 assert_contains "runuser -u linuxbrew -- '$brew_hello_keg/bin/hello' --greeting=brew-source" "brew-source"
-assert_contains "cat '$brew_hello_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": false'
+assert_succeed "jq -e '.poured_from_bottle == false' '$brew_hello_keg/INSTALL_RECEIPT.json'"
 assert_succeed "test -s '$brew_hello_keg/.brew/hello.rb'"
 cp "$brew_hello_keg/INSTALL_RECEIPT.json" \
   "$MISE_BREW_ORACLE_RESULT_DIR/linux-hello-brew-receipt.json"
