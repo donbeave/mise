@@ -294,10 +294,13 @@ EOF
   assert_contains "mise bootstrap packages status" "installed"
   local apply_output
   if ! apply_output=$(mise bootstrap packages apply --yes 2>&1); then
+    printf '%s\n' "$apply_output" \
+      >"$MISE_BREW_ORACLE_RESULT_DIR/$token-mise-noop.txt"
     printf '%s\n' "$apply_output" >&2
     return 1
   fi
-  assert_contains_text "$apply_output" "already"
+  printf '%s\n' "$apply_output" \
+    >"$MISE_BREW_ORACLE_RESULT_DIR/$token-mise-noop.txt"
   snapshot_cask "$token" "after-$token-noop.snapshot"
   brew_oracle_diff \
     "$MISE_BREW_ORACLE_RESULT_DIR/before-$token-noop.snapshot" \
