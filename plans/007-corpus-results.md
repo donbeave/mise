@@ -29,7 +29,7 @@ mutate state; they are not silently classified as metadata.
 | ----------------------------- | --------- | ----------------- | --------- | ---- | --------- | ----------------- | --- | -------------------------------------------------------- |
 | 1password                     | A         | —                 | L,Q       | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | 1password-cli                 | B,G       | —                 | —         | —    | —         | —                 | Z   | implemented / oracle pending                             |
-| bartender                     | A         | —                 | L,Q,D     | ✓    | —         | —                 | Z   | **UNSUPPORTED: protected `/System` delete**               |
+| bartender                     | A         | —                 | L,Q,D     | ✓    | —         | —                 | Z   | **UNSUPPORTED: protected `/System` delete**              |
 | chatgpt                       | A         | —                 | Q         | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | claude                        | A         | —                 | Q         | ✓    | —         | —                 | Z   | implemented / oracle pending                             |
 | claude-code                   | B         | —                 | —         | —    | —         | —                 | Z   | implemented / oracle pending                             |
