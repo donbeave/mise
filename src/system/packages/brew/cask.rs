@@ -5482,6 +5482,52 @@ fn expand_homebrew_cask_placeholders(value: Value) -> Value {
     }
 }
 
+/// Homebrew expands path placeholders before persisting uninstall artifacts.
+/// Restore only paths contained by the current authoritative roots so the
+/// installed-receipt parser can apply the same ownership rules as catalog
+/// metadata without accepting arbitrary absolute archive sources.
+fn restore_homebrew_cask_placeholders(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(restore_homebrew_cask_placeholders)
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, restore_homebrew_cask_placeholders(value)))
+                .collect(),
+        ),
+        Value::String(value) => {
+            let path = Path::new(&value);
+            if !path.is_absolute() {
+                return Value::String(value);
+            }
+            let prefix = prefix::prefix();
+            let cellar = prefix.join("Cellar");
+            for (root, placeholder) in [
+                (EffectiveCaskDirs::current().appdir, "$APPDIR"),
+                (cellar, "$HOMEBREW_CELLAR"),
+                (prefix, "$HOMEBREW_PREFIX"),
+            ] {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let restored = if relative.as_os_str().is_empty() {
+                    placeholder.to_string()
+                } else {
+                    format!("{placeholder}/{}", relative.to_string_lossy())
+                };
+                return Value::String(restored);
+            }
+            Value::String(value)
+        }
+        value => value,
+    }
+}
+
 fn cask_runtime_dependencies(cask: &Cask) -> Result<serde_json::Map<String, Value>> {
     let runtime = cask
         .depends_on
@@ -6037,7 +6083,12 @@ fn cask_from_homebrew_receipt(token: &str, receipt: &receipt::CaskReceipt) -> Ca
         url: String::new(),
         url_specs: CaskUrlSpecs::default(),
         sha256: None,
-        artifacts: receipt.uninstall_artifacts.clone(),
+        artifacts: receipt
+            .uninstall_artifacts
+            .clone()
+            .into_iter()
+            .map(restore_homebrew_cask_placeholders)
+            .collect(),
         ruby_source_path: None,
         ruby_source_checksum: None,
         tap_git_head: receipt.source.tap_git_head.clone(),
@@ -10071,6 +10122,36 @@ end
         );
         assert_eq!(artifacts.completions.len(), 3);
         assert_eq!(artifacts.fonts.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_homebrew_expanded_ghostty_receipt_sources() -> Result<()> {
+        let appdir = EffectiveCaskDirs::current().appdir;
+        let mut receipt: receipt::CaskReceipt =
+            serde_json::from_str(include_str!("testdata/codex-INSTALL_RECEIPT.json"))?;
+        receipt.source.version = "1.2.0".to_string();
+        receipt.uninstall_artifacts = serde_json::from_value(serde_json::json!([
+            {"app": ["Ghostty.app"]},
+            {"manpage": [appdir.join("Ghostty.app/Contents/Resources/man/man1/ghostty.1")]},
+            {"bash_completion": [appdir.join("Ghostty.app/Contents/Resources/bash-completion/completions/ghostty.bash")]},
+            {"fish_completion": [appdir.join("Ghostty.app/Contents/Resources/fish/vendor_completions.d/ghostty.fish")]},
+            {"zsh_completion": [appdir.join("Ghostty.app/Contents/Resources/zsh/site-functions/_ghostty")]}
+        ]))?;
+
+        let cask = cask_from_homebrew_receipt("ghostty", &receipt);
+        let artifacts = parse_cask_artifacts(&cask, false)?;
+
+        assert_eq!(artifacts.apps.len(), 1);
+        assert_eq!(artifacts.manpages.len(), 1);
+        assert_eq!(artifacts.completions.len(), 3);
+        assert!(artifacts.manpages[0].source.starts_with("$APPDIR/"));
+        assert!(
+            artifacts
+                .completions
+                .iter()
+                .all(|completion| completion.source.starts_with("$APPDIR/"))
+        );
         Ok(())
     }
 
