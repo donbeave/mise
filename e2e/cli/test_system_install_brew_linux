@@ -118,7 +118,9 @@ brew_oracle_record_api_fixture formula hello 2.12.3 \
 brew_oracle_record_api_fixture cask font-jetbrains-mono 2.304 \
   4aa667b54ee06b86b2473d6cfbedb0900527e918d0be8f89b2026efd69588ca2
 mise_bin=$(command -v mise)
-install -d -m 0755 -o linuxbrew -g linuxbrew /home/linuxbrew/tmp
+linuxbrew_tmp=/home/linuxbrew/tmp
+install -d -m 0755 -o linuxbrew -g linuxbrew "$linuxbrew_tmp"
+export linuxbrew_tmp
 run_mise_as_linuxbrew() {
   runuser -u linuxbrew -- env \
     HOME=/home/linuxbrew \
@@ -131,7 +133,8 @@ run_mise_as_linuxbrew() {
     MISE_DATA_DIR=/home/linuxbrew/.local/share/mise \
     MISE_STATE_DIR=/home/linuxbrew/.local/state/mise \
     MISE_SYSTEM_DIR=/home/linuxbrew/.local/share/mise/system \
-    MISE_TMP_DIR=/home/linuxbrew/tmp \
+    MISE_TMP_DIR="$linuxbrew_tmp" \
+    TMPDIR="$linuxbrew_tmp" \
     MISE_TRUSTED_CONFIG_PATHS="$PWD" \
     "$mise_bin" "$@"
 }
@@ -248,7 +251,7 @@ cp "$mise_hello_keg/.brew/hello.rb" \
 runuser -u linuxbrew -- "$brew" uninstall --formula hello
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/hello"
 
-runuser -u linuxbrew -- env HOMEBREW_NO_AUTO_UPDATE=1 \
+runuser -u linuxbrew -- env HOMEBREW_NO_AUTO_UPDATE=1 TMPDIR="$linuxbrew_tmp" \
   "$brew" install --build-from-source hello
 brew_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "installed"
