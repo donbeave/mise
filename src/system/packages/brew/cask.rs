@@ -2660,17 +2660,25 @@ fn find_generated_completion_executable(
 }
 
 fn appdir_artifact_source(source: &str, apps: &[AppArtifact]) -> Result<Option<PathBuf>> {
-    appdir_artifact_source_matching(source, apps, false)
+    appdir_artifact_source_matching(source, apps, false, true)
 }
 
 fn binary_appdir_artifact_source(source: &str, apps: &[AppArtifact]) -> Result<Option<PathBuf>> {
-    appdir_artifact_source_matching(source, apps, true)
+    appdir_artifact_source_matching(source, apps, true, true)
+}
+
+fn declared_binary_appdir_artifact_source(
+    source: &str,
+    apps: &[AppArtifact],
+) -> Result<Option<PathBuf>> {
+    appdir_artifact_source_matching(source, apps, true, false)
 }
 
 fn appdir_artifact_source_matching(
     source: &str,
     apps: &[AppArtifact],
     allow_directory: bool,
+    require_node: bool,
 ) -> Result<Option<PathBuf>> {
     let Some(relative) = source.strip_prefix("$APPDIR/") else {
         return Ok(None);
@@ -2697,7 +2705,7 @@ fn appdir_artifact_source_matching(
             continue;
         }
         let path = target.join(&suffix);
-        if appdir_source_node_is_owned(&path, &target, allow_directory) {
+        if !require_node || appdir_source_node_is_owned(&path, &target, allow_directory) {
             matches.push(path);
         }
     }
@@ -5182,10 +5190,13 @@ fn surviving_cask_artifacts_are_owned(
 ) -> Result<bool> {
     for app in &artifacts.apps {
         let target = app_target_path(app.target_name())?;
+        let backlink = caskroom_artifact_path(version_dir, &app.source, "app")?;
         if target.symlink_metadata().is_err() {
+            if backlink.symlink_metadata().is_ok() && !symlink_declares_target(&backlink, &target) {
+                return Ok(false);
+            }
             continue;
         }
-        let backlink = caskroom_artifact_path(version_dir, &app.source, "app")?;
         if !target.is_dir()
             || !backlink
                 .symlink_metadata()
@@ -5197,10 +5208,13 @@ fn surviving_cask_artifacts_are_owned(
     }
     for font in &artifacts.fonts {
         let target = font_target_path(font)?;
+        let backlink = caskroom_font_path(version_dir, font)?;
         if target.symlink_metadata().is_err() {
+            if backlink.symlink_metadata().is_ok() && !symlink_declares_target(&backlink, &target) {
+                return Ok(false);
+            }
             continue;
         }
-        let backlink = caskroom_font_path(version_dir, font)?;
         if !target.is_file()
             || !backlink
                 .symlink_metadata()
@@ -5217,7 +5231,12 @@ fn surviving_cask_artifacts_are_owned(
             continue;
         }
         let owned = if binary.source.starts_with("$APPDIR/") {
-            declared_appdir_binary_symlink_is_owned(&binary.source, &artifacts.apps, &target)?
+            let Some(source) =
+                declared_binary_appdir_artifact_source(&binary.source, &artifacts.apps)?
+            else {
+                return Ok(false);
+            };
+            symlink_declares_target(&target, &source)
         } else {
             symlink_resolves_below(&target, version_dir)
         };
@@ -5247,6 +5266,14 @@ fn surviving_cask_artifacts_are_owned(
         }
     }
     Ok(artifacts.pkg_ids.is_empty())
+}
+
+fn symlink_declares_target(link: &Path, expected: &Path) -> bool {
+    link.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && std::fs::read_link(link)
+            .map(|target| resolve_symlink_target(link, target) == expected)
+            .unwrap_or(false)
 }
 
 fn validate_homebrew_cask_config(
@@ -12736,6 +12763,65 @@ end
             panic!("foreign replacement artifact must need repair");
         };
         assert!(!replacement_safe);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_app_with_owned_dangling_appdir_links_is_replacement_safe() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let cask = test_cask("appdir-repair", "1.0.0");
+        write_homebrew_cask_receipt(&cask.token, &cask.version, |receipt| {
+            receipt["uninstall_artifacts"] = serde_json::json!([
+                {"app": ["Example.app"]},
+                {"binary": ["$APPDIR/Example.app/Contents/MacOS/example", {"target": "example"}]},
+                {"binary": ["$APPDIR/Example.app/Contents/Applications/Dashboard.app", {"target": "$APPDIR/Dashboard.app"}]}
+            ]);
+        });
+        let app = EffectiveCaskDirs::current().appdir.join("Example.app");
+        let executable = app.join("Contents/MacOS/example");
+        let dashboard = app.join("Contents/Applications/Dashboard.app");
+        file::create_dir_all(&dashboard)?;
+        file::create_dir_all(executable.parent().unwrap())?;
+        file::write(&executable, "example")?;
+        let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+        file::make_symlink(&app, &version_dir.join("Example.app"))?;
+        let binary = prefix::prefix().join("bin/example");
+        file::create_dir_all(binary.parent().unwrap())?;
+        file::make_symlink(&executable, &binary)?;
+        let dashboard_target = EffectiveCaskDirs::current().appdir.join("Dashboard.app");
+        file::make_symlink(&dashboard, &dashboard_target)?;
+
+        assert!(matches!(
+            installed_cask_state(&cask, &CaskArtifacts::default())?,
+            InstalledCaskState::Installed(_)
+        ));
+        file::remove_all(&app)?;
+        let receipt = receipt::read_cask_receipt(&caskroom_token_dir(&cask.token))?;
+        let installed = cask_from_homebrew_receipt(&cask.token, &receipt);
+        let artifacts = parse_cask_artifacts(&installed, false)?;
+        assert_eq!(artifacts.apps.len(), 1);
+        assert_eq!(artifacts.binaries.len(), 2);
+        assert!(symlink_declares_target(
+            &version_dir.join("Example.app"),
+            &app
+        ));
+        assert!(symlink_declares_target(&binary, &executable));
+        assert!(symlink_declares_target(&dashboard_target, &dashboard));
+        assert!(surviving_cask_artifacts_are_owned(
+            &installed,
+            &artifacts,
+            &version_dir
+        )?);
+        let InstalledCaskState::NeedsRepair {
+            replacement_safe, ..
+        } = installed_cask_state(&cask, &CaskArtifacts::default())?
+        else {
+            panic!("missing app must need repair");
+        };
+        assert!(replacement_safe);
         Ok(())
     }
 
