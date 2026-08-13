@@ -5622,96 +5622,10 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(target_os = "macos")]
 fn native_build_system_info() -> Result<receipt::BuiltOn> {
-    let product_version = command_output("/usr/bin/sw_vers", &["-productVersion"])
-        .ok_or_else(|| eyre!("brew-cask: cannot determine macOS version"))?;
-    let mut parts = product_version.split('.');
-    let major = parts.next().unwrap_or_default();
-    let minor = parts.next().unwrap_or_default();
-    let os_version = if minor == "0" || minor.is_empty() {
-        format!("macOS {major}")
-    } else {
-        format!("macOS {major}.{minor}")
-    };
-    let family = command_output("/usr/sbin/sysctl", &["-n", "hw.cpufamily"])
-        .and_then(|raw| raw.parse::<i64>().ok())
-        .map(|value| value as u32)
-        .map(|value| match value {
-            0x2c91a47e => "arm_typhoon",
-            0x92fb37c8 => "arm_twister",
-            0x67ceee93 => "arm_hurricane_zephyr",
-            0xe81e7ef6 => "arm_monsoon_mistral",
-            0x07d34b9f => "arm_vortex_tempest",
-            0x462504d2 => "arm_lightning_thunder",
-            0x573b5eec => "arm_firestorm_icestorm",
-            0xda33d83d => "arm_blizzard_avalanche",
-            0xfa33415e => "arm_ibiza",
-            0x5f4dea93 => "arm_lobos",
-            0x72015832 => "arm_palma",
-            0x6f5129ac => "arm_donan",
-            0x17d5b93a => "arm_brava",
-            0x1d5a87e8 => "arm_hidra",
-            0xf76c5b1a => "arm_sotra",
-            _ => "dunno",
-        })
-        .unwrap_or("dunno")
-        .to_string();
-    let xcode = command_output("/usr/bin/xcodebuild", &["-version"]).and_then(|value| {
-        value
-            .lines()
-            .next()?
-            .strip_prefix("Xcode ")
-            .map(str::to_string)
-    });
-    let clt = command_output(
-        "/usr/sbin/pkgutil",
-        &["--pkg-info=com.apple.pkg.CLTools_Executables"],
-    )
-    .and_then(|value| {
-        value
-            .lines()
-            .find_map(|line| line.strip_prefix("version: ").map(str::to_string))
-    });
-    let preferred_perl = command_output("/usr/bin/perl", &["-e", "printf \"%vd\\n\", $^V"])
-        .and_then(|value| {
-            value
-                .rsplit_once('.')
-                .map(|(version, _)| version.to_string())
-        })
-        .ok_or_else(|| eyre!("brew-cask: cannot determine preferred system Perl"))?;
-    Ok(receipt::BuiltOn {
-        os: "Macintosh".to_string(),
-        os_version,
-        cpu_family: family,
-        xcode,
-        clt,
-        preferred_perl: Some(preferred_perl),
-        extra: serde_json::Map::new(),
+    receipt::native_build_system_info().map_err(|error| {
+        eyre!("brew-cask: cannot determine Homebrew build-system metadata: {error}")
     })
-}
-
-#[cfg(target_os = "linux")]
-fn native_build_system_info() -> Result<receipt::BuiltOn> {
-    let os_version = command_output("uname", &["-r"])
-        .ok_or_else(|| eyre!("brew-cask: cannot determine Linux version"))?;
-    Ok(receipt::BuiltOn {
-        os: "Linux".to_string(),
-        os_version,
-        cpu_family: std::env::consts::ARCH.to_string(),
-        xcode: None,
-        clt: None,
-        preferred_perl: command_output("perl", &["-e", "printf \"%vd\\n\", $^V"]),
-        extra: serde_json::Map::new(),
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn native_build_system_info() -> Result<receipt::BuiltOn> {
-    bail!(
-        "brew-cask: build-system metadata is unsupported on {}",
-        std::env::consts::OS
-    )
 }
 
 fn cask_target_record_matches(record: &CaskTargetRecord) -> Result<bool> {
