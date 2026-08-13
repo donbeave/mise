@@ -44,7 +44,7 @@ brew_oracle_normalize_json() {
 
 brew_oracle_normalize_path() {
   # Homebrew assigns cask metadata a wall-clock installation directory.
-  sed -E 's#(/\.metadata/[^/]+)/[0-9]{14}\.[0-9]{3}/#\1/<TIMESTAMP>/#'
+  sed -E 's#(/\.metadata/[^/]+)/[0-9]{14}\.[0-9]{3}(/|$)#\1/<TIMESTAMP>\2#'
 }
 
 brew_oracle_snapshot() {
