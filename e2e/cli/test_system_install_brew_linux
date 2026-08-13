@@ -81,9 +81,18 @@ trap cleanup_linuxbrew_home EXIT
 
 useradd --create-home --home-dir /home/linuxbrew linuxbrew
 # Homebrew rejects an inaccessible current directory even when every explicit
-# operation targets its repository. The harness workspace is disposable and is
-# later used by mise as this same user, so transfer it before the first owner
-# switch.
+# operation targets its repository. mktemp makes the isolated root mode 0700,
+# so validate the exact disposable harness topology, expose only traversal on
+# its ancestors, and transfer the workdir before the first owner switch.
+oracle_workspace_root=$(dirname "$HOME")
+[[ $PWD == "$HOME/workdir" ]] || brew_oracle_fail "unexpected oracle workdir"
+for oracle_workspace_dir in "$oracle_workspace_root" "$HOME" "$PWD"; do
+  [[ -d $oracle_workspace_dir && ! -L $oracle_workspace_dir ]] ||
+    brew_oracle_fail "oracle workspace contains an ambiguous directory"
+  [[ $(stat -c %u "$oracle_workspace_dir") == 0 ]] ||
+    brew_oracle_fail "oracle workspace must start root-owned"
+done
+chmod 0711 "$oracle_workspace_root" "$HOME"
 chown linuxbrew:linuxbrew "$PWD"
 installer_commit=a34ae4ee9151cbce4c3b33bca7043a972b7ae9a5
 installer_sha256=12479a24be3f5307eecac7cde670fad7118640f031229e964f544b1367b52a41
