@@ -1,13 +1,11 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
-};
 
 use async_trait::async_trait;
 use eyre::{WrapErr, bail, eyre};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -109,7 +107,7 @@ struct CommandWrapperArtifact {
     content: Option<String>,
     executable: Option<String>,
     args: Vec<String>,
-    env: BTreeMap<String, String>,
+    env: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3110,48 +3108,105 @@ fn stage_command_wrapper(
     cask: &Cask,
     wrapper: &CommandWrapperArtifact,
 ) -> Result<()> {
+    let (content, readonly) = render_command_wrapper(appdir, cask, wrapper)?;
     let target = wrapper.caskroom_path(caskroom);
     file::remove_all(&target)?;
     if let Some(parent) = target.parent() {
         file::create_dir_all(parent)?;
     }
-    let content = match (&wrapper.content, &wrapper.executable) {
-        (Some(content), None) => expand_command_wrapper_content(content, appdir),
+    file::write(&target, content)?;
+    if readonly {
+        set_command_wrapper_readonly_executable(&target)?;
+    } else {
+        file::make_executable(&target)?;
+    }
+    Ok(())
+}
+
+fn render_command_wrapper(
+    appdir: &Path,
+    cask: &Cask,
+    wrapper: &CommandWrapperArtifact,
+) -> Result<(String, bool)> {
+    let (content, readonly) = match (&wrapper.content, &wrapper.executable) {
+        (Some(content), None) => (expand_command_wrapper_content(content, appdir), false),
         (None, Some(executable)) => {
             let executable = expand_command_wrapper_value(executable, appdir, cask);
+            validate_command_wrapper_double_quoted_value("executable", &executable)?;
             let args = wrapper
                 .args
                 .iter()
                 .map(|arg| expand_command_wrapper_value(arg, appdir, cask))
-                .map(|arg| shell_escape::unix::escape(Cow::Owned(arg)).into_owned())
-                .collect::<Vec<_>>();
-            let env = wrapper
-                .env
-                .iter()
-                .map(|(key, value)| {
-                    let value = expand_command_wrapper_value(value, appdir, cask);
-                    Ok(format!(
-                        "{key}={}",
-                        shell_escape::unix::escape(Cow::Owned(value))
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut command = Vec::new();
-            command.extend(env);
-            command.push("exec".to_string());
-            command.push(shell_escape::unix::escape(Cow::Owned(executable)).into_owned());
-            command.extend(args);
-            command.push("\"$@\"".to_string());
-            format!("#!/bin/bash\n{}\n", command.join(" "))
+                .map(|arg| homebrew_shell_escape(&arg))
+                .collect::<Result<Vec<_>>>()?
+                .join(" ");
+            let mut env = String::new();
+            for (key, value) in &wrapper.env {
+                let value = expand_command_wrapper_value(value, appdir, cask);
+                validate_command_wrapper_double_quoted_value("environment value", &value)?;
+                env.push_str(&format!("{key}=\"{value}\" "));
+            }
+            (
+                format!("#!/bin/bash\n{env}exec \"{executable}\" {args} \"$@\"\n"),
+                true,
+            )
         }
         _ => bail!(
             "brew-cask: command_wrapper '{}' must set exactly one of content or executable",
             wrapper.name
         ),
     };
-    file::write(&target, content)?;
-    file::make_executable(&target)?;
+    Ok((content, readonly))
+}
+
+fn validate_command_wrapper_double_quoted_value(kind: &str, value: &str) -> Result<()> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\0' | '\n' | '\r' | '"' | '$' | '`' | '\\'))
+    {
+        bail!("brew-cask: command_wrapper {kind} cannot be represented safely");
+    }
     Ok(())
+}
+
+fn homebrew_shell_escape(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        bail!("brew-cask: command_wrapper argument contains a NUL byte");
+    }
+    if value.is_empty() {
+        return Ok("''".to_string());
+    }
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if character == '\n' {
+            escaped.push('\'');
+            escaped.push('\n');
+            escaped.push('\'');
+        } else if character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '-' | '.' | ',' | ':' | '+' | '/' | '@')
+        {
+            escaped.push(character);
+        } else {
+            escaped.push('\\');
+            escaped.push(character);
+        }
+    }
+    Ok(escaped)
+}
+
+#[cfg(unix)]
+fn set_command_wrapper_readonly_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = path.metadata()?.permissions();
+    permissions.set_mode(0o555);
+    std::fs::set_permissions(path, permissions)
+        .wrap_err_with(|| format!("failed to chmod 0555: {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_command_wrapper_readonly_executable(path: &Path) -> Result<()> {
+    file::make_executable(path)
 }
 
 fn expand_command_wrapper_content(value: &str, appdir: &Path) -> String {
@@ -3473,6 +3528,10 @@ fn validate_platform_support(cask: &Cask, artifacts: &CaskArtifacts) -> Result<(
             cask.token
         );
     }
+    let dirs = EffectiveCaskDirs::current();
+    for wrapper in &artifacts.command_wrappers {
+        render_command_wrapper(&dirs.appdir, cask, wrapper)?;
+    }
     Ok(())
 }
 
@@ -3610,7 +3669,7 @@ fn parse_command_wrapper_artifact(value: &Value) -> Result<Option<CommandWrapper
                             eyre!("brew-cask: command_wrapper environment values must be strings")
                         })
                 })
-                .collect::<Result<BTreeMap<_, _>>>()
+                .collect::<Result<IndexMap<_, _>>>()
         })
         .transpose()?
         .unwrap_or_default();
@@ -8383,7 +8442,7 @@ mod tests {
                 content: None,
                 executable: Some("$APPDIR/Firefox.app/Contents/MacOS/firefox".to_string()),
                 args: Vec::new(),
-                env: BTreeMap::new(),
+                env: IndexMap::new(),
             }]
         );
         Ok(())
@@ -8428,7 +8487,7 @@ mod tests {
                 "two words".to_string(),
                 "{{version}}".to_string(),
             ],
-            env: BTreeMap::from([
+            env: IndexMap::from([
                 ("FIREFOX_MODE".to_string(), "mise test".to_string()),
                 ("FIREFOX_ROOT".to_string(), "{{staged_path}}".to_string()),
             ]),
@@ -8440,17 +8499,73 @@ mod tests {
 
         let staged = final_caskroom.join(".homebrew-command-wrappers/firefox");
         let contents = file::read_to_string(&staged)?;
-        assert!(contents.starts_with("#!/bin/bash\n"));
-        assert!(contents.contains("FIREFOX_MODE='mise test'"));
-        assert!(contents.contains(&format!(
-            "FIREFOX_ROOT={}",
-            final_caskroom.to_string_lossy()
-        )));
         let executable = appdir.join("Firefox.app/Contents/MacOS/firefox");
-        assert!(contents.contains(executable.to_string_lossy().as_ref()));
-        assert!(contents.contains("--profile 'two words' 153.0.1 \"$@\""));
-        assert!(staged.metadata()?.permissions().mode() & 0o111 != 0);
+        assert_eq!(
+            contents,
+            format!(
+                "#!/bin/bash\nFIREFOX_MODE=\"mise test\" FIREFOX_ROOT=\"{}\" exec \"{}\" --profile two\\ words 153.0.1 \"$@\"\n",
+                final_caskroom.display(),
+                executable.display()
+            )
+        );
+        assert_eq!(staged.metadata()?.permissions().mode() & 0o777, 0o555);
         assert_eq!(std::fs::read_link(wrapper.target_path()?)?, staged);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stages_command_wrapper_without_args_like_homebrew() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let prefix = tmp.path().join("homebrew");
+        let _guard = BrewPrefixGuard::set(&prefix);
+        let cask = test_cask("vlc", "3.0.23");
+        let caskroom = caskroom_version_dir(&cask.token, &cask.version);
+        let appdir = Path::new("/Applications");
+        let wrapper = CommandWrapperArtifact {
+            name: "vlc".to_string(),
+            target: Some("$HOMEBREW_PREFIX/bin/vlc".to_string()),
+            content: None,
+            executable: Some("$APPDIR/VLC.app/Contents/MacOS/VLC".to_string()),
+            args: Vec::new(),
+            env: IndexMap::new(),
+        };
+
+        stage_command_wrapper(&caskroom, appdir, &cask, &wrapper)?;
+
+        let staged = wrapper.caskroom_path(&caskroom);
+        assert_eq!(
+            file::read_to_string(&staged)?,
+            "#!/bin/bash\nexec \"/Applications/VLC.app/Contents/MacOS/VLC\"  \"$@\"\n"
+        );
+        assert_eq!(staged.metadata()?.permissions().mode() & 0o777, 0o555);
+        Ok(())
+    }
+
+    #[test]
+    fn command_wrapper_rendering_fails_closed_before_staging() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cask = test_cask("example", "1.0.0");
+        let caskroom = tmp.path().join("Caskroom/example/1.0.0");
+        let wrapper = CommandWrapperArtifact {
+            name: "example".to_string(),
+            target: None,
+            content: None,
+            executable: Some("/Applications/$UNTRUSTED/example".to_string()),
+            args: Vec::new(),
+            env: IndexMap::new(),
+        };
+
+        let err = stage_command_wrapper(&caskroom, Path::new("/Applications"), &cask, &wrapper)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("executable cannot be represented safely"));
+        assert!(!caskroom.exists());
+        assert_eq!(
+            homebrew_shell_escape("two words; true")?,
+            "two\\ words\\;\\ true"
+        );
         Ok(())
     }
 
@@ -8472,7 +8587,7 @@ mod tests {
             ),
             executable: None,
             args: Vec::new(),
-            env: BTreeMap::new(),
+            env: IndexMap::new(),
         };
 
         stage_command_wrapper(&caskroom, Path::new("/Applications"), &cask, &wrapper)?;
@@ -8483,6 +8598,15 @@ mod tests {
                 "#!/bin/sh\nHOME=$HOME\nSTAGE={{{{staged_path}}}}\nexec '{}/bin/example' \"$@\"\n",
                 prefix.display()
             )
+        );
+        assert_eq!(
+            caskroom
+                .join(".homebrew-command-wrappers/example")
+                .metadata()?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
         );
         Ok(())
     }
@@ -11676,7 +11800,7 @@ end
                 content: None,
                 executable: Some("$APPDIR/Example.app/Contents/MacOS/example".to_string()),
                 args: Vec::new(),
-                env: BTreeMap::new(),
+                env: IndexMap::new(),
             }],
             ..Default::default()
         };
@@ -11758,7 +11882,7 @@ end
             content: None,
             executable: Some("$APPDIR/Firefox.app/Contents/MacOS/firefox".to_string()),
             args: Vec::new(),
-            env: BTreeMap::new(),
+            env: IndexMap::new(),
         };
         let caskroom = caskroom_version_dir(&cask.token, &cask.version);
         file::create_dir_all(&caskroom)?;
