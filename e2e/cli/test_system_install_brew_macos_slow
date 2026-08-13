@@ -106,9 +106,18 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew-cask:cloudflare-warp" = "latest"
 EOF
-cloudflare_status=$(mise bootstrap packages status 2>&1)
-grep -F "unsupported" <<<"$cloudflare_status" >/dev/null
-grep -F "pkg artifacts are unsupported" <<<"$cloudflare_status" >/dev/null
+cloudflare_status=$(mise bootstrap packages status --json)
+printf '%s\n' "$cloudflare_status" \
+  >"$MISE_BREW_ORACLE_RESULT_DIR/cloudflare-status.json"
+jq -e '
+  .["brew-cask"].packages == [{
+    "installed_version": "",
+    "package": "cloudflare-warp",
+    "reason": "brew-cask:cloudflare-warp: unsupported recorded uninstall directive script",
+    "requested_version": "latest",
+    "state": "unsupported"
+  }]
+' <<<"$cloudflare_status" >/dev/null
 assert_fail "mise bootstrap packages status --missing"
 assert_fail "mise bootstrap packages apply --yes"
 pkgutil --pkgs | LC_ALL=C sort >"$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-after.txt"
