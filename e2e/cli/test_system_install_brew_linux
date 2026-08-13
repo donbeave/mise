@@ -139,6 +139,19 @@ export mise_bin
 export -f run_mise_as_linuxbrew
 mise_as_linuxbrew=run_mise_as_linuxbrew
 
+record_xz_evidence() {
+  local producer=$1 keg=$2 relative output
+  install -d "$MISE_BREW_ORACLE_RESULT_DIR/$producer-xz-files"
+  cp "$keg/INSTALL_RECEIPT.json" \
+    "$MISE_BREW_ORACLE_RESULT_DIR/$producer-xz-INSTALL_RECEIPT.json"
+  for relative in bin/lzmadec bin/lzmainfo bin/xz bin/xzdec lib/liblzma.so.5.8.3; do
+    output="$MISE_BREW_ORACLE_RESULT_DIR/$producer-xz-files/${relative//\//_}"
+    cp "$keg/$relative" "$output"
+    readelf --wide --file-header --program-headers --dynamic --dyn-syms \
+      "$keg/$relative" >"$output.readelf"
+  done
+}
+
 cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew:xz" = "latest"
@@ -149,6 +162,7 @@ chown linuxbrew:linuxbrew mise.toml
 runuser -u linuxbrew -- "$brew" install --formula xz --yes
 brew_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/brew-xz.snapshot" "keg=$brew_keg"
+record_xz_evidence brew "$brew_keg"
 runuser -u linuxbrew -- "$brew" uninstall --formula xz
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
 assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
@@ -158,6 +172,7 @@ assert_contains "$mise_as_linuxbrew bootstrap packages status" "missing"
 run_mise_as_linuxbrew bootstrap packages apply --yes
 mise_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-xz.snapshot" "keg=$mise_keg"
+record_xz_evidence mise "$mise_keg"
 brew_oracle_diff \
   "$MISE_BREW_ORACLE_RESULT_DIR/brew-xz.snapshot" \
   "$MISE_BREW_ORACLE_RESULT_DIR/mise-xz.snapshot"
