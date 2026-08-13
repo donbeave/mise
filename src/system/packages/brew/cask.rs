@@ -413,7 +413,12 @@ impl BrewCaskManager {
             info!("brew-cask:{}: already installed", cask.token);
             return Ok(version);
         }
-        if let InstalledCaskState::NeedsRepair { reason, .. } = &installed {
+        if let InstalledCaskState::NeedsRepair {
+            reason,
+            replacement_safe: false,
+            ..
+        } = &installed
+        {
             bail!("brew-cask:{}: needs repair: {reason}", cask.token);
         }
         if matches!(
@@ -460,9 +465,17 @@ impl BrewCaskManager {
         prefix::bootstrap(false)?;
         let _caskroom_lock = lock_cask(&cask.token)?;
         match reconcile_legacy_cask_locked(&cask, installed_cask_state(&cask, &artifacts)?)? {
-            InstalledCaskState::NeedsRepair { reason, .. } => {
+            InstalledCaskState::NeedsRepair {
+                reason,
+                replacement_safe: false,
+                ..
+            } => {
                 bail!("brew-cask:{}: needs repair: {reason}", cask.token);
             }
+            InstalledCaskState::NeedsRepair {
+                replacement_safe: true,
+                ..
+            } => {}
             InstalledCaskState::Installed(version)
                 if existing_install_noop(
                     &InstalledCaskState::Installed(version.clone()),
@@ -855,12 +868,12 @@ impl SystemPackageManager for BrewCaskManager {
                 InstalledCaskState::LegacyMise(legacy) => PackageState::Installed {
                     version: legacy.version,
                 },
-                InstalledCaskState::NeedsRepair { installed, reason } => {
-                    PackageState::NeedsRepair {
-                        installed: installed.unwrap_or_default(),
-                        reason,
-                    }
-                }
+                InstalledCaskState::NeedsRepair {
+                    installed, reason, ..
+                } => PackageState::NeedsRepair {
+                    installed: installed.unwrap_or_default(),
+                    reason,
+                },
             };
             statuses.push(PackageStatus {
                 request: req.clone(),
@@ -4762,6 +4775,10 @@ enum InstalledCaskState {
     NeedsRepair {
         installed: Option<String>,
         reason: String,
+        /// A complete native receipt proved the predecessor's ownership and
+        /// teardown vocabulary. Apply may replace that damaged installation;
+        /// malformed, legacy, or interrupted state must still fail closed.
+        replacement_safe: bool,
     },
 }
 
@@ -4803,6 +4820,7 @@ fn installed_cask_state_in(
         return Ok(InstalledCaskState::NeedsRepair {
             installed: installed_version(&cask.token),
             reason,
+            replacement_safe: false,
         });
     }
     let token_dir = caskroom_token_dir(&cask.token);
@@ -4812,6 +4830,8 @@ fn installed_cask_state_in(
                 let version = receipt.source.version.clone();
                 let version_dir = caskroom_version_dir(&cask.token, &version);
                 if !version_dir.is_dir() {
+                    let replacement_safe =
+                        homebrew_cask_replacement_safe(&cask.token, &receipt, &version_dir);
                     InstalledCaskState::NeedsRepair {
                         installed: Some(version.clone()),
                         reason: format!(
@@ -4819,16 +4839,20 @@ fn installed_cask_state_in(
                             cask.token,
                             version_dir.display()
                         ),
+                        replacement_safe,
                     }
                 } else if let Err(err) =
                     validate_installed_homebrew_cask_topology(&cask.token, &receipt, &version_dir)
                 {
+                    let replacement_safe =
+                        homebrew_cask_replacement_safe(&cask.token, &receipt, &version_dir);
                     InstalledCaskState::NeedsRepair {
                         installed: Some(version),
                         reason: format!(
                             "brew-cask:{}: installed artifact topology is incomplete: {err:#}",
                             cask.token
                         ),
+                        replacement_safe,
                     }
                 } else {
                     InstalledCaskState::Installed(version)
@@ -4837,6 +4861,7 @@ fn installed_cask_state_in(
             Err(err) => InstalledCaskState::NeedsRepair {
                 installed: installed_version(&cask.token),
                 reason: format!("brew-cask:{}: {err}", cask.token),
+                replacement_safe: false,
             },
         });
     }
@@ -4853,6 +4878,7 @@ fn installed_cask_state_in(
                     "brew-cask:{}: legacy mise receipt cannot be parsed ({err}); reinstall with either 'brew install --cask {}' or mise apply after uninstalling",
                     cask.token, cask.token
                 ),
+                replacement_safe: false,
             });
         }
     };
@@ -5125,6 +5151,104 @@ fn validate_installed_homebrew_cask_topology(
     validate_installed_cask_topology(&installed, &artifacts, version_dir)
 }
 
+fn homebrew_cask_replacement_safe(
+    token: &str,
+    receipt: &receipt::CaskReceipt,
+    version_dir: &Path,
+) -> bool {
+    let installed = cask_from_homebrew_receipt(token, receipt);
+    let Ok(artifacts) = parse_cask_artifacts(&installed, false) else {
+        return false;
+    };
+    if validate_homebrew_uninstall_artifacts(token, receipt).is_err() {
+        return false;
+    }
+    let Some(token_dir) = version_dir.parent() else {
+        return false;
+    };
+    if validate_homebrew_cask_config(token, token_dir, receipt, &artifacts).is_err() {
+        return false;
+    }
+    surviving_cask_artifacts_are_owned(&installed, &artifacts, version_dir).unwrap_or(false)
+}
+
+/// Missing receipt-declared targets are repairable by a full transactional
+/// replacement. Any surviving target must still prove that the installed
+/// receipt owns it; otherwise replacement could overwrite foreign state.
+fn surviving_cask_artifacts_are_owned(
+    cask: &Cask,
+    artifacts: &CaskArtifacts,
+    version_dir: &Path,
+) -> Result<bool> {
+    for app in &artifacts.apps {
+        let target = app_target_path(app.target_name())?;
+        if target.symlink_metadata().is_err() {
+            continue;
+        }
+        let backlink = caskroom_artifact_path(version_dir, &app.source, "app")?;
+        if !target.is_dir()
+            || !backlink
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            || !file::same_file(&backlink, &target)
+        {
+            return Ok(false);
+        }
+    }
+    for font in &artifacts.fonts {
+        let target = font_target_path(font)?;
+        if target.symlink_metadata().is_err() {
+            continue;
+        }
+        let backlink = caskroom_font_path(version_dir, font)?;
+        if !target.is_file()
+            || !backlink
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            || !file::same_file(&backlink, &target)
+        {
+            return Ok(false);
+        }
+    }
+    let appdir = cask_appdir(&artifacts.apps)?;
+    for binary in &artifacts.binaries {
+        let target = binary.target_path(&appdir)?;
+        if target.symlink_metadata().is_err() {
+            continue;
+        }
+        let owned = if binary.source.starts_with("$APPDIR/") {
+            declared_appdir_binary_symlink_is_owned(&binary.source, &artifacts.apps, &target)?
+        } else {
+            symlink_resolves_below(&target, version_dir)
+        };
+        if !owned {
+            return Ok(false);
+        }
+    }
+    for wrapper in &artifacts.command_wrappers {
+        let target = wrapper.target_path()?;
+        if target.symlink_metadata().is_ok() && !symlink_resolves_below(&target, version_dir) {
+            return Ok(false);
+        }
+    }
+    for target in completion_target_paths(cask, artifacts)? {
+        if target.symlink_metadata().is_ok()
+            && !completion_target_is_owned(cask, artifacts, &target, version_dir)?
+        {
+            return Ok(false);
+        }
+    }
+    for manpage in &artifacts.manpages {
+        let target = manpage_target_path(manpage)?;
+        if target.symlink_metadata().is_ok()
+            && !manpage_target_is_owned(manpage, &artifacts.apps, &target, version_dir)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(artifacts.pkg_ids.is_empty())
+}
+
 fn validate_homebrew_cask_config(
     token: &str,
     token_dir: &Path,
@@ -5196,6 +5320,7 @@ fn legacy_needs_repair(cask: &Cask, version: &str, detail: &str) -> InstalledCas
             "brew-cask:{}: legacy mise install cannot be converted ({detail}); reinstall with either 'brew install --cask {}' or mise apply after uninstalling",
             cask.token, cask.token
         ),
+        replacement_safe: false,
     }
 }
 
@@ -8284,6 +8409,7 @@ mod tests {
                 &InstalledCaskState::NeedsRepair {
                     installed: Some("1.0".to_string()),
                     reason: "corrupt receipt".to_string(),
+                    replacement_safe: false,
                 },
                 &cask,
                 false,
@@ -12547,12 +12673,16 @@ end
             serde_json::to_vec(&config)?,
         )?;
 
-        let InstalledCaskState::NeedsRepair { reason, .. } =
-            installed_cask_state(&cask, &CaskArtifacts::default())?
+        let InstalledCaskState::NeedsRepair {
+            reason,
+            replacement_safe,
+            ..
+        } = installed_cask_state(&cask, &CaskArtifacts::default())?
         else {
             panic!("custom relevant Homebrew config must not use default target paths");
         };
         assert!(reason.contains("unsupported custom appdir"));
+        assert!(!replacement_safe);
         assert!(!custom_appdir.exists());
         Ok(())
     }
@@ -12587,12 +12717,25 @@ end
         );
 
         file::remove_file(&target)?;
-        let InstalledCaskState::NeedsRepair { reason, .. } =
-            installed_cask_state(&current, &current_artifacts)?
+        let InstalledCaskState::NeedsRepair {
+            reason,
+            replacement_safe,
+            ..
+        } = installed_cask_state(&current, &current_artifacts)?
         else {
             panic!("missing installed receipt artifact must need repair");
         };
         assert!(reason.contains("bin/old"));
+        assert!(replacement_safe);
+
+        file::write(&target, "foreign")?;
+        let InstalledCaskState::NeedsRepair {
+            replacement_safe, ..
+        } = installed_cask_state(&current, &current_artifacts)?
+        else {
+            panic!("foreign replacement artifact must need repair");
+        };
+        assert!(!replacement_safe);
         Ok(())
     }
 
@@ -12606,13 +12749,17 @@ end
         file::create_dir_all(token_dir.join(".metadata"))?;
         file::write(token_dir.join(".metadata/INSTALL_RECEIPT.json"), "{")?;
 
-        let InstalledCaskState::NeedsRepair { reason, .. } =
-            installed_cask_state(&cask, &CaskArtifacts::default())?
+        let InstalledCaskState::NeedsRepair {
+            reason,
+            replacement_safe,
+            ..
+        } = installed_cask_state(&cask, &CaskArtifacts::default())?
         else {
             panic!("malformed Homebrew receipt must need repair");
         };
         assert!(reason.contains("broken-receipt"));
         assert!(reason.contains("INSTALL_RECEIPT.json"));
+        assert!(!replacement_safe);
         Ok(())
     }
 
