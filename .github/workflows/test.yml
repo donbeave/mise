@@ -272,7 +272,7 @@ jobs:
           result_dir="$RUNNER_TEMP/mise-brew-oracle-results"
           brew_oracle_verify_marker \
             "$result_dir/macos-cask.completed" \
-            test_system_install_brew_macos_slow 7 /opt/homebrew \
+            test_system_install_brew_macos_slow 8 /opt/homebrew \
             "$MISE_BREW_ORACLE_MISE_SHA" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_RELEASE" \
             "$MISE_BREW_ORACLE_HOMEBREW_REFERENCE_SHA" \
