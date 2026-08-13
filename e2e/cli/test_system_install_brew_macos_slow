@@ -261,6 +261,7 @@ EOF
     "$MISE_BREW_ORACLE_RESULT_DIR/mise-$token.snapshot"
   assert_contains "'$brew' list --cask" "$token"
   assert_succeed "'$brew' info --cask '$token'"
+  "$brew" upgrade --cask "$token"
   "$brew" reinstall --cask "$token"
   snapshot_cask "$token" "brew-reinstalled-$token.snapshot"
   brew_oracle_diff \
