@@ -25,14 +25,14 @@ shared_fixture_paths=(
 postgresql_var="$MISE_SYSTEM_BREW_PREFIX/var/postgresql@17"
 preexisting_record="$MISE_BREW_ORACLE_RESULT_DIR/macos-formula-lifecycle.preexisting"
 
-brew_oracle_record_api_fixture formula ca-certificates 2026-07-16 \
-  8868cd9524277e8309ebf094f9d6938baf0dbe45b6e302b201649ceaaa39cf26
+brew_oracle_record_api_fixture formula ca-certificates 2026-08-13 \
+  e04c5e309cf46f8b56ea948dd184aca2ae64cd78e15c9fe15e43dd3a44c4f828
 brew_oracle_record_api_fixture formula openssl@3 3.6.3 \
   13a19dd3df8d702d1700cdbdfe476675ea4944d862b1cfab2b5aba7920e1f47f
 brew_oracle_record_api_fixture formula node 26.7.0 \
   ef137f5d70e97b399ea64f6e9c04c07994cea8a0db492142922c9d77fb789a8e
-brew_oracle_record_api_fixture formula kimi-code 0.34.0 \
-  6b1d0b2ff38f9904c343fb79b7aaec0d1584c4f7217a704ba36e954ea642fd7f
+brew_oracle_record_api_fixture formula kimi-code 0.35.0 \
+  2b1aea8a594f340dadec2ea105dd8afd032f725c410b5c697b17703c1800747e
 brew_oracle_record_api_fixture formula postgresql@17 17.10 \
   30b784b24892ca2b76c4fa787a388ede791842e41875e85d6b2dadfc6f50d1f9
 
