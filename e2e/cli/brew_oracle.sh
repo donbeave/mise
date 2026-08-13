@@ -17,12 +17,14 @@ brew_oracle_normalize_json() {
   if [[ $input == */INSTALL_RECEIPT.json ]]; then
     jq -e '
       has("homebrew_version") and has("time") and has("built_on") and
+      has("loaded_from_api") and (.loaded_from_api | type == "boolean") and
       (.source | type == "object" and has("path") and has("tap_git_head")) and
       ((has("used_options") | not) or has("source_modified_time"))
     ' "$input" >/dev/null
     jq -S '
       .homebrew_version = "<NORMALIZED>" |
       .time = "<NORMALIZED>" |
+      .loaded_from_api = "<NORMALIZED>" |
       .source.path = "<NORMALIZED>"
     ' "$input" >"$output"
   elif [[ $input == */sbom.spdx.json ]]; then
