@@ -1879,6 +1879,9 @@ mod tests {
         crate::file::write(keg.join("sbom.spdx.json"), serde_json::to_vec(&sbom)?)?;
         let mut tab = bottle_tab("1.0");
         tab["changed_files"] = Value::Null;
+        tab["built_on"]["xcode"] = Value::Null;
+        tab["built_on"]["clt"] = Value::Null;
+        tab["built_on"]["preferred_perl"] = Value::Null;
         tab["source"] = json!({
             "scm_revision": "source-deadbeef",
             "versions": {

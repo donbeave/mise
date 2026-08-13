@@ -33,14 +33,38 @@ pub enum ReceiptError {
     },
 }
 
+fn deserialize_present_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BuiltOn {
     pub os: String,
     pub os_version: String,
     pub cpu_family: String,
-    pub xcode: Option<String>,
-    pub clt: Option<String>,
-    pub preferred_perl: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_nullable_string"
+    )]
+    pub xcode: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_nullable_string"
+    )]
+    pub clt: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_nullable_string"
+    )]
+    pub preferred_perl: Option<Option<String>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -212,6 +236,117 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn os_release_pretty_name(contents: &str) -> Option<String> {
+    let raw = contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "PRETTY_NAME").then_some(value.trim())
+    })?;
+    let value = if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let value = value.replace("\\\"", "\"").replace("\\\\", "\\");
+    (!value.is_empty()).then_some(value)
+}
+
+fn cpuinfo_number(cpuinfo: &str, key: &str) -> Option<u32> {
+    cpuinfo.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim() == key)
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+fn cpuinfo_value<'a>(cpuinfo: &'a str, key: &str) -> Option<&'a str> {
+    cpuinfo.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim() == key).then(|| value.trim())
+    })
+}
+
+fn intel_cpu_family(family: u32, model: u32) -> Option<&'static str> {
+    match family {
+        0x06 => match model {
+            0x3a | 0x3e => Some("ivybridge"),
+            0x2a | 0x2d => Some("sandybridge"),
+            0x25 | 0x2c | 0x2f => Some("westmere"),
+            0x1a | 0x1e | 0x1f | 0x2e => Some("nehalem"),
+            0x17 | 0x1d => Some("penryn"),
+            0x0f | 0x16 => Some("merom"),
+            0x0d => Some("dothan"),
+            0x1c | 0x26 | 0x27 | 0x35 | 0x36 => Some("atom"),
+            0x3c | 0x3f | 0x45 | 0x46 => Some("haswell"),
+            0x3d | 0x47 | 0x4f | 0x56 => Some("broadwell"),
+            0x4e | 0x5e | 0x8e | 0x9e | 0xa5 | 0xa6 => Some("skylake"),
+            0x66 => Some("cannonlake"),
+            0x6a | 0x6c | 0x7d | 0x7e => Some("icelake"),
+            0xa7 => Some("rocketlake"),
+            0x8c | 0x8d => Some("tigerlake"),
+            0x97 | 0x9a | 0xbe | 0xb7 | 0xba | 0xbf | 0xaa | 0xac => Some("alderlake"),
+            0xc5 | 0xb5 | 0xc6 | 0xbd => Some("arrowlake"),
+            0xcc => Some("pantherlake"),
+            0xad | 0xae => Some("graniterapids"),
+            0xcf | 0x8f => Some("sapphirerapids"),
+            _ => None,
+        },
+        0x0f => match model {
+            0x06 => Some("presler"),
+            0x03 | 0x04 => Some("prescott"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn amd_cpu_family(family: u32, model: u32) -> Option<&'static str> {
+    match family {
+        0x06 => Some("amd_k7"),
+        0x0f => Some("amd_k8"),
+        0x10 => Some("amd_k10"),
+        0x11 => Some("amd_k8_k10_hybrid"),
+        0x12 => Some("amd_k10_llano"),
+        0x14 => Some("bobcat"),
+        0x15 => Some("bulldozer"),
+        0x16 => Some("jaguar"),
+        0x17 => match model {
+            0x10..=0x2f => Some("zen"),
+            0x30..=0x3f | 0x47 | 0x60..=0x7f | 0x84..=0x87 | 0x90..=0xaf => Some("zen2"),
+            _ => None,
+        },
+        0x19 => match model {
+            0x00..=0x0f | 0x20..=0x5f => Some("zen3"),
+            0x10..=0x1f | 0x60..=0x7f | 0xa0..=0xaf => Some("zen4"),
+            _ => None,
+        },
+        0x1a => Some("zen5"),
+        _ => None,
+    }
+}
+
+fn linux_cpu_family(cpuinfo: &str, arch: &str) -> String {
+    match arch {
+        "aarch64" | "arm" | "armv7" => return "arm".to_string(),
+        arch if arch.starts_with("powerpc") => return "ppc".to_string(),
+        "x86" | "x86_64" => {}
+        _ => return "dunno".to_string(),
+    }
+    let family = cpuinfo_number(cpuinfo, "cpu family").unwrap_or_default();
+    let model = cpuinfo_number(cpuinfo, "model").unwrap_or_default();
+    let detected = match cpuinfo_value(cpuinfo, "vendor_id") {
+        Some("GenuineIntel") => intel_cpu_family(family, model),
+        Some("AuthenticAMD") => amd_cpu_family(family, model),
+        _ => None,
+    };
+    detected
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("unknown_0x{family:x}_0x{model:x}"))
+}
+
 #[cfg(target_os = "macos")]
 pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
     let product_version = command_output("/usr/bin/sw_vers", &["-productVersion"])
@@ -274,25 +409,46 @@ pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
         os: "Macintosh".to_string(),
         os_version,
         cpu_family: family,
-        xcode,
-        clt,
-        preferred_perl: Some(preferred_perl),
+        xcode: Some(xcode),
+        clt: Some(clt),
+        preferred_perl: Some(Some(preferred_perl)),
         extra: Map::new(),
     })
 }
 
 #[cfg(target_os = "linux")]
 pub fn native_build_system_info() -> Result<BuiltOn, ReceiptError> {
-    let os_version = command_output("uname", &["-r"])
-        .ok_or_else(|| ReceiptError::MissingFact("Linux version".to_string()))?;
+    let os_release = fs::read_to_string("/etc/os-release")
+        .map_err(|_| ReceiptError::MissingFact("Linux /etc/os-release".to_string()))?;
+    let os_version = os_release_pretty_name(&os_release)
+        .ok_or_else(|| ReceiptError::MissingFact("Linux PRETTY_NAME".to_string()))?;
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo")
+        .map_err(|_| ReceiptError::MissingFact("Linux /proc/cpuinfo".to_string()))?;
+    let cpu_family = linux_cpu_family(&cpuinfo, std::env::consts::ARCH);
+    let glibc_version = command_output("getconf", &["GNU_LIBC_VERSION"])
+        .and_then(|value| value.strip_prefix("glibc ").map(str::to_string))
+        .ok_or_else(|| ReceiptError::MissingFact("Linux glibc version".to_string()))?;
+    let oldest_cpu_family = match std::env::consts::ARCH {
+        "x86_64" => "core2",
+        "x86" => "core",
+        "aarch64" => "armv8",
+        "arm" | "armv7" => "armv6",
+        _ => "dunno",
+    };
+    let mut extra = Map::new();
+    extra.insert("glibc_version".to_string(), Value::String(glibc_version));
+    extra.insert(
+        "oldest_cpu_family".to_string(),
+        Value::String(oldest_cpu_family.to_string()),
+    );
     Ok(BuiltOn {
         os: "Linux".to_string(),
         os_version,
-        cpu_family: std::env::consts::ARCH.to_string(),
+        cpu_family,
         xcode: None,
         clt: None,
         preferred_perl: None,
-        extra: Map::new(),
+        extra,
     })
 }
 
@@ -390,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn built_on_absent_probe_values_are_preserved_as_null() {
+    fn built_on_absent_probe_values_are_omitted() {
         let value = serde_json::to_value(BuiltOn {
             os: "Linux".to_string(),
             os_version: "test".to_string(),
@@ -402,9 +558,46 @@ mod tests {
         })
         .unwrap();
 
+        assert!(value.get("xcode").is_none());
+        assert!(value.get("clt").is_none());
+        assert!(value.get("preferred_perl").is_none());
+    }
+
+    #[test]
+    fn built_on_explicit_null_probe_values_round_trip() {
+        let built_on: BuiltOn = serde_json::from_value(serde_json::json!({
+            "os": "Linux",
+            "os_version": "test",
+            "cpu_family": "test",
+            "xcode": null,
+            "clt": null,
+            "preferred_perl": null
+        }))
+        .unwrap();
+        let value = serde_json::to_value(built_on).unwrap();
+
         assert!(value["xcode"].is_null());
         assert!(value["clt"].is_null());
         assert!(value["preferred_perl"].is_null());
+    }
+
+    #[test]
+    fn parses_homebrew_linux_build_host_facts() {
+        assert_eq!(
+            os_release_pretty_name(
+                "NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.3 LTS\"\nVERSION_ID=24.04\n"
+            )
+            .as_deref(),
+            Some("Ubuntu 24.04.3 LTS")
+        );
+        assert_eq!(
+            linux_cpu_family(
+                "vendor_id : AuthenticAMD\ncpu family : 25\nmodel : 17\n",
+                "x86_64"
+            ),
+            "zen4"
+        );
+        assert_eq!(linux_cpu_family("", "aarch64"), "arm");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
