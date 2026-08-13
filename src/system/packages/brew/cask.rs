@@ -9877,9 +9877,10 @@ end
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
         let _guard = BrewPrefixGuard::set(tmp.path());
+        let appdir = EffectiveCaskDirs::current().appdir;
         assert_eq!(
-            binary_target_path("$APPDIR/Surge Dashboard.app", Path::new("/Applications"))?,
-            PathBuf::from("/Applications/Surge Dashboard.app")
+            binary_target_path("$APPDIR/Surge Dashboard.app", &appdir)?,
+            appdir.join("Surge Dashboard.app")
         );
         let prefix_appdir = tmp.path().join("Applications");
         assert_eq!(
@@ -9893,7 +9894,7 @@ end
             "prefix/$APPDIR/secret",
         ] {
             assert!(
-                binary_target_path(target, Path::new("/Applications")).is_err(),
+                binary_target_path(target, &appdir).is_err(),
                 "accepted {target}"
             );
         }
@@ -11828,6 +11829,7 @@ end
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
         let _guard = BrewPrefixGuard::set(tmp.path());
+        let parent_cwd = std::env::current_dir()?;
         let ready = tmp.path().join("child-ready");
         let release = tmp.path().join("child-release");
         let test_name = "system::packages::brew::cask::tests::cask_lock_process_helper";
@@ -11836,6 +11838,7 @@ end
             .env("MISE_SYSTEM_BREW_PREFIX", tmp.path())
             .env("MISE_CASK_LOCK_HELPER_READY", &ready)
             .env("MISE_CASK_LOCK_HELPER_RELEASE", &release)
+            .env("MISE_TEST_PRESERVE_FIXTURE", "1")
             .spawn()?;
         for _ in 0..200 {
             if ready.is_file() {
@@ -11855,6 +11858,7 @@ end
         assert!(err.contains("another Homebrew-compatible operation"));
         file::write(&release, "release")?;
         assert!(child.wait()?.success());
+        assert_eq!(std::env::current_dir()?, parent_cwd);
         let _released = lock_cask("process-contention")?;
         Ok(())
     }
