@@ -1902,7 +1902,16 @@ fn stage_manpage(
 }
 
 fn link_manpage(caskroom: &Path, apps: &[AppArtifact], manpage: &ManpageArtifact) -> Result<()> {
-    let source = staged_manpage_source(caskroom, apps, manpage)?;
+    let source = if manpage.source.starts_with("$APPDIR/") {
+        appdir_artifact_source(&manpage.source, apps)?.ok_or_else(|| {
+            eyre!(
+                "brew-cask: manpage APPDIR artifact '{}' is missing after app activation",
+                manpage.source
+            )
+        })?
+    } else {
+        staged_manpage_source(caskroom, apps, manpage)?
+    };
     let target = manpage_target_path(manpage)?;
     if let Some(parent) = target.parent() {
         create_dir_all_elevating(parent)?;
@@ -2312,6 +2321,18 @@ fn stage_completion(
     apps: &[AppArtifact],
     completion: &CompletionArtifact,
 ) -> Result<()> {
+    if completion.source.starts_with("$APPDIR/") {
+        staged_appdir_artifact_source(&completion.source, apps, caskroom)?.ok_or_else(|| {
+            eyre!(
+                "brew-cask: {} completion APPDIR artifact '{}' was not staged",
+                completion.shell.name(),
+                completion.source
+            )
+        })?;
+        // Homebrew links APPDIR completions directly into the moved app. Do
+        // not create a second Caskroom copy with different receipt topology.
+        return Ok(());
+    }
     let target = completion.target_path()?;
     let caskroom_completion = caskroom_completion_path(caskroom, &target)?;
     let source = find_completion_source(stage, caskroom, cask, apps, &completion.source)?
@@ -2363,7 +2384,31 @@ fn link_completion(
     target: &Path,
 ) -> Result<()> {
     let caskroom_completion = caskroom_completion_path(caskroom, target)?;
-    if !caskroom_completion.is_file() {
+    let mut declared = artifacts
+        .completions
+        .iter()
+        .filter(|completion| completion.target_path().is_ok_and(|path| path == target));
+    let first_declared = declared.next();
+    if first_declared.is_some() && declared.next().is_some() {
+        bail!(
+            "brew-cask:{}: multiple completion artifacts claim '{}'",
+            cask.token,
+            target.display()
+        );
+    }
+    let source = match first_declared {
+        Some(completion) if completion.source.starts_with("$APPDIR/") => {
+            appdir_artifact_source(&completion.source, &artifacts.apps)?.ok_or_else(|| {
+                eyre!(
+                    "brew-cask:{}: completion APPDIR artifact '{}' is missing after app activation",
+                    cask.token,
+                    completion.source
+                )
+            })?
+        }
+        _ => caskroom_completion,
+    };
+    if !source.is_file() {
         bail!(
             "brew-cask: completion artifact '{}' was not staged",
             target.display()
@@ -2373,7 +2418,7 @@ fn link_completion(
         create_dir_all_elevating(parent)?;
     }
     ensure_completion_target_replaceable(cask, artifacts, target)?;
-    make_symlink_elevating(&caskroom_completion, target)?;
+    make_symlink_elevating(&source, target)?;
     Ok(())
 }
 
@@ -4657,17 +4702,18 @@ fn validate_installed_cask_topology(
         }
     }
     for target in completion_target_paths(cask, artifacts)? {
-        if !symlink_resolves_below(&target, version_dir) {
+        if !completion_target_is_owned(cask, artifacts, &target, version_dir)? {
             bail!(
-                "completion is not an owned Caskroom symlink: {}",
+                "completion is not an owned declared-source symlink: {}",
                 target.display()
             );
         }
     }
-    for target in manpage_target_paths(artifacts)? {
-        if !symlink_resolves_below(&target, version_dir) {
+    for manpage in &artifacts.manpages {
+        let target = manpage_target_path(manpage)?;
+        if !manpage_target_is_owned(manpage, &artifacts.apps, &target, version_dir)? {
             bail!(
-                "manpage is not an owned Caskroom symlink: {}",
+                "manpage is not an owned declared-source symlink: {}",
                 target.display()
             );
         }
@@ -4676,6 +4722,59 @@ fn validate_installed_cask_topology(
         bail!("one or more recorded package receipts are missing");
     }
     Ok(())
+}
+
+fn declared_appdir_symlink_is_owned(
+    source: &str,
+    apps: &[AppArtifact],
+    target: &Path,
+) -> Result<bool> {
+    let Some(source) = appdir_artifact_source(source, apps)? else {
+        return Ok(false);
+    };
+    Ok(target
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && file::same_file(target, &source))
+}
+
+fn manpage_target_is_owned(
+    manpage: &ManpageArtifact,
+    apps: &[AppArtifact],
+    target: &Path,
+    version_dir: &Path,
+) -> Result<bool> {
+    if manpage.source.starts_with("$APPDIR/") {
+        declared_appdir_symlink_is_owned(&manpage.source, apps, target)
+    } else {
+        Ok(symlink_resolves_below(target, version_dir))
+    }
+}
+
+fn completion_target_is_owned(
+    cask: &Cask,
+    artifacts: &CaskArtifacts,
+    target: &Path,
+    version_dir: &Path,
+) -> Result<bool> {
+    let mut declared = artifacts
+        .completions
+        .iter()
+        .filter(|completion| completion.target_path().is_ok_and(|path| path == target));
+    let completion = declared.next();
+    if completion.is_some() && declared.next().is_some() {
+        bail!(
+            "brew-cask:{}: multiple completion artifacts claim '{}'",
+            cask.token,
+            target.display()
+        );
+    }
+    match completion {
+        Some(completion) if completion.source.starts_with("$APPDIR/") => {
+            declared_appdir_symlink_is_owned(&completion.source, &artifacts.apps, target)
+        }
+        _ => Ok(symlink_resolves_below(target, version_dir)),
+    }
 }
 
 fn validate_installed_homebrew_cask_topology(
@@ -5751,6 +5850,7 @@ fn finish_interrupted_cask_commit(cask: &Cask, journal: &CaskTransactionJournal)
 
 fn successor_owns_public_target(cask: &Cask, target: &Path) -> bool {
     let version_dir = caskroom_version_dir(&cask.token, &cask.version);
+    let artifacts = cask_artifacts(cask).ok();
     if target
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -5758,10 +5858,22 @@ fn successor_owns_public_target(cask: &Cask, target: &Path) -> bool {
         let Ok(link) = std::fs::read_link(target) else {
             return false;
         };
-        return path_starts_with_resolved_root(&resolve_symlink_target(target, link), &version_dir);
+        if path_starts_with_resolved_root(&resolve_symlink_target(target, link), &version_dir) {
+            return true;
+        }
+        let Some(artifacts) = artifacts.as_ref() else {
+            return false;
+        };
+        if completion_target_is_owned(cask, artifacts, target, &version_dir).unwrap_or(false) {
+            return true;
+        }
+        return artifacts.manpages.iter().any(|manpage| {
+            manpage_target_path(manpage).is_ok_and(|path| path == target)
+                && manpage_target_is_owned(manpage, &artifacts.apps, target, &version_dir)
+                    .unwrap_or(false)
+        });
     }
-    let mut backlinks = cask_artifacts(cask)
-        .ok()
+    let mut backlinks = artifacts
         .into_iter()
         .flat_map(|artifacts| {
             let app_backlinks = artifacts.apps.into_iter().filter_map(|app| {
@@ -7017,6 +7129,16 @@ fn remove_launchctl_service(token: &str, label: &str) -> Result<()> {
 
 fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
     let receipt = &candidate.receipt;
+    let native_artifacts = candidate
+        .homebrew_receipt
+        .as_ref()
+        .map(|homebrew| {
+            parse_cask_artifacts(
+                &cask_from_homebrew_receipt(&candidate.token, homebrew),
+                false,
+            )
+        })
+        .transpose()?;
     if let Some(homebrew) = &candidate.homebrew_receipt {
         let token_dir = candidate
             .version_dir
@@ -7112,9 +7234,24 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         let record = records
             .get(path)
             .ok_or_else(|| eyre!("missing manpage target record"))?;
+        let source_is_owned = match &native_artifacts {
+            Some(artifacts) => {
+                let manpage = artifacts
+                    .manpages
+                    .iter()
+                    .find(|manpage| {
+                        manpage_target_path(manpage).is_ok_and(|target| target == *path)
+                    })
+                    .ok_or_else(|| {
+                        eyre!("missing native manpage artifact for {}", path.display())
+                    })?;
+                manpage_target_is_owned(manpage, &artifacts.apps, path, &candidate.version_dir)?
+            }
+            None => symlink_resolves_below(path, &candidate.version_dir),
+        };
         if record.fingerprint.kind != CaskTargetKind::Symlink
             || !path_is_below(path, &EffectiveCaskDirs::current().manpagedir)
-            || !symlink_resolves_below(path, &candidate.version_dir)
+            || !source_is_owned
         {
             bail!(
                 "manpage target is not an owned Caskroom symlink: {}",
@@ -7133,11 +7270,23 @@ fn validate_cask_prune_candidate(candidate: &CaskPruneCandidate) -> Result<()> {
         let record = records
             .get(path)
             .ok_or_else(|| eyre!("missing completion target record"))?;
+        let source_is_owned = match &native_artifacts {
+            Some(artifacts) => completion_target_is_owned(
+                &cask_from_homebrew_receipt(
+                    &candidate.token,
+                    candidate.homebrew_receipt.as_ref().expect("checked above"),
+                ),
+                artifacts,
+                path,
+                &candidate.version_dir,
+            )?,
+            None => symlink_resolves_below(path, &candidate.version_dir),
+        };
         if record.fingerprint.kind != CaskTargetKind::Symlink
             || !completion_roots
                 .iter()
                 .any(|root| path_is_below(path, root))
-            || !symlink_resolves_below(path, &candidate.version_dir)
+            || !source_is_owned
         {
             bail!(
                 "completion target is not an owned Caskroom symlink: {}",
@@ -7620,6 +7769,7 @@ mod tests {
             .iter()
             .map(|artifact| artifact["font"][0].as_str().unwrap())
             .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
         assert_eq!(
             sources,
             [
@@ -7641,6 +7791,17 @@ mod tests {
                 "font-0.ttf",
             ]
         );
+        #[cfg(not(target_os = "macos"))]
+        {
+            let actual = sources.into_iter().collect::<BTreeSet<_>>();
+            let expected = (0..16)
+                .map(|index| format!("font-{index}.ttf"))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actual,
+                expected.iter().map(String::as_str).collect::<BTreeSet<_>>()
+            );
+        }
         Ok(())
     }
 
@@ -9198,7 +9359,7 @@ end
 
     #[cfg(unix)]
     #[test]
-    fn link_completion_adopts_homebrew_app_symlink() -> Result<()> {
+    fn link_completion_preserves_homebrew_app_symlink() -> Result<()> {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir()?;
         let _guard = BrewPrefixGuard::set(tmp.path());
@@ -9218,22 +9379,52 @@ end
             completions: vec![completion.clone()],
             ..Default::default()
         };
-        let relative = Path::new("etc/bash_completion.d/docker");
-        let target = tmp.path().join(relative);
-        let caskroom_completion = caskroom.join(relative);
+        let target = tmp.path().join("etc/bash_completion.d/docker");
         let app_completion = app_target_path(app.target_name())?
             .join("Contents/Resources/etc/docker.bash-completion");
-        file::create_dir_all(caskroom_completion.parent().unwrap())?;
         file::create_dir_all(app_completion.parent().unwrap())?;
         file::create_dir_all(target.parent().unwrap())?;
-        crate::file::write(&caskroom_completion, "new")?;
         crate::file::write(&app_completion, "homebrew")?;
         file::make_symlink(&app_completion, &target)?;
 
         link_completion(&cask, &artifacts, &caskroom, &target)?;
 
-        assert_eq!(std::fs::read_link(&target)?, caskroom_completion);
-        assert_eq!(crate::file::read_to_string(target)?, "new");
+        assert_eq!(std::fs::read_link(&target)?, app_completion);
+        assert_eq!(crate::file::read_to_string(target)?, "homebrew");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn appdir_completion_staging_creates_no_duplicate_caskroom_file() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let stage = tmp.path().join("stage");
+        let caskroom = tmp.path().join("Caskroom/ghostty/1.0.0");
+        let app = AppArtifact {
+            source: "Ghostty.app".to_string(),
+            target: Some("$HOMEBREW_PREFIX/Applications/Ghostty.app".to_string()),
+        };
+        let completion = CompletionArtifact {
+            shell: CompletionShell::Bash,
+            source: "$APPDIR/Ghostty.app/Contents/Resources/ghostty.bash".to_string(),
+            target: Some("$HOMEBREW_PREFIX/etc/bash_completion.d/ghostty".to_string()),
+        };
+        file::create_dir_all(&stage)?;
+        let staged_source = caskroom.join("Ghostty.app/Contents/Resources/ghostty.bash");
+        file::create_dir_all(staged_source.parent().unwrap())?;
+        crate::file::write(staged_source, "complete")?;
+
+        stage_completion(
+            &stage,
+            &caskroom,
+            &test_cask("ghostty", "1.0.0"),
+            &[app],
+            &completion,
+        )?;
+
+        assert!(!caskroom.join("etc/bash_completion.d/ghostty").exists());
         Ok(())
     }
 
@@ -11319,7 +11510,7 @@ end
             target: Some("$HOMEBREW_PREFIX/Applications/Ghostty.app".to_string()),
         };
         let manpage = ManpageArtifact {
-            source: "Ghostty.app/Contents/Resources/man/ghostty.1".to_string(),
+            source: "$APPDIR/Ghostty.app/Contents/Resources/man/ghostty.1".to_string(),
             section: "1".to_string(),
         };
         let app_target = app_target_path(app.target_name())?;
@@ -11338,6 +11529,16 @@ end
         );
         assert!(manpage_target.is_symlink());
         assert!(file::same_file(&manpage_target, &manpage_source));
+        assert_eq!(
+            std::fs::read_link(&manpage_target)?,
+            app_target.join("Contents/Resources/man/ghostty.1")
+        );
+        assert!(manpage_target_is_owned(
+            &manpage,
+            std::slice::from_ref(&app),
+            &manpage_target,
+            &caskroom,
+        )?);
         Ok(())
     }
 
