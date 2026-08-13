@@ -113,21 +113,23 @@ cmp "$MISE_BREW_ORACLE_RESULT_DIR/pkgutil-before.txt" \
 brew_oracle_require_absent_path "$cloudflare_room" "unsupported pkg cask metadata"
 brew_oracle_require_absent_path "$cloudflare_app" "unsupported pkg cask app"
 
-# A process using Homebrew's exact lock identity blocks mise before the first
-# artifact or metadata mutation.
+# Pinned Homebrew's own CaskLock blocks mise before the first artifact or
+# metadata mutation.
 cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew-cask:hiddenbar" = "latest"
 EOF
 lock_ready="$MISE_BREW_ORACLE_RESULT_DIR/hiddenbar-lock-held"
-lock_path="$prefix/var/homebrew/locks/hiddenbar.cask.lock"
-/usr/bin/ruby -e '
-  File.open(ARGV.fetch(0), File::RDWR | File::CREAT, 0644) do |lock|
-    lock.flock(File::LOCK_EX)
+lock_holder="$MISE_BREW_ORACLE_RESULT_DIR/homebrew-cask-lock-holder.rb"
+cat <<'RUBY' >"$lock_holder"
+require "lock_file"
+
+CaskLock.new(ARGV.fetch(0)).with_lock do
     File.write(ARGV.fetch(1), "held\n")
     sleep 5
-  end
-' "$lock_path" "$lock_ready" &
+end
+RUBY
+"$brew" ruby "$lock_holder" hiddenbar "$lock_ready" &
 lock_pid=$!
 for _ in {1..50}; do
   [[ -f $lock_ready ]] && break
