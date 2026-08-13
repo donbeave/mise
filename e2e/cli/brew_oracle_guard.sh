@@ -39,7 +39,7 @@ brew_oracle_validate_homebrew_identity() {
 brew_oracle_configure_runtime() {
   local expected_prefix=$1 brew_source repository bridge
   local brew_real repository_real runner_real prefix_real prefix_owner repository_owner
-  local actual_prefix actual_repository actual_version actual_sha
+  local repository_user actual_prefix actual_repository actual_version actual_sha
 
   brew_source=${MISE_BREW_ORACLE_BREW_SOURCE:-}
   repository=${MISE_BREW_ORACLE_HOMEBREW_REPOSITORY:-}
@@ -88,7 +88,20 @@ brew_oracle_configure_runtime() {
     return 1
   }
 
-  actual_sha=$(git -C "$repository_real" rev-parse HEAD) || return 1
+  if [[ $(id -u) == "$repository_owner" ]]; then
+    actual_sha=$(git -C "$repository_real" rev-parse HEAD) || return 1
+  elif [[ $(uname) == Linux && $(id -u) == 0 ]]; then
+    repository_user=$(getent passwd "$repository_owner" | awk -F: 'NR == 1 { print $1 }')
+    [[ -n $repository_user ]] || {
+      brew_oracle_fail "pinned repository owner has no local account"
+      return 1
+    }
+    actual_sha=$(runuser -u "$repository_user" -- git -C "$repository_real" rev-parse HEAD) ||
+      return 1
+  else
+    brew_oracle_fail "cannot inspect pinned repository as its owner"
+    return 1
+  fi
   [[ $actual_sha == "$MISE_BREW_ORACLE_HOMEBREW_RUNTIME_SHA" ]] || {
     brew_oracle_fail "pinned repository SHA $actual_sha does not match the marker identity"
     return 1
