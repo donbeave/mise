@@ -118,7 +118,24 @@ brew_oracle_record_api_fixture formula hello 2.12.3 \
 brew_oracle_record_api_fixture cask font-jetbrains-mono 2.304 \
   4aa667b54ee06b86b2473d6cfbedb0900527e918d0be8f89b2026efd69588ca2
 mise_bin=$(command -v mise)
-mise_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache '$mise_bin'"
+install -d -m 0755 -o linuxbrew -g linuxbrew /home/linuxbrew/tmp
+run_mise_as_linuxbrew() {
+  runuser -u linuxbrew -- env \
+    HOME=/home/linuxbrew \
+    XDG_CACHE_HOME=/home/linuxbrew/.cache \
+    XDG_CONFIG_HOME=/home/linuxbrew/.config \
+    XDG_DATA_HOME=/home/linuxbrew/.local/share \
+    XDG_STATE_HOME=/home/linuxbrew/.local/state \
+    MISE_CACHE_DIR=/home/linuxbrew/.cache/mise \
+    MISE_CONFIG_DIR=/home/linuxbrew/.config/mise \
+    MISE_DATA_DIR=/home/linuxbrew/.local/share/mise \
+    MISE_STATE_DIR=/home/linuxbrew/.local/state/mise \
+    MISE_SYSTEM_DIR=/home/linuxbrew/.local/share/mise/system \
+    MISE_TMP_DIR=/home/linuxbrew/tmp \
+    MISE_TRUSTED_CONFIG_PATHS="$PWD" \
+    "$mise_bin" "$@"
+}
+mise_as_linuxbrew=run_mise_as_linuxbrew
 
 cat <<EOF >mise.toml
 [bootstrap.packages]
@@ -136,8 +153,7 @@ assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
 
 # Engine state must be indistinguishable after explicit volatile normalization.
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "missing"
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages apply --yes
+run_mise_as_linuxbrew bootstrap packages apply --yes
 mise_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
 brew_oracle_snapshot "$MISE_BREW_ORACLE_RESULT_DIR/mise-xz.snapshot" "keg=$mise_keg"
 brew_oracle_diff \
@@ -162,16 +178,14 @@ brew_oracle_diff \
 runuser -u linuxbrew -- "$brew" uninstall --formula xz
 
 # Keep repair/import/prune coverage on engine-installed state.
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages apply --yes
+run_mise_as_linuxbrew bootstrap packages apply --yes
 keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)
 receipt_mtime=$(stat -c %y "$keg/INSTALL_RECEIPT.json")
 keg_inode=$(stat -c %i "$keg")
 public_link_inode=$(stat -c %i /home/linuxbrew/.linuxbrew/bin/xz)
 rm /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "needs repair"
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages apply --yes
+run_mise_as_linuxbrew bootstrap packages apply --yes
 assert_succeed "test \"$(readlink -f /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz)\" = \"$keg\""
 assert_succeed "test \"$(stat -c %y "$keg/INSTALL_RECEIPT.json")\" = \"$receipt_mtime\""
 assert_succeed "test \"$(stat -c %i "$keg")\" = \"$keg_inode\""
@@ -179,13 +193,11 @@ assert_succeed "test \"$(stat -c %i /home/linuxbrew/.linuxbrew/bin/xz)\" = \"$pu
 
 rm /home/linuxbrew/.linuxbrew/opt/xz
 assert_contains "$mise_as_linuxbrew bootstrap packages status" "needs repair"
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages apply --yes
+run_mise_as_linuxbrew bootstrap packages apply --yes
 assert_succeed "test \"$(readlink -f /home/linuxbrew/.linuxbrew/opt/xz)\" = \"$keg\""
 
 assert_contains "$mise_as_linuxbrew bootstrap packages import --manager brew --dry-run --path imported.toml" '"brew:xz" = "latest"'
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages import --manager brew --path imported.toml
+run_mise_as_linuxbrew bootstrap packages import --manager brew --path imported.toml
 assert_contains "cat imported.toml" '"brew:xz" = "latest"'
 assert_contains "$mise_as_linuxbrew bootstrap packages prune --manager brew --dry-run 2>&1" "nothing to prune"
 
@@ -193,8 +205,7 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 EOF
 assert_contains "$mise_as_linuxbrew bootstrap packages prune --manager brew --dry-run" "remove brew:xz"
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  "$mise_bin" bootstrap packages prune --manager brew --yes
+run_mise_as_linuxbrew bootstrap packages prune --manager brew --yes
 assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/xz"
 assert_fail "test -L /home/linuxbrew/.linuxbrew/var/homebrew/linked/xz"
 
@@ -204,10 +215,9 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 "brew:hello" = "latest"
 EOF
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  MISE_SYSTEM_BREW_FORCE_SOURCE=hello \
+MISE_SYSTEM_BREW_FORCE_SOURCE=hello \
   MISE_URL_REPLACEMENTS='{"https://ftpmirror.gnu.org/gnu":"https://ftp.gnu.org/gnu"}' \
-  "$mise_bin" bootstrap packages apply --yes
+  run_mise_as_linuxbrew bootstrap packages apply --yes
 mise_hello_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/hello)
 assert_contains "runuser -u linuxbrew -- '$brew' list --formula" "hello"
 assert_succeed "runuser -u linuxbrew -- '$brew' info hello"
@@ -394,12 +404,11 @@ exit 97
 EOF
 chmod 0755 "$archive_root/no-compiler/cc"
 chown -R linuxbrew:linuxbrew "$archive_root/no-compiler"
-mise_archive="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache MISE_URL_REPLACEMENTS='$archive_replacements' PATH='$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin' '$mise_bin'"
+mise_archive="MISE_URL_REPLACEMENTS='$archive_replacements' PATH='$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin' run_mise_as_linuxbrew"
 assert_contains "$mise_archive bootstrap packages status" "missing"
-runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  MISE_URL_REPLACEMENTS="$archive_replacements" \
+MISE_URL_REPLACEMENTS="$archive_replacements" \
   PATH="$archive_root/no-compiler:/usr/local/bin:/usr/bin:/bin" \
-  "$mise_bin" bootstrap packages apply --yes
+  run_mise_as_linuxbrew bootstrap packages apply --yes
 mise_archive_keg=$(readlink -f /home/linuxbrew/.linuxbrew/opt/archive-fixture)
 assert_contains "'$mise_archive_keg/bin/archive-fixture'" "archive-fixture 1.0.0"
 assert_contains "cat '$mise_archive_keg/INSTALL_RECEIPT.json'" '"poured_from_bottle": true'
@@ -429,7 +438,7 @@ assert_fail "test -e /home/linuxbrew/.linuxbrew/opt/archive-fixture"
 linux_font_xdg=/home/linuxbrew/oracle-xdg-data
 linux_font_dir="$linux_font_xdg/fonts"
 linux_font_room=/home/linuxbrew/.linuxbrew/Caskroom/font-jetbrains-mono
-mise_font_as_linuxbrew="runuser -u linuxbrew -- env HOME=/home/linuxbrew XDG_CACHE_HOME=/home/linuxbrew/.cache HOMEBREW_XDG_DATA_HOME='$linux_font_xdg' '$mise_bin'"
+mise_font_as_linuxbrew="HOMEBREW_XDG_DATA_HOME='$linux_font_xdg' run_mise_as_linuxbrew"
 
 snapshot_linux_font() {
   local output="$MISE_BREW_ORACLE_RESULT_DIR/$1" font index=0
@@ -464,10 +473,8 @@ runuser -u linuxbrew -- env HOME=/home/linuxbrew \
   "$brew" uninstall --cask font-jetbrains-mono
 assert_linux_font_absent
 
-runuser -u linuxbrew -- env HOME=/home/linuxbrew \
-  XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
-  "$mise_bin" bootstrap packages apply --yes
+HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  run_mise_as_linuxbrew bootstrap packages apply --yes
 snapshot_linux_font mise-linux-font.snapshot
 brew_oracle_diff \
   "$MISE_BREW_ORACLE_RESULT_DIR/brew-linux-font.snapshot" \
@@ -500,10 +507,8 @@ cat <<EOF >mise.toml
 [bootstrap.packages]
 EOF
 chown linuxbrew:linuxbrew mise.toml
-runuser -u linuxbrew -- env HOME=/home/linuxbrew \
-  XDG_CACHE_HOME=/home/linuxbrew/.cache \
-  HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
-  "$mise_bin" bootstrap packages prune --manager brew-cask --yes
+HOMEBREW_XDG_DATA_HOME="$linux_font_xdg" \
+  run_mise_as_linuxbrew bootstrap packages prune --manager brew-cask --yes
 assert_linux_font_absent
 
 brew_oracle_complete test_system_install_brew_linux 4 /home/linuxbrew/.linuxbrew
