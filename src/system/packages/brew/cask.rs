@@ -1190,10 +1190,7 @@ async fn fetch_and_stage(cask: &Cask, pr: Option<&dyn SingleReport>) -> Result<P
 }
 
 async fn fetch_git_clone_and_stage(cask: &Cask, pr: Option<&dyn SingleReport>) -> Result<PathBuf> {
-    let extract_dir = crate::dirs::CACHE
-        .join("system-brew")
-        .join("cask-extract")
-        .join(format!("{}-{}", cask.token, cask.version));
+    let extract_dir = cask_extract_dir(cask);
     file::remove_all(&extract_dir)?;
     file::create_dir_all(&extract_dir)?;
     let clone_dir = crate::dirs::CACHE
@@ -1263,10 +1260,7 @@ async fn fetch_archive(cask: &Cask, pr: Option<&dyn SingleReport>) -> Result<Pat
 }
 
 fn extract_archive(cask: &Cask, archive: &Path, pr: Option<&dyn SingleReport>) -> Result<PathBuf> {
-    let extract_dir = crate::dirs::CACHE
-        .join("system-brew")
-        .join("cask-extract")
-        .join(format!("{}-{}", cask.token, cask.version));
+    let extract_dir = cask_extract_dir(cask);
     file::remove_all(&extract_dir)?;
     file::create_dir_all(&extract_dir)?;
     let filename = archive
@@ -1304,6 +1298,13 @@ fn extract_archive(cask: &Cask, archive: &Path, pr: Option<&dyn SingleReport>) -
         }
     }
     Ok(extract_dir)
+}
+
+fn cask_extract_dir(cask: &Cask) -> PathBuf {
+    crate::dirs::CACHE
+        .join("system-brew")
+        .join("cask-extract")
+        .join(format!("{}-{}", cask.token, cask.version))
 }
 
 /// Match Homebrew's DMG BOM filtering. Disk-image presentation metadata and
@@ -2973,6 +2974,25 @@ fn generated_completion_staging_path(stage: &Path, target: &Path) -> Result<Path
         );
     }
     Ok(stage.join(".mise-generated-completions").join(relative))
+}
+
+fn generated_completion_matches_staging(stage: &Path, target: &Path) -> bool {
+    let Ok(staged) = generated_completion_staging_path(stage, target) else {
+        return false;
+    };
+    let Ok(target_metadata) = target.symlink_metadata() else {
+        return false;
+    };
+    let Ok(staged_metadata) = staged.symlink_metadata() else {
+        return false;
+    };
+    target_metadata.file_type().is_file()
+        && staged_metadata.file_type().is_file()
+        && target_metadata.len() == staged_metadata.len()
+        && std::fs::read(target)
+            .ok()
+            .zip(std::fs::read(staged).ok())
+            .is_some_and(|(target, staged)| target == staged)
 }
 
 fn completion_target_paths(cask: &Cask, artifacts: &CaskArtifacts) -> Result<Vec<PathBuf>> {
@@ -5964,6 +5984,7 @@ fn recover_cask_transaction(cask: &Cask) -> Result<()> {
                 );
             }
             file::remove_all(caskroom_tmp_dir(cask))?;
+            file::remove_all(cask_extract_dir(cask))?;
             remove_cask_journals(&cask.token)
         }
         CaskRecoveryMode::RestoreFilesystem => restore_interrupted_cask_filesystem(cask, &journal),
@@ -6013,6 +6034,7 @@ fn restore_interrupted_cask_filesystem(
         file::remove_all(&destination)?;
     }
     file::remove_all(caskroom_tmp_dir(cask))?;
+    file::remove_all(cask_extract_dir(cask))?;
     remove_cask_journals(&cask.token)
 }
 
@@ -6037,6 +6059,7 @@ fn finish_interrupted_cask_commit(cask: &Cask, journal: &CaskTransactionJournal)
         }
     }
     remove_stale_versions(&caskroom_token_dir(&cask.token), &cask.version)?;
+    file::remove_all(cask_extract_dir(cask))?;
     remove_cask_journals(&cask.token)
 }
 
@@ -6064,6 +6087,11 @@ fn successor_owns_public_target(cask: &Cask, target: &Path) -> bool {
                 && manpage_target_is_owned(manpage, &artifacts.apps, target, &version_dir)
                     .unwrap_or(false)
         });
+    }
+    if let Some(artifacts) = artifacts.as_ref()
+        && completion_target_is_generated(cask, artifacts, target).unwrap_or(false)
+    {
+        return generated_completion_matches_staging(&cask_extract_dir(cask), target);
     }
     let mut backlinks = artifacts
         .into_iter()
@@ -9852,6 +9880,30 @@ end
             "completion|bash|bash"
         );
         assert!(!target.symlink_metadata()?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_completion_recovery_requires_retained_matching_output() -> Result<()> {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir()?;
+        let _guard = BrewPrefixGuard::set(tmp.path());
+        let stage = tmp.path().join("stage");
+        let target = tmp.path().join("etc/bash_completion.d/op");
+        let staged = generated_completion_staging_path(&stage, &target)?;
+        file::create_dir_all(target.parent().unwrap())?;
+        file::create_dir_all(staged.parent().unwrap())?;
+        crate::file::write(&target, "owned")?;
+
+        assert!(!generated_completion_matches_staging(&stage, &target));
+        crate::file::write(&staged, "owned")?;
+        assert!(generated_completion_matches_staging(&stage, &target));
+        crate::file::write(&staged, "other")?;
+        assert!(!generated_completion_matches_staging(&stage, &target));
+        file::remove_file(&staged)?;
+        file::make_symlink(&target, &staged)?;
+        assert!(!generated_completion_matches_staging(&stage, &target));
         Ok(())
     }
 
