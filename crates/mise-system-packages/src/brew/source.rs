@@ -657,6 +657,63 @@ end
         Ok(())
     }
 
+    /// `with_env` temporarily merges the given hash into `ENV` for the block,
+    /// then restores the previous values. Used by source formulae to scope
+    /// build-time variables (e.g. `HOME` for completion generation).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_with_env_supported() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        let cellar = tmp.path().join("Cellar");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        mise_util::file::write(
+            &formula_rb,
+            r#"class Example < Formula
+  def install
+    (prefix/"before").write(ENV["MISE_WITH_ENV_TEST"].to_s)
+    with_env("MISE_WITH_ENV_TEST" => "scoped", HOME: buildpath) do
+      (prefix/"inside").write(ENV["MISE_WITH_ENV_TEST"].to_s)
+    end
+    (prefix/"after").write(ENV["MISE_WITH_ENV_TEST"].to_s)
+  end
+end
+"#,
+        )?;
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", &cellar)
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let keg = cellar.join("example/1.0.0");
+        assert_eq!(mise_util::file::read_to_string(keg.join("before"))?, "");
+        assert_eq!(
+            mise_util::file::read_to_string(keg.join("inside"))?,
+            "scoped"
+        );
+        assert_eq!(mise_util::file::read_to_string(keg.join("after"))?, "");
+        Ok(())
+    }
+
     /// `install_symlink` resolves a relative source against the receiving
     /// directory, as Homebrew does. Without that, `relative_path_from` is
     /// handed a relative path and an absolute base and raises "different
