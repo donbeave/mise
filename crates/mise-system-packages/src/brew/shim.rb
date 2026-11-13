@@ -253,6 +253,9 @@ class Pathname
     raise "cannot install #{src}: does not exist" unless src.exist? || src.symlink?
     dest.dirname.mkpath
     FileUtils.mv src.to_s, dest.to_s
+    if %w[bin sbin].include?(dest.dirname.basename.to_s) && dest.file?
+      FileUtils.chmod 0755, dest.to_s
+    end
   end
   private :install_one
 
