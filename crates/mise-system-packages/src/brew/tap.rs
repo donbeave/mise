@@ -1280,6 +1280,43 @@ end
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn cask_metadata_supports_csv_second() -> Result<()> {
+        let Some(ruby) = test_ruby().await? else {
+            return Ok(());
+        };
+        let runner = CmdLineRunner::new(ruby)
+            .with_on_stderr(|line| eprintln!("{line}"))
+            .arg("--disable-gems")
+            .arg("-e")
+            .arg(CASK_METADATA_SHIM_RB)
+            .stdin_string(
+                r##"cask "widget" do
+  version "1.0,1306"
+  sha256 :no_check
+  url "https://example.invalid/mac/Widget-#{version.csv.first}-#{version.csv.second}.dmg"
+  app "Widget.app"
+end"##,
+            )
+            .env("MISE_BREW_TOKEN", "widget")
+            .env("MISE_BREW_SOURCE_PATH", "Casks/widget.rb")
+            .env("MISE_BREW_SOURCE_CHECKSUM", "bbbb")
+            .env("MISE_BREW_TAP_COMMIT", "deadbeef")
+            .env("MISE_BREW_MACOS_VERSION", "0")
+            .env("MISE_BREW_OS", std::env::consts::OS)
+            .env("MISE_BREW_ARCH", std::env::consts::ARCH)
+            .with_sandbox(metadata_sandbox()?);
+        runner.apply_sandbox().await?;
+        let json = runner.read().await?;
+        let metadata: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(
+            metadata["url"],
+            "https://example.invalid/mac/Widget-1.0-1306.dmg"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn serializes_cask_pkg_choices() -> Result<()> {
         let Some(ruby) = test_ruby().await? else {
             return Ok(());

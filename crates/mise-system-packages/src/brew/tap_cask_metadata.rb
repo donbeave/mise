@@ -2,6 +2,25 @@
 
 # Extract Homebrew Cask metadata used by mise without loading Homebrew.
 
+# Homebrew's ActiveSupport-style helpers used in cask URLs (e.g. version.csv.second).
+class Array
+  def second
+    self[1]
+  end
+
+  def third
+    self[2]
+  end
+
+  def fourth
+    self[3]
+  end
+
+  def fifth
+    self[4]
+  end
+end
+
 module JSON
   def self.generate(value)
     case value
