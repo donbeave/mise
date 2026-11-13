@@ -168,6 +168,7 @@ pub(super) async fn build(
             keg.display()
         );
     }
+    ensure_keg_bin_executable(&keg)?;
 
     let host_tag = tag::host_tag();
     let receipt = pour::write_receipt(
@@ -191,6 +192,28 @@ pub(super) async fn build(
         return Err(err);
     }
     mise_util::file::remove_all(&build_root)?;
+    Ok(())
+}
+
+/// Ensure source-built binaries are executable, even when the formula's
+/// `install` left them without executable bits (e.g. a bare binary download
+/// moved into `bin` without an explicit `chmod`). Covers `bin` and `sbin`.
+fn ensure_keg_bin_executable(keg: &Path) -> Result<()> {
+    for dir in ["bin", "sbin"] {
+        let dir_path = keg.join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir_path) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if !path.is_file() || path.is_symlink() {
+                continue;
+            }
+            if let Err(err) = mise_util::file::make_executable(&path) {
+                debug!("failed to make {} executable: {err:#}", path.display());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -477,6 +500,27 @@ fn build_env(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn source_keg_bin_executable() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let keg = tmp.path().join("example/1.0.0");
+        let bin = keg.join("bin");
+        mise_util::file::create_dir_all(&bin)?;
+        let tool = bin.join("tool");
+        mise_util::file::write(&tool, "#!/bin/sh\necho hi\n")?;
+        let mut perms = std::fs::metadata(&tool)?.permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&tool, perms)?;
+
+        super::ensure_keg_bin_executable(&keg)?;
+
+        let mode = std::fs::metadata(&tool)?.permissions().mode();
+        assert_ne!(mode & 0o111, 0, "bin/tool is not executable: {mode:o}");
+        Ok(())
+    }
 
     #[test]
     fn build_env_drops_toolchain_vars_but_keeps_essentials() {
