@@ -168,6 +168,8 @@ pub(super) async fn build(
             keg.display()
         );
     }
+    #[cfg(unix)]
+    normalize_keg_bin_permissions(&keg)?;
 
     let host_tag = tag::host_tag();
     let receipt = pour::write_receipt(
@@ -193,6 +195,75 @@ pub(super) async fn build(
     mise_util::file::remove_all(&build_root)?;
     Ok(())
 }
+
+/// Normalize executable bits under a source-built keg's `bin` and `sbin`.
+///
+/// Homebrew's cleanup phase sets every file under these directories to 0555
+/// when it looks executable (`brew reinstall --debug` logs e.g. "Fixing ...
+/// permissions from 644 to 555"). A raw release download stages as 0644, so
+/// without this a `bin.install`ed binary keeps 0644 through the install and
+/// its health check fails with "permission denied". Only missing execute bits
+/// are repaired; modes are otherwise untouched and symlinks are skipped.
+#[cfg(unix)]
+fn normalize_keg_bin_permissions(keg: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for dir in ["bin", "sbin"] {
+        let root = keg.join(dir);
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if !keg_file_looks_executable(entry.path())? {
+                continue;
+            }
+            if entry.metadata()?.permissions().mode() & 0o111 != 0 {
+                continue;
+            }
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o555))
+                .wrap_err_with(|| {
+                    format!("failed to make {} executable", entry.path().display())
+                })?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a keg file should be executable: it already has an execute bit, or
+/// its contents identify it as a native binary or interpreter script. This
+/// mirrors the intent of Homebrew's `Cleaner#executable_path?`, extended to
+/// Mach-O/ELF magic so a staged-but-never-executable binary is recognized.
+#[cfg(unix)]
+fn keg_file_looks_executable(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::fs::symlink_metadata(path)?.permissions().mode() & 0o111 != 0 {
+        return Ok(true);
+    }
+    let mut header = [0u8; 4];
+    let mut file = std::fs::File::open(path)?;
+    let len = file.read(&mut header)?;
+    let magic: &[u8] = &header[..len];
+    Ok(magic.starts_with(b"#!")
+        || magic.starts_with(b"\x7fELF")
+        || MACHO_MAGICS.iter().any(|m| magic == *m))
+}
+
+#[cfg(unix)]
+const MACHO_MAGICS: [[u8; 4]; 7] = [
+    [0xFE, 0xED, 0xFA, 0xCE], // 32-bit big-endian
+    [0xFE, 0xED, 0xFA, 0xCF], // 64-bit big-endian
+    [0xCA, 0xFE, 0xBA, 0xBE], // fat big-endian
+    [0xCA, 0xFE, 0xBA, 0xBF], // fat64 big-endian
+    [0xCE, 0xFA, 0xED, 0xFE], // 32-bit little-endian
+    [0xCF, 0xFA, 0xED, 0xFE], // 64-bit little-endian
+    [0xBE, 0xBA, 0xFE, 0xCA], // fat little-endian
+];
 
 /// Download the formula's .rb from homebrew/core, pinned to the commit the
 /// API metadata was generated from and verified against its sha256.
@@ -562,6 +633,81 @@ mod tests {
             tap_git_head: Some("abc123".to_string()),
             post_install_steps: vec![],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_formula_bin_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // minimal 64-bit little-endian Mach-O header plus payload, staged 0644
+        let mut macho = vec![0xCF, 0xFA, 0xED, 0xFE];
+        macho.extend_from_slice(&[0u8; 64]);
+        std::fs::write(bin.join("tool"), &macho).unwrap();
+        std::fs::set_permissions(bin.join("tool"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(bin.join("notes.txt"), b"plain text").unwrap();
+
+        normalize_keg_bin_permissions(tmp.path()).unwrap();
+
+        let mode = |name: &str| {
+            std::fs::symlink_metadata(bin.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("tool"), 0o555);
+        assert_eq!(mode("notes.txt"), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_formula_shebang_script_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sbin = tmp.path().join("sbin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        std::fs::write(sbin.join("helper"), b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(sbin.join("helper"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        normalize_keg_bin_permissions(tmp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(sbin.join("helper"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_formula_executable_bit_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool"), b"\x7fELF stark mock").unwrap();
+        std::fs::set_permissions(bin.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        normalize_keg_bin_permissions(tmp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(bin.join("tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     #[test]
