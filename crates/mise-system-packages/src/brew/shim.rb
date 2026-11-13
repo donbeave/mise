@@ -975,6 +975,22 @@ class Formula
 
   def time = Time.now
 
+  # Temporarily overrides ENV entries while running the block, restoring
+  # everything afterwards — the shape of Homebrew's `Utils::Shell.with_env`.
+  # Keys are stringified, values are stringified (`nil` deletes), and entries
+  # absent before the block are removed again afterwards.
+  def with_env(hash)
+    old_values = {}
+    hash.each do |key, value|
+      name = key.to_s
+      old_values[name] = ENV.delete(name)
+      ENV[name] = value&.to_s
+    end
+    yield
+  ensure
+    ENV.update(old_values)
+  end
+
   def post_install; end
 
   # unknown instance helpers: fail loudly

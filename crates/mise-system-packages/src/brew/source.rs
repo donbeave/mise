@@ -657,6 +657,61 @@ end
         Ok(())
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn with_env_supported() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        let cellar = tmp.path().join("Cellar");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        mise_util::file::write(
+            &formula_rb,
+            r#"class Example < Formula
+  def install
+    with_env(TEST_WITH_ENV_INNER: "inner", TEST_WITH_ENV_ABSENT: "set") do
+      (share/"inner").write(ENV["TEST_WITH_ENV_INNER"].to_s)
+      (share/"absent-inside").write(ENV["TEST_WITH_ENV_ABSENT"].to_s)
+    end
+    (share/"outer").write(ENV.fetch("TEST_WITH_ENV_OUTER", "unset"))
+    (share/"absent-after").write(ENV.key?("TEST_WITH_ENV_ABSENT") ? "leaked" : "clean")
+  end
+end
+"#,
+        )?;
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", &cellar)
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .env("TEST_WITH_ENV_OUTER", "outer")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let share = cellar.join("example/1.0.0/share");
+        let read = |name: &str| mise_util::file::read_to_string(share.join(name));
+        assert_eq!(read("inner")?, "inner");
+        assert_eq!(read("absent-inside")?, "set");
+        assert_eq!(read("outer")?, "outer");
+        assert_eq!(read("absent-after")?, "clean");
+        Ok(())
+    }
+
     /// `install_symlink` resolves a relative source against the receiving
     /// directory, as Homebrew does. Without that, `relative_path_from` is
     /// handed a relative path and an absolute base and raises "different
