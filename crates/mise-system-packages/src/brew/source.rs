@@ -657,6 +657,60 @@ end
         Ok(())
     }
 
+    /// `bin.install` ensures installed binaries are executable, even when the
+    /// staged source arrived without executable bits (e.g. a bare binary
+    /// download). Third-party tap formulae that install a single binary via
+    /// `bin.install` rely on this instead of an explicit `chmod`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tap_formula_bin_executable() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        let cellar = tmp.path().join("Cellar");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        mise_util::file::write(
+            &formula_rb,
+            r##"class Example < Formula
+  def install
+    (buildpath/"tool").write("#!/bin/sh\necho hi\n")
+    bin.install buildpath/"tool" => "tool"
+  end
+end
+"##,
+        )?;
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", &cellar)
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mode = std::fs::metadata(cellar.join("example/1.0.0/bin/tool"))?
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "bin/tool is not executable: {mode:o}");
+        Ok(())
+    }
+
     /// `install_symlink` resolves a relative source against the receiving
     /// directory, as Homebrew does. Without that, `relative_path_from` is
     /// handed a relative path and an absolute base and raises "different
