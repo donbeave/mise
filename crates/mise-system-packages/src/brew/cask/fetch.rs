@@ -623,6 +623,19 @@ pub(super) fn raw_cask_artifact_name(
     // A URL whose path ends in a separator, or only in dot segments that
     // normalization collapses, has no final segment to name the staged file;
     // `extract_dir.join("")` would target the staging directory itself.
+    if archive_filename(&cask.url)
+        .filter(|name| !name.is_empty())
+        .is_none()
+        && let Ok(artifacts) = cask_artifacts(cask)
+        && let [binary] = artifacts.binaries.as_slice()
+        && !binary.source.contains(['/', '\\', '$'])
+        && validate_cask_path_component("binary source", &binary.source).is_ok()
+    {
+        // Opaque download URLs (query-param file names, Content-Disposition)
+        // serve a single bare binary. Stage it under the declared artifact
+        // name so binary lookup finds it.
+        return Ok((binary.source.clone(), true));
+    }
     Ok((
         archive_filename(&cask.url)
             .filter(|name| !name.is_empty())

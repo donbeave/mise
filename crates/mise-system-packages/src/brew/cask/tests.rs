@@ -4472,6 +4472,28 @@ fn raw_executable_keeps_url_filename() -> Result<()> {
 }
 
 #[test]
+fn raw_opaque_url_uses_declared_binary_name() -> Result<()> {
+    // Query-param download URLs have no path filename; stage under the single
+    // declared bare binary name so binary lookup finds it.
+    let tmp = tempfile::tempdir()?;
+    let archive = tmp.path().join("cached-name");
+    std::fs::write(&archive, b"\x7fELF binary")?;
+    let mut cask = test_cask("widget", "1.4.18");
+    cask.url =
+        "https://example.com/download/?channel=widget&version=1.4.18&file=widget-aarch64-macos"
+            .to_string();
+    cask.artifacts = vec![serde_json::json!({
+        "binary": ["widget-aarch64-macos", {"target": "widget"}],
+    })];
+
+    assert_eq!(
+        raw_cask_artifact_name(&cask, &archive, "cached-name")?,
+        ("widget-aarch64-macos".to_string(), true)
+    );
+    Ok(())
+}
+
+#[test]
 fn detects_a_single_suffixless_nested_archive() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let archive = tmp.path().join("download");
