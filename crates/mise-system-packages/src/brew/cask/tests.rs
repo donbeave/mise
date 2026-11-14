@@ -5229,6 +5229,29 @@ fn appdir_artifact_source_matches_app_case_insensitively() -> Result<()> {
 }
 
 #[test]
+fn nested_appdir_binary_linked() -> Result<()> {
+    // A binary stanza can name a nested `.app` directory inside an installed
+    // app (e.g. `$APPDIR/Parent.app/Contents/Applications/Child.app`). It is
+    // a directory, not a file, so lookup must accept existing paths.
+    let _lock = mise_util::testing::lock_ignoring_poison(&ENV_LOCK);
+    let tmp = tempfile::tempdir()?;
+    let _guard = BrewPrefixGuard::set(tmp.path());
+    let appdir = tmp.path().join("Applications");
+    let nested = "Parent.app/Contents/Applications/Child.app";
+    file::create_dir_all(appdir.join(nested))?;
+    let apps = [AppArtifact {
+        source: "Parent.app".to_string(),
+        target: None,
+    }];
+
+    assert_eq!(
+        appdir_artifact_source("$APPDIR/Parent.app/Contents/Applications/Child.app", &apps)?,
+        Some(appdir.join(nested)),
+    );
+    Ok(())
+}
+
+#[test]
 fn generated_completion_executable_prefers_staged_prefix_binary() -> Result<()> {
     let _lock = mise_util::testing::lock_ignoring_poison(&ENV_LOCK);
     let tmp = tempfile::tempdir()?;

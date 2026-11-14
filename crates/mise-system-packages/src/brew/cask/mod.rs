@@ -3991,7 +3991,7 @@ fn appdir_artifact_source_in(
             continue;
         }
         let path = target.join(&suffix);
-        if path.is_file() {
+        if path.exists() {
             matches.push(path);
         }
     }
@@ -4755,7 +4755,7 @@ fn cask_appdir_for(cask: &Cask, apps: &[AppArtifact]) -> Result<PathBuf> {
 #[cfg(test)]
 fn link_binary(caskroom: &Path, appdir: &Path, binary: &BinaryArtifact) -> Result<()> {
     let caskroom_binary = caskroom_binary_path(caskroom, appdir, binary)?;
-    if !caskroom_binary.is_file() {
+    if !caskroom_binary.exists() {
         if caskroom_binary
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -4787,7 +4787,7 @@ fn link_binary_for(
     binary: &BinaryArtifact,
 ) -> Result<()> {
     let caskroom_binary = caskroom_binary_path_for(caskroom, cask, appdir, binary)?;
-    if !caskroom_binary.is_file() {
+    if !caskroom_binary.exists() {
         if caskroom_binary
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
