@@ -905,6 +905,25 @@ class Formula
     block ? Dir.chdir(path.to_s, &block) : path
   end
 
+  def with_env(env)
+    old = {}
+    env.each do |key, value|
+      key = key.to_s
+      old[key] = ENV[key] if ENV.key?(key)
+      ENV[key] = value.to_s
+    end
+    yield
+  ensure
+    env.each_key do |key|
+      key = key.to_s
+      if old.key?(key)
+        ENV[key] = old[key]
+      else
+        ENV.delete(key)
+      end
+    end
+  end
+
   def loader_path = OS.mac? ? "@loader_path" : "$ORIGIN"
 
   def rpath(source: bin, target: lib)
